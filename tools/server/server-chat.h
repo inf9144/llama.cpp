@@ -13,6 +13,10 @@ using json = nlohmann::ordered_json;
 // Convert OpenAI Responses API format to OpenAI Chat Completions API format
 json server_chat_convert_responses_to_chatcmpl(const json & body);
 
+// Encode/decode namespaced Responses tools to a flat Chat Completions function name.
+std::string server_chat_encode_namespace_tool_name(const std::string & tool_namespace, const std::string & tool_name);
+bool server_chat_decode_namespace_tool_name(const std::string & flat_name, std::string & tool_namespace, std::string & tool_name);
+
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);
 

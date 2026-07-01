@@ -14,6 +14,28 @@
 
 using json = nlohmann::ordered_json;
 
+static json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
+    std::string tool_namespace;
+    std::string tool_name;
+
+    json output_item = {
+        {"id",        "fc_" + tool_call.id},
+        {"type",      "function_call"},
+        {"status",    status},
+        {"arguments", tool_call.arguments},
+        {"call_id",   "call_" + tool_call.id},
+    };
+
+    if (server_chat_decode_namespace_tool_name(tool_call.name, tool_namespace, tool_name)) {
+        output_item["name"] = tool_name;
+        output_item["namespace"] = tool_namespace;
+    } else {
+        output_item["name"] = tool_call.name;
+    }
+
+    return output_item;
+}
+
 //
 // task_params
 //
@@ -568,14 +590,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(json {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name},
-        });
+        output.push_back(server_task_build_response_function_call(tool_call, "completed"));
     }
 
     std::time_t t = std::time(0);
@@ -668,14 +683,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        const json output_item = {
-            {"id",        "fc_" + tool_call.id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name}
-        };
+        const json output_item = server_task_build_response_function_call(tool_call, "completed");
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1273,18 +1281,12 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.name.empty()) {
+            common_chat_tool_call tool_call = diff.tool_call_delta;
             events.push_back(json {
                 {"event", "response.output_item.added"},
                 {"data", json {
                     {"type",  "response.output_item.added"},
-                    {"item", json {
-                        {"id",        "fc_" + diff.tool_call_delta.id},
-                        {"arguments", ""},
-                        {"call_id",   "call_" + diff.tool_call_delta.id},
-                        {"name",      diff.tool_call_delta.name},
-                        {"type",      "function_call"},
-                        {"status",    "in_progress"},
-                    }},
+                    {"item", server_task_build_response_function_call(tool_call, "in_progress")},
                 }},
             });
             oai_resp_fc_id = diff.tool_call_delta.id;
