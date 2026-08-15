@@ -262,12 +262,39 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     });
                 } else {
                     json chatcmpl_outputs = item.at("output");
+
+                    // Support Codex view_image tool outputs.
+
                     for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            throw std::invalid_argument("Output of tool call should be 'Input text'");
+                        const std::string output_type = json_value(chatcmpl_output, "type", std::string());
+
+                        if (output_type == "input_text" ||
+                            output_type == "output_text" ||
+                            output_type == "text") {
+                            if (!exists_and_is_string(chatcmpl_output, "text")) {
+                                throw std::invalid_argument("Text output of tool call requires 'text'");
+                            }
+                            chatcmpl_output["type"] = "text";
+                        } else if (output_type == "input_image") {
+                            if (!exists_and_is_string(chatcmpl_output, "image_url")) {
+                                throw std::invalid_argument("Image output of tool call requires 'image_url'");
+                            }
+
+                            const std::string image_url =
+                                chatcmpl_output.at("image_url").get<std::string>();
+
+                            chatcmpl_output = json {
+                                {"type", "image_url"},
+                                {"image_url", json {
+                                    {"url", image_url}
+                                }}
+                            };
+                        } else {
+                            throw std::invalid_argument(
+                                "Output of tool call must be text or input_image");
                         }
-                        chatcmpl_output["type"] = "text";
                     }
+
                     chatcmpl_messages.push_back(json {
                         {"content",      chatcmpl_outputs},
                         {"role",         "tool"},
