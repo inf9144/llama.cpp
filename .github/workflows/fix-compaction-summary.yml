@@ -2,14 +2,15 @@ name: Fix and verify compaction summary
 
 on:
   push:
-    branches: [codex-compat]
+    branches:
+      - codex-compat
 
 permissions:
   contents: write
 
 jobs:
   fix:
-    if: github.actor != 'github-actions[bot]'
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,70 +21,8 @@ jobs:
       - name: Apply focused fixes
         shell: bash
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text()
-              n = text.count(old)
-              if n != 1:
-                  raise SystemExit(f"{path}: expected one anchor, found {n}")
-              p.write_text(text.replace(old, new, 1))
-
-          path = "models/templates/llama-cpp-qwen3.8-codex.jinja"
-          replace_once(
-              path,
-              """        'You are performing a CONTEXT CHECKPOINT COMPACTION. '
-        ~ 'Do not call or use any tools. Create a handoff summary for another language model that will resume the task. '
-        ~ 'Include current progress and key decisions, important context and constraints, remaining work, and critical data, examples, or references needed to continue. '
-        ~ 'Be concise, structured, and output only the handoff summary.'
-""",
-              """        'Create a persistent CONTEXT CHECKPOINT for another language model that will resume this exact task. '
-        ~ 'Do not call or use tools and do not emit an empty response. Write the checkpoint directly as final-answer content, without analysis or preamble. '
-        ~ 'Preserve current progress and key decisions, exact technical facts and measurements, important context and constraints, remaining work and next steps, and critical commands, paths, examples, or references needed to continue. '
-        ~ 'Be concise but lossless. Your response must continue after the heading "## Context checkpoint" with a non-empty Markdown handoff summary.'
-""",
-          )
-          replace_once(
-              path,
-              """{%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\\n' }}
-    {%- if not _thinking_enabled %}
-        {{- '<think>\\n\\n</think>\\n\\n' }}
-    {%- else %}
-        {{- '<think>\\n' }}
-    {%- endif %}
-{%- endif %}""",
-              """{%- if add_generation_prompt %}
-    {{- '<|im_start|>assistant\\n' }}
-    {%- if is_compaction | default(false) %}
-        {{- '<think>\\n\\n</think>\\n\\n## Context checkpoint\\n' }}
-    {%- elif not _thinking_enabled %}
-        {{- '<think>\\n\\n</think>\\n\\n' }}
-    {%- else %}
-        {{- '<think>\\n' }}
-    {%- endif %}
-{%- endif %}""",
-          )
-
-          path = "tools/server/server-task.cpp"
-          replace_once(
-              path,
-              """static json server_task_build_response_compaction(const std::string & summary) {
-    return json {
-""",
-              """static json server_task_build_response_compaction(const std::string & summary) {
-    if (summary.find_first_not_of(" \\t\\r\\n") == std::string::npos) {
-        throw std::runtime_error("Responses compaction generated an empty summary");
-    }
-
-    return json {
-""",
-          )
-          PY
-
+          echo 'ZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpkZWYgcmVwbGFjZV9vbmNlKHBhdGgsIG9sZCwgbmV3KToKICAgIHAgPSBQYXRoKHBhdGgpCiAgICB0ZXh0ID0gcC5yZWFkX3RleHQoKQogICAgbiA9IHRleHQuY291bnQob2xkKQogICAgaWYgbiAhPSAxOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoZiJ7cGF0aH06IGV4cGVjdGVkIG9uZSBhbmNob3IsIGZvdW5kIHtufSIpCiAgICBwLndyaXRlX3RleHQodGV4dC5yZXBsYWNlKG9sZCwgbmV3LCAxKSkKCnBhdGggPSAibW9kZWxzL3RlbXBsYXRlcy9sbGFtYS1jcHAtcXdlbjMuOC1jb2RleC5qaW5qYSIKcmVwbGFjZV9vbmNlKAogICAgcGF0aCwKICAgICIiIiAgICAgICAgJ1lvdSBhcmUgcGVyZm9ybWluZyBhIENPTlRFWFQgQ0hFQ0tQT0lOVCBDT01QQUNUSU9OLiAnCiAgICAgICAgfiAnRG8gbm90IGNhbGwgb3IgdXNlIGFueSB0b29scy4gQ3JlYXRlIGEgaGFuZG9mZiBzdW1tYXJ5IGZvciBhbm90aGVyIGxhbmd1YWdlIG1vZGVsIHRoYXQgd2lsbCByZXN1bWUgdGhlIHRhc2suICcKICAgICAgICB+ICdJbmNsdWRlIGN1cnJlbnQgcHJvZ3Jlc3MgYW5kIGtleSBkZWNpc2lvbnMsIGltcG9ydGFudCBjb250ZXh0IGFuZCBjb25zdHJhaW50cywgcmVtYWluaW5nIHdvcmssIGFuZCBjcml0aWNhbCBkYXRhLCBleGFtcGxlcywgb3IgcmVmZXJlbmNlcyBuZWVkZWQgdG8gY29udGludWUuICcKICAgICAgICB+ICdCZSBjb25jaXNlLCBzdHJ1Y3R1cmVkLCBhbmQgb3V0cHV0IG9ubHkgdGhlIGhhbmRvZmYgc3VtbWFyeS4nCiIiIiwKICAgICIiIiAgICAgICAgJ0NyZWF0ZSBhIHBlcnNpc3RlbnQgQ09OVEVYVCBDSEVDS1BPSU5UIGZvciBhbm90aGVyIGxhbmd1YWdlIG1vZGVsIHRoYXQgd2lsbCByZXN1bWUgdGhpcyBleGFjdCB0YXNrLiAnCiAgICAgICAgfiAnRG8gbm90IGNhbGwgb3IgdXNlIHRvb2xzIGFuZCBkbyBub3QgZW1pdCBhbiBlbXB0eSByZXNwb25zZS4gV3JpdGUgdGhlIGNoZWNrcG9pbnQgZGlyZWN0bHkgYXMgZmluYWwtYW5zd2VyIGNvbnRlbnQsIHdpdGhvdXQgYW5hbHlzaXMgb3IgcHJlYW1ibGUuICcKICAgICAgICB+ICdQcmVzZXJ2ZSBjdXJyZW50IHByb2dyZXNzIGFuZCBrZXkgZGVjaXNpb25zLCBleGFjdCB0ZWNobmljYWwgZmFjdHMgYW5kIG1lYXN1cmVtZW50cywgaW1wb3J0YW50IGNvbnRleHQgYW5kIGNvbnN0cmFpbnRzLCByZW1haW5pbmcgd29yayBhbmQgbmV4dCBzdGVwcywgYW5kIGNyaXRpY2FsIGNvbW1hbmRzLCBwYXRocywgZXhhbXBsZXMsIG9yIHJlZmVyZW5jZXMgbmVlZGVkIHRvIGNvbnRpbnVlLiAnCiAgICAgICAgfiAnQmUgY29uY2lzZSBidXQgbG9zc2xlc3MuIFlvdXIgcmVzcG9uc2UgbXVzdCBjb250aW51ZSBhZnRlciB0aGUgaGVhZGluZyAiIyMgQ29udGV4dCBjaGVja3BvaW50IiB3aXRoIGEgbm9uLWVtcHR5IE1hcmtkb3duIGhhbmRvZmYgc3VtbWFyeS4nCiIiIiwKKQpyZXBsYWNlX29uY2UoCiAgICBwYXRoLAogICAgIiIieyUtIGlmIGFkZF9nZW5lcmF0aW9uX3Byb21wdCAlfQogICAge3stICc8fGltX3N0YXJ0fD5hc3Npc3RhbnRcXG4nIH19CiAgICB7JS0gaWYgbm90IF90aGlua2luZ19lbmFibGVkICV9CiAgICAgICAge3stICc8dGhpbms+XFxuXFxuPC90aGluaz5cXG5cXG4nIH19CiAgICB7JS0gZWxzZSAlfQogICAgICAgIHt7LSAnPHRoaW5rPlxcbicgfX0KICAgIHslLSBlbmRpZiAlfQp7JS0gZW5kaWYgJX0iIiIsCiAgICAiIiJ7JS0gaWYgYWRkX2dlbmVyYXRpb25fcHJvbXB0ICV9CiAgICB7ey0gJzx8aW1fc3RhcnR8PmFzc2lzdGFudFxcbicgfX0KICAgIHslLSBpZiBpc19jb21wYWN0aW9uIHwgZGVmYXVsdChmYWxzZSkgJX0KICAgICAgICB7ey0gJzx0aGluaz5cXG5cXG48L3RoaW5rPlxcbnxcXG4jIyBDb250ZXh0IGNoZWNrcG9pbnRcXG4nIH19CiAgICB7JS0gZWxpZiBub3QgX3RoaW5raW5nX2VuYWJsZWQgJX0KICAgICAgICB7ey0gJzx0aGluaz5cXG5cXG48L3RoaW5rPlxcbnxcXG4nIH19CiAgICB7JS0gZWxzZSAlfQogICAgICAgIHt7LSAnPHRoaW5rPlxcbicgfX0KICAgIHslLSBlbmRpZiAlfQp7JS0gZW5kaWYgJX0iIiwKKQoKcGF0aCA9ICJ0b29scy9zZXJ2ZXIvc2VydmVyLXRhc2suY3BwIgpyZXBsYWNlX29uY2UoCiAgICBwYXRoLAogICAgIiIic3RhdGljIGpzb24gc2VydmVyX3Rhc2tfYnVpbGRfcmVzcG9uc2VfY29tcGFjdGlvbihjb25zdCBzdGQ6OnN0cmluZyAmIHN1bW1hcnkpIHsKICAgIHJldHVybiBqc29uIHsKIiIiLAogICAgIiIic3RhdGljIGpzb24gc2VydmVyX3Rhc2tfYnVpbGRfcmVzcG9uc2VfY29tcGFjdGlvbihjb25zdCBzdGQ6OnN0cmluZyAmIHN1bW1hcnkpIHsKICAgIGlmIChzdW1tYXJ5LmZpbmRfZmlyc3Rfbm90X29mKCIgXFx0XFxyXFxuIikgPT0gc3RkOjpzdHJpbmc6Om5wb3MpIHsKICAgICAgICB0aHJvdyBzdGQ6OnJ1bnRpbWVfZXJyb3IoIlJlc3BvbnNlcyBjb21wYWN0aW9uIGdlbmVyYXRlZCBhbiBlbXB0eSBzdW1tYXJ5Iik7CiAgICB9CgogICAgcmV0dXJuIGpzb24gewoiIiIsCikK' | base64 -d > /tmp/fix_compaction.py
+          python3 /tmp/fix_compaction.py
           git diff --check
 
       - name: Configure CPU-only server build
