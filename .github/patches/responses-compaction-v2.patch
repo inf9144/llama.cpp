@@ -1,0 +1,146 @@
+diff --git a/tools/server/server-chat.cpp b/tools/server/server-chat.cpp
+index 21889a7a6..000000000 100644
+--- a/tools/server/server-chat.cpp
++++ b/tools/server/server-chat.cpp
+@@ -70,6 +70,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+     json chatcmpl_body = response_body;
+     chatcmpl_body.erase("input");
+     std::vector<json> chatcmpl_messages;
++    bool is_compaction_request = false;
+ 
+     if (response_body.contains("instructions")) {
+         chatcmpl_messages.push_back({
+@@ -98,7 +99,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+             return j.contains(key) && j.at(key).is_string();
+         };
+ 
+-        for (json item : input_value) {
++        for (size_t input_index = 0; input_index < input_value.size(); ++input_index) {
++            json item = input_value.at(input_index);
++            const std::string item_type = json_value(item, "type", std::string());
++
++            if (item_type == "compaction_trigger") {
++                if (input_index + 1 != input_value.size()) {
++                    throw std::invalid_argument("'compaction_trigger' must be the last input item");
++                }
++                is_compaction_request = true;
++                continue;
++            }
++
+             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
+ 
+             if (exists_and_is_string(item, "content")) {
+@@ -300,6 +311,24 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+                         {"tool_call_id", item.at("call_id")},
+                     });
+                 }
++            } else if (item_type == "compaction" && exists_and_is_string(item, "encrypted_content")) {
++                static constexpr const char * compaction_prefix = "llama.cpp.compaction.v1\n";
++                const std::string encrypted_content = item.at("encrypted_content").get<std::string>();
++
++                if (encrypted_content.rfind(compaction_prefix, 0) != 0) {
++                    throw std::invalid_argument("Unsupported Responses compaction payload");
++                }
++
++                const std::string summary = encrypted_content.substr(std::char_traits<char>::length(compaction_prefix));
++                if (summary.empty()) {
++                    throw std::invalid_argument("Responses compaction payload is empty");
++                }
++
++                chatcmpl_messages.push_back(json {
++                    {"role", "user"},
++                    {"content", "<context_compaction>\n" + summary + "\n</context_compaction>"},
++                });
+             } else if (exists_and_is_array(item, "summary") &&
+                 exists_and_is_string(item, "type") &&
+                 item.at("type") == "reasoning") {
+@@ -329,6 +358,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+         throw std::invalid_argument("'input' must be a string or array of objects");
+     }
+ 
++    if (is_compaction_request) {
++        chatcmpl_messages.push_back(json {
++            {"role", "user"},
++            {"content",
++                "You are performing a CONTEXT CHECKPOINT COMPACTION. "
++                "Do not call or use any tools. Create a handoff summary for another language model that will resume the task. "
++                "Include current progress and key decisions, important context and constraints, remaining work, and critical data, examples, or references. "
++                "Be concise, structured, and output only the handoff summary."},
++        });
++
++        // Internal marker carried through task_params without changing the rendered prompt.
++        chatcmpl_body["response_fields"] = json::array({"__llamacpp_responses_compaction"});
++    }
++
+     chatcmpl_body["messages"] = chatcmpl_messages;
+ 
+     if (response_body.contains("tools")) {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 5d6a31f5f..000000000 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -10,10 +10,26 @@
+ #include "speculative.h"
+ #include "server-common.h"
+ 
++#include <algorithm>
+ #include <sstream>
+ 
+ using json = nlohmann::ordered_json;
+ 
++static bool server_task_is_responses_compaction(const std::vector<std::string> & response_fields) {
++    return std::find(
++        response_fields.begin(),
++        response_fields.end(),
++        "__llamacpp_responses_compaction") != response_fields.end();
++}
++
++static json server_task_build_response_compaction(const std::string & summary) {
++    return json {
++        {"id",                "cmp_" + random_string()},
++        {"type",              "compaction"},
++        {"encrypted_content", "llama.cpp.compaction.v1\n" + summary},
++    };
++}
++
+ static json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
+     std::string tool_namespace;
+     std::string tool_name;
+@@ -591,6 +607,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
+         output.push_back(server_task_build_response_function_call(tool_call, "completed"));
+     }
+ 
++    if (server_task_is_responses_compaction(response_fields)) {
++        output.push_back(server_task_build_response_compaction(msg.content));
++    }
++
+     std::time_t t = std::time(0);
+     json res = {
+         {"completed_at", t},
+@@ -688,6 +708,28 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
+         output.push_back(output_item);
+     }
+ 
++    if (server_task_is_responses_compaction(response_fields)) {
++        const json output_item = server_task_build_response_compaction(oaicompat_msg.content);
++
++        server_sent_events.push_back(json {
++            {"event", "response.output_item.added"},
++            {"data", json {
++                {"type", "response.output_item.added"},
++                {"item", output_item}
++            }}
++        });
++        server_sent_events.push_back(json {
++            {"event", "response.output_item.done"},
++            {"data", json {
++                {"type", "response.output_item.done"},
++                {"item", output_item}
++            }}
++        });
++        output.push_back(output_item);
++    }
++
+     std::time_t t = std::time(0);
+     server_sent_events.push_back(json {
+         {"event", "response.completed"},
