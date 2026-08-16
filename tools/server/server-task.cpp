@@ -14,6 +14,14 @@
 
 using json = nlohmann::ordered_json;
 
+static json server_task_build_response_compaction(const std::string & summary) {
+    return json {
+        {"id",                "cmp_" + random_string()},
+        {"type",              "compaction"},
+        {"encrypted_content", "llama.cpp.compaction.v1\n" + summary},
+    };
+}
+
 static json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
     std::string tool_namespace;
     std::string tool_name;
@@ -593,6 +601,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         output.push_back(server_task_build_response_function_call(tool_call, "completed"));
     }
 
+    if (generation_params.responses_compaction) {
+        output.push_back(server_task_build_response_compaction(msg.content));
+    }
+
     std::time_t t = std::time(0);
     json res = {
         {"completed_at", t},
@@ -684,6 +696,26 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         const json output_item = server_task_build_response_function_call(tool_call, "completed");
+        server_sent_events.push_back(json {
+            {"event", "response.output_item.done"},
+            {"data", json {
+                {"type", "response.output_item.done"},
+                {"item", output_item}
+            }}
+        });
+        output.push_back(output_item);
+    }
+
+    if (generation_params.responses_compaction) {
+        const json output_item = server_task_build_response_compaction(oaicompat_msg.content);
+
+        server_sent_events.push_back(json {
+            {"event", "response.output_item.added"},
+            {"data", json {
+                {"type", "response.output_item.added"},
+                {"item", output_item}
+            }}
+        });
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {

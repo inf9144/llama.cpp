@@ -72,6 +72,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
+    bool is_compaction_request = false;
 
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
@@ -97,7 +98,18 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             return j.contains(key) && j.at(key).is_string();
         };
 
-        for (json item : input_value) {
+        for (size_t input_index = 0; input_index < input_value.size(); ++input_index) {
+            json item = input_value.at(input_index);
+            const std::string item_type = json_value(item, "type", std::string());
+
+            if (item_type == "compaction_trigger") {
+                if (input_index + 1 != input_value.size()) {
+                    throw std::invalid_argument("'compaction_trigger' must be the last input item");
+                }
+                is_compaction_request = true;
+                continue;
+            }
+
             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
 
             if (exists_and_is_string(item, "content")) {
@@ -301,6 +313,23 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 }
+            } else if (item_type == "compaction" && exists_and_is_string(item, "encrypted_content")) {
+                static constexpr const char * compaction_prefix = "llama.cpp.compaction.v1\n";
+                const std::string encrypted_content = item.at("encrypted_content").get<std::string>();
+
+                if (encrypted_content.rfind(compaction_prefix, 0) != 0) {
+                    throw std::invalid_argument("Unsupported Responses compaction payload");
+                }
+
+                const std::string summary = encrypted_content.substr(std::char_traits<char>::length(compaction_prefix));
+                if (summary.empty()) {
+                    throw std::invalid_argument("Responses compaction payload is empty");
+                }
+
+                chatcmpl_messages.push_back(json {
+                    {"role", "user"},
+                    {"content", "<context_compaction>\n" + summary + "\n</context_compaction>"},
+                });
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
@@ -332,6 +361,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         }
     } else {
         throw std::invalid_argument("'input' must be a string or array of objects");
+    }
+
+    if (is_compaction_request) {
+        json chat_template_kwargs = json_value(chatcmpl_body, "chat_template_kwargs", json::object());
+        if (!chat_template_kwargs.is_object()) {
+            throw std::invalid_argument("'chat_template_kwargs' must be an object");
+        }
+
+        // Keep model-specific compaction prompting in the chat template. This
+        // flag does not alter durable history; a template can append its own
+        // compaction tail after rendering the normal message/tool prefix.
+        chat_template_kwargs["is_compaction"] = true;
+        chatcmpl_body["chat_template_kwargs"] = std::move(chat_template_kwargs);
+        chatcmpl_body["__llamacpp_responses_compaction"] = true;
     }
 
     chatcmpl_body["messages"] = chatcmpl_messages;
