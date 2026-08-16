@@ -356,6 +356,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
+    std::string oai_resp_compaction_content;
 
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
@@ -365,7 +366,30 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
+
+        common_chat_msg compaction_prefill_msg;
+        if (generation_params.responses_compaction) {
+            // common_chat_parse() prepends chat_parser_params.generation_prompt to
+            // every parse. Parse that prefill by itself so it can never become part
+            // of the durable compaction payload.
+            compaction_prefill_msg = common_chat_parse("", true, state.chat_parser_params);
+        }
+
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+
+        if (generation_params.responses_compaction) {
+            if (state.generated_text.find_first_not_of(" \t\r\n") == std::string::npos) {
+                throw std::runtime_error("Responses compaction generated no model output");
+            }
+
+            const std::string & prefill_content = compaction_prefill_msg.content;
+            const std::string & final_content = oaicompat_msg.content;
+            if (final_content.size() < prefill_content.size() ||
+                final_content.compare(0, prefill_content.size(), prefill_content) != 0) {
+                throw std::runtime_error("Responses compaction output does not extend its generation prefill");
+            }
+            oai_resp_compaction_content = final_content.substr(prefill_content.size());
+        }
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

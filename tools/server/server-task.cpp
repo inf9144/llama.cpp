@@ -606,7 +606,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     if (generation_params.responses_compaction) {
-        output.push_back(server_task_build_response_compaction(msg.content));
+        output.push_back(server_task_build_response_compaction(oai_resp_compaction_content));
     }
 
     std::time_t t = std::time(0);
@@ -711,7 +711,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     if (generation_params.responses_compaction) {
-        const json output_item = server_task_build_response_compaction(oaicompat_msg.content);
+        const json output_item = server_task_build_response_compaction(oai_resp_compaction_content);
 
         server_sent_events.push_back(json {
             {"event", "response.output_item.added"},
