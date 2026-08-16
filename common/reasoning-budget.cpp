@@ -67,6 +67,7 @@ struct common_reasoning_budget_ctx {
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
 
     bool diag_first_apply;    // one-shot raw-logit trace before any sampler modifies the first generation step
+    llama_tokens diag_prefill_tokens; // generation-prompt tokens accepted before the first sampling step
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
@@ -75,6 +76,10 @@ static const char * common_reasoning_budget_name(const struct llama_sampler * /*
 
 static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_token token) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    if (ctx->diag_first_apply) {
+        ctx->diag_prefill_tokens.push_back(token);
+    }
 
     switch (ctx->state) {
         case REASONING_BUDGET_IDLE:
@@ -171,6 +176,37 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
     if (ctx->diag_first_apply) {
         ctx->diag_first_apply = false;
 
+        std::string prefill_str;
+        const size_t n_prefill = ctx->diag_prefill_tokens.size();
+        const size_t n_dump = std::min<size_t>(64, n_prefill);
+        const size_t i_begin = n_prefill - n_dump;
+        for (size_t i = i_begin; i < n_prefill; ++i) {
+            const llama_token token = ctx->diag_prefill_tokens[i];
+            std::string piece;
+            if (ctx->vocab != nullptr) {
+                piece = common_token_to_piece(ctx->vocab, token, true);
+            }
+            std::string escaped;
+            escaped.reserve(piece.size());
+            for (const char c : piece) {
+                switch (c) {
+                    case '\\': escaped += "\\\\"; break;
+                    case '\n': escaped += "\\n";  break;
+                    case '\r': escaped += "\\r";  break;
+                    case '\t': escaped += "\\t";  break;
+                    case '\'': escaped += "\\'";  break;
+                    default:   escaped += c;       break;
+                }
+            }
+            if (!prefill_str.empty()) {
+                prefill_str += ", ";
+            }
+            prefill_str += string_format("#%zu id=%d piece='%s'", i, token, escaped.c_str());
+        }
+
+        COM_INF("first-apply prefill: state=%d tokens=%zu trailing=[%s]\n",
+                (int) ctx->state, n_prefill, prefill_str.c_str());
+
         std::vector<llama_token_data> top(cur_p->data, cur_p->data + cur_p->size);
         const size_t n_top = std::min<size_t>(10, top.size());
         if (n_top > 0) {
@@ -259,6 +295,7 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->force_pos = 0;
     ctx->end_match = -1;
     ctx->diag_first_apply = true;
+    ctx->diag_prefill_tokens.clear();
 }
 
 static struct llama_sampler * common_reasoning_budget_init_state(
@@ -311,16 +348,17 @@ static struct llama_sampler * common_reasoning_budget_init_state(
     return llama_sampler_init(
         /* .iface = */ &common_reasoning_budget_i,
         /* .ctx   = */ new common_reasoning_budget_ctx {
-            /* .vocab            = */ vocab,
-            /* .start_matcher    = */ token_matcher(start_seqs),
-            /* .end_matcher      = */ token_matcher(end_seqs),
-            /* .forced_tokens    = */ forced_tokens,
-            /* .budget           = */ budget,
-            /* .remaining        = */ budget,
-            /* .state            = */ initial_state,
-            /* .force_pos        = */ 0,
-            /* .end_match        = */ -1,
-            /* .diag_first_apply = */ true,
+            /* .vocab               = */ vocab,
+            /* .start_matcher       = */ token_matcher(start_seqs),
+            /* .end_matcher         = */ token_matcher(end_seqs),
+            /* .forced_tokens       = */ forced_tokens,
+            /* .budget              = */ budget,
+            /* .remaining           = */ budget,
+            /* .state               = */ initial_state,
+            /* .force_pos           = */ 0,
+            /* .end_match           = */ -1,
+            /* .diag_first_apply    = */ true,
+            /* .diag_prefill_tokens = */ {},
         }
     );
 }

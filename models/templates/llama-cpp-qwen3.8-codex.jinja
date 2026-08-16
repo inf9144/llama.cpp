@@ -604,11 +604,9 @@
     ------------------------------------------------------------------------- -#}
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
-    {%- if not (is_compaction | default(false)) %}
-        {%- if not _thinking_enabled %}
-            {{- '<think>\n\n</think>\n\n' }}
-        {%- else %}
-            {{- '<think>\n' }}
-        {%- endif %}
+    {%- if not _thinking_enabled %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
     {%- endif %}
 {%- endif %}
