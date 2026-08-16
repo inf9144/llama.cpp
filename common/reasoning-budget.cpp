@@ -65,6 +65,8 @@ struct common_reasoning_budget_ctx {
     size_t force_pos;         // next position in forced_tokens to force
 
     int32_t end_match;        // index into end_matcher.seqs of the sequence that transitioned to DONE, -1 if none
+
+    bool diag_first_apply;    // one-shot raw-logit trace before any sampler modifies the first generation step
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
@@ -166,6 +168,69 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    if (ctx->diag_first_apply) {
+        ctx->diag_first_apply = false;
+
+        std::vector<llama_token_data> top(cur_p->data, cur_p->data + cur_p->size);
+        const size_t n_top = std::min<size_t>(10, top.size());
+        if (n_top > 0) {
+            std::partial_sort(top.begin(), top.begin() + n_top, top.end(),
+                [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit;
+                });
+        }
+
+        float max_logit = -INFINITY;
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            max_logit = std::max(max_logit, cur_p->data[i].logit);
+        }
+
+        double sum_exp = 0.0;
+        if (std::isfinite(max_logit)) {
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                const float logit = cur_p->data[i].logit;
+                if (std::isfinite(logit)) {
+                    sum_exp += std::exp((double) logit - max_logit);
+                }
+            }
+        }
+
+        std::string top_str;
+        for (size_t i = 0; i < n_top; ++i) {
+            const auto & candidate = top[i];
+            std::string piece;
+            bool is_eog = false;
+            if (ctx->vocab != nullptr) {
+                piece = common_token_to_piece(ctx->vocab, candidate.id, true);
+                is_eog = llama_vocab_is_eog(ctx->vocab, candidate.id);
+            }
+            for (char & c : piece) {
+                if (c == '\n' || c == '\r' || c == '\t') {
+                    c = ' ';
+                }
+            }
+
+            const double probability = sum_exp > 0.0 && std::isfinite(candidate.logit)
+                ? std::exp((double) candidate.logit - max_logit) / sum_exp
+                : 0.0;
+
+            if (!top_str.empty()) {
+                top_str += ", ";
+            }
+            top_str += string_format(
+                "#%zu id=%d piece='%s' logit=%.6f p=%.6g eog=%d",
+                i + 1,
+                candidate.id,
+                piece.c_str(),
+                candidate.logit,
+                probability,
+                is_eog ? 1 : 0);
+        }
+
+        COM_INF("first-apply diag: state=%d candidates=%zu top=[%s]\n",
+                (int) ctx->state, cur_p->size, top_str.c_str());
+    }
+
     if (ctx->state != REASONING_BUDGET_FORCING) {
         // passthrough — don't modify logits
         return;
@@ -193,6 +258,7 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     ctx->force_pos = 0;
     ctx->end_match = -1;
+    ctx->diag_first_apply = true;
 }
 
 static struct llama_sampler * common_reasoning_budget_init_state(
@@ -245,15 +311,16 @@ static struct llama_sampler * common_reasoning_budget_init_state(
     return llama_sampler_init(
         /* .iface = */ &common_reasoning_budget_i,
         /* .ctx   = */ new common_reasoning_budget_ctx {
-            /* .vocab         = */ vocab,
-            /* .start_matcher = */ token_matcher(start_seqs),
-            /* .end_matcher   = */ token_matcher(end_seqs),
-            /* .forced_tokens = */ forced_tokens,
-            /* .budget        = */ budget,
-            /* .remaining     = */ budget,
-            /* .state         = */ initial_state,
-            /* .force_pos     = */ 0,
-            /* .end_match     = */ -1,
+            /* .vocab            = */ vocab,
+            /* .start_matcher    = */ token_matcher(start_seqs),
+            /* .end_matcher      = */ token_matcher(end_seqs),
+            /* .forced_tokens    = */ forced_tokens,
+            /* .budget           = */ budget,
+            /* .remaining        = */ budget,
+            /* .state            = */ initial_state,
+            /* .force_pos        = */ 0,
+            /* .end_match        = */ -1,
+            /* .diag_first_apply = */ true,
         }
     );
 }
