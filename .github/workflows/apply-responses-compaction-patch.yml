@@ -16,20 +16,205 @@ jobs:
         with:
           ref: codex-compat
           fetch-depth: 0
-      - name: Apply staged patch
+      - name: Apply source edits
         shell: bash
         run: |
           set -euo pipefail
-          patch=.github/patches/responses-compaction-v2.patch
-          if git apply --check "$patch"; then
-            git apply "$patch"
-          elif git apply --reverse --check "$patch"; then
-            echo "Patch is already applied"
-            exit 0
-          else
-            echo "Patch neither applies nor reverses cleanly" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one replacement anchor, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          path = "tools/server/server-chat.cpp"
+          replace_once(
+              path,
+              '    std::vector<json> chatcmpl_messages;\n',
+              '    std::vector<json> chatcmpl_messages;\n'
+              '    bool is_compaction_request = false;\n',
+          )
+          replace_once(
+              path,
+              '        for (json item : input_value) {\n'
+              '            bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";\n',
+              '        for (size_t input_index = 0; input_index < input_value.size(); ++input_index) {\n'
+              '            json item = input_value.at(input_index);\n'
+              '            const std::string item_type = json_value(item, "type", std::string());\n'
+              '\n'
+              '            if (item_type == "compaction_trigger") {\n'
+              '                if (input_index + 1 != input_value.size()) {\n'
+              '                    throw std::invalid_argument("\'compaction_trigger\' must be the last input item");\n'
+              '                }\n'
+              '                is_compaction_request = true;\n'
+              '                continue;\n'
+              '            }\n'
+              '\n'
+              '            bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";\n',
+          )
+          replace_once(
+              path,
+              '            } else if (exists_and_is_array(item, "summary") &&\n'
+              '                exists_and_is_string(item, "type") &&\n'
+              '                item.at("type") == "reasoning") {\n',
+              '            } else if (item_type == "compaction" && exists_and_is_string(item, "encrypted_content")) {\n'
+              '                static constexpr const char * compaction_prefix = "llama.cpp.compaction.v1\\n";\n'
+              '                const std::string encrypted_content = item.at("encrypted_content").get<std::string>();\n'
+              '\n'
+              '                if (encrypted_content.rfind(compaction_prefix, 0) != 0) {\n'
+              '                    throw std::invalid_argument("Unsupported Responses compaction payload");\n'
+              '                }\n'
+              '\n'
+              '                const std::string summary = encrypted_content.substr(std::char_traits<char>::length(compaction_prefix));\n'
+              '                if (summary.empty()) {\n'
+              '                    throw std::invalid_argument("Responses compaction payload is empty");\n'
+              '                }\n'
+              '\n'
+              '                chatcmpl_messages.push_back(json {\n'
+              '                    {"role", "user"},\n'
+              '                    {"content", "<context_compaction>\\n" + summary + "\\n</context_compaction>"},\n'
+              '                });\n'
+              '            } else if (exists_and_is_array(item, "summary") &&\n'
+              '                exists_and_is_string(item, "type") &&\n'
+              '                item.at("type") == "reasoning") {\n',
+          )
+          replace_once(
+              path,
+              '    chatcmpl_body["messages"] = chatcmpl_messages;\n',
+              '    if (is_compaction_request) {\n'
+              '        json chat_template_kwargs = json_value(chatcmpl_body, "chat_template_kwargs", json::object());\n'
+              '        if (!chat_template_kwargs.is_object()) {\n'
+              '            throw std::invalid_argument("\'chat_template_kwargs\' must be an object");\n'
+              '        }\n'
+              '\n'
+              '        // Keep model-specific compaction prompting in the chat template. This\n'
+              '        // flag does not alter durable history; a template can append its own\n'
+              '        // compaction tail after rendering the normal message/tool prefix.\n'
+              '        chat_template_kwargs["is_compaction"] = true;\n'
+              '        chatcmpl_body["chat_template_kwargs"] = std::move(chat_template_kwargs);\n'
+              '        chatcmpl_body["__llamacpp_responses_compaction"] = true;\n'
+              '    }\n'
+              '\n'
+              '    chatcmpl_body["messages"] = chatcmpl_messages;\n',
+          )
+
+          path = "tools/server/server-task.h"
+          replace_once(
+              path,
+              '    bool return_tokens   = false;\n'
+              '    bool return_progress = false;\n',
+              '    bool return_tokens   = false;\n'
+              '    bool return_progress = false;\n'
+              '    bool responses_compaction = false;\n',
+          )
+
+          path = "tools/server/server-schema.cpp"
+          replace_once(
+              path,
+              '    add((new field_bool("return_progress", params.return_progress))\n'
+              '        ->set_desc("Include prompt processing progress events in stream mode"));\n'
+              '\n',
+              '    add((new field_bool("return_progress", params.return_progress))\n'
+              '        ->set_desc("Include prompt processing progress events in stream mode"));\n'
+              '\n'
+              '    add((new field_bool("__llamacpp_responses_compaction", params.responses_compaction))\n'
+              '        ->set_desc("Internal Responses API context compaction marker"));\n'
+              '\n',
+          )
+
+          path = "tools/server/server-task.cpp"
+          replace_once(
+              path,
+              'using json = nlohmann::ordered_json;\n'
+              '\n',
+              'using json = nlohmann::ordered_json;\n'
+              '\n'
+              'static json server_task_build_response_compaction(const std::string & summary) {\n'
+              '    return json {\n'
+              '        {"id",                "cmp_" + random_string()},\n'
+              '        {"type",              "compaction"},\n'
+              '        {"encrypted_content", "llama.cpp.compaction.v1\\n" + summary},\n'
+              '    };\n'
+              '}\n'
+              '\n',
+          )
+          anchor = (
+              '    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {\n'
+              '        output.push_back(server_task_build_response_function_call(tool_call, "completed"));\n'
+              '    }\n'
+              '\n'
+              '    std::time_t t = std::time(0);\n'
+          )
+          replacement = (
+              '    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {\n'
+              '        output.push_back(server_task_build_response_function_call(tool_call, "completed"));\n'
+              '    }\n'
+              '\n'
+              '    if (generation_params.responses_compaction) {\n'
+              '        output.push_back(server_task_build_response_compaction(msg.content));\n'
+              '    }\n'
+              '\n'
+              '    std::time_t t = std::time(0);\n'
+          )
+          replace_once(path, anchor, replacement)
+
+          anchor = (
+              '    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {\n'
+              '        const json output_item = server_task_build_response_function_call(tool_call, "completed");\n'
+              '        server_sent_events.push_back(json {\n'
+              '            {"event", "response.output_item.done"},\n'
+              '            {"data", json {\n'
+              '                {"type", "response.output_item.done"},\n'
+              '                {"item", output_item}\n'
+              '            }}\n'
+              '        });\n'
+              '        output.push_back(output_item);\n'
+              '    }\n'
+              '\n'
+              '    std::time_t t = std::time(0);\n'
+          )
+          replacement = (
+              '    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {\n'
+              '        const json output_item = server_task_build_response_function_call(tool_call, "completed");\n'
+              '        server_sent_events.push_back(json {\n'
+              '            {"event", "response.output_item.done"},\n'
+              '            {"data", json {\n'
+              '                {"type", "response.output_item.done"},\n'
+              '                {"item", output_item}\n'
+              '            }}\n'
+              '        });\n'
+              '        output.push_back(output_item);\n'
+              '    }\n'
+              '\n'
+              '    if (generation_params.responses_compaction) {\n'
+              '        const json output_item = server_task_build_response_compaction(oaicompat_msg.content);\n'
+              '\n'
+              '        server_sent_events.push_back(json {\n'
+              '            {"event", "response.output_item.added"},\n'
+              '            {"data", json {\n'
+              '                {"type", "response.output_item.added"},\n'
+              '                {"item", output_item}\n'
+              '            }}\n'
+              '        });\n'
+              '        server_sent_events.push_back(json {\n'
+              '            {"event", "response.output_item.done"},\n'
+              '            {"data", json {\n'
+              '                {"type", "response.output_item.done"},\n'
+              '                {"item", output_item}\n'
+              '            }}\n'
+              '        });\n'
+              '        output.push_back(output_item);\n'
+              '    }\n'
+              '\n'
+              '    std::time_t t = std::time(0);\n'
+          )
+          replace_once(path, anchor, replacement)
+          PY
+
           git diff --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
