@@ -374,10 +374,6 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         // compaction tail after rendering the normal message/tool prefix.
         chat_template_kwargs["is_compaction"] = true;
         chatcmpl_body["chat_template_kwargs"] = std::move(chat_template_kwargs);
-
-        // Keep the tool definitions visible so the rendered prefix stays cache-identical,
-        // but force the compaction turn itself to produce content rather than a tool call.
-        chatcmpl_body["tool_choice"] = "none";
         chatcmpl_body["__llamacpp_responses_compaction"] = true;
     }
 
