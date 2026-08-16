@@ -1,0 +1,38 @@
+name: Apply Responses compaction patch
+
+on:
+  push:
+    branches: [codex-compat]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex-compat
+          fetch-depth: 0
+      - name: Apply staged patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch=.github/patches/responses-compaction-v2.patch
+          if git apply --check "$patch"; then
+            git apply "$patch"
+          elif git apply --reverse --check "$patch"; then
+            echo "Patch is already applied"
+            exit 0
+          else
+            echo "Patch neither applies nor reverses cleanly" >&2
+            exit 1
+          fi
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/server/server-chat.cpp tools/server/server-task.h tools/server/server-schema.cpp tools/server/server-task.cpp
+          git commit -m 'server: support Responses compaction v2'
+          git push origin HEAD:codex-compat
