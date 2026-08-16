@@ -15,6 +15,10 @@
 using json = nlohmann::ordered_json;
 
 static json server_task_build_response_compaction(const std::string & summary) {
+    if (summary.find_first_not_of(" \\t\\r\\n") == std::string::npos) {
+        throw std::runtime_error("Responses compaction generated an empty summary");
+    }
+
     return json {
         {"id",                "cmp_" + random_string()},
         {"type",              "compaction"},
