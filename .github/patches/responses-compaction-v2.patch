@@ -54,47 +54,60 @@ index 21889a7a6..000000000 100644
              } else if (exists_and_is_array(item, "summary") &&
                  exists_and_is_string(item, "type") &&
                  item.at("type") == "reasoning") {
-@@ -329,6 +358,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
+@@ -329,6 +358,19 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
          throw std::invalid_argument("'input' must be a string or array of objects");
      }
  
 +    if (is_compaction_request) {
-+        chatcmpl_messages.push_back(json {
-+            {"role", "user"},
-+            {"content",
-+                "You are performing a CONTEXT CHECKPOINT COMPACTION. "
-+                "Do not call or use any tools. Create a handoff summary for another language model that will resume the task. "
-+                "Include current progress and key decisions, important context and constraints, remaining work, and critical data, examples, or references. "
-+                "Be concise, structured, and output only the handoff summary."},
-+        });
++        json chat_template_kwargs = json_value(chatcmpl_body, "chat_template_kwargs", json::object());
++        if (!chat_template_kwargs.is_object()) {
++            throw std::invalid_argument("'chat_template_kwargs' must be an object");
++        }
 +
-+        // Internal marker carried through task_params without changing the rendered prompt.
-+        chatcmpl_body["response_fields"] = json::array({"__llamacpp_responses_compaction"});
++        // Keep model-specific compaction prompting in the chat template. This
++        // flag does not alter durable history; a template can append its own
++        // compaction tail after rendering the normal message/tool prefix.
++        chat_template_kwargs["is_compaction"] = true;
++        chatcmpl_body["chat_template_kwargs"] = std::move(chat_template_kwargs);
++        chatcmpl_body["__llamacpp_responses_compaction"] = true;
 +    }
 +
      chatcmpl_body["messages"] = chatcmpl_messages;
  
      if (response_body.contains("tools")) {
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index b6da4d4bd..000000000 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -48,6 +48,7 @@ struct task_params {
+     bool return_tokens   = false;
+     bool return_progress = false;
++    bool responses_compaction = false;
+ 
+     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+ 
+ diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 5d7fa6ae6..000000000 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -26,6 +26,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("return_progress", params.return_progress))
+         ->set_desc("Include prompt processing progress events in stream mode"));
+ 
++    add((new field_bool("__llamacpp_responses_compaction", params.responses_compaction))
++        ->set_desc("Internal Responses API context compaction marker"));
++
+     add((new field_num("sse_ping_interval", params.sse_ping_interval))
+         ->set_hard_limits(-1, INT32_MAX)
+         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
 index 5d6a31f5f..000000000 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
-@@ -10,10 +10,26 @@
- #include "speculative.h"
- #include "server-common.h"
- 
-+#include <algorithm>
- #include <sstream>
+@@ -13,6 +13,14 @@
  
  using json = nlohmann::ordered_json;
  
-+static bool server_task_is_responses_compaction(const std::vector<std::string> & response_fields) {
-+    return std::find(
-+        response_fields.begin(),
-+        response_fields.end(),
-+        "__llamacpp_responses_compaction") != response_fields.end();
-+}
-+
 +static json server_task_build_response_compaction(const std::string & summary) {
 +    return json {
 +        {"id",                "cmp_" + random_string()},
@@ -106,22 +119,22 @@ index 5d6a31f5f..000000000 100644
  static json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
      std::string tool_namespace;
      std::string tool_name;
-@@ -591,6 +607,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
+@@ -591,6 +599,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
          output.push_back(server_task_build_response_function_call(tool_call, "completed"));
      }
  
-+    if (server_task_is_responses_compaction(response_fields)) {
++    if (generation_params.responses_compaction) {
 +        output.push_back(server_task_build_response_compaction(msg.content));
 +    }
 +
      std::time_t t = std::time(0);
      json res = {
          {"completed_at", t},
-@@ -688,6 +708,28 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
+@@ -688,6 +700,28 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
          output.push_back(output_item);
      }
  
-+    if (server_task_is_responses_compaction(response_fields)) {
++    if (generation_params.responses_compaction) {
 +        const json output_item = server_task_build_response_compaction(oaicompat_msg.content);
 +
 +        server_sent_events.push_back(json {
