@@ -86,7 +86,7 @@ index b6da4d4bd..000000000 100644
  
      int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
  
- diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
 index 5d7fa6ae6..000000000 100644
 --- a/tools/server/server-schema.cpp
 +++ b/tools/server/server-schema.cpp
