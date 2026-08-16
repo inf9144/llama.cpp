@@ -74,7 +74,7 @@ json server_slot_stats::to_json() const {
         {"prompt_per_second",      n_prompt_tps()},
 
         {"predicted_n",            n_gen},
-        {"predicted_ms",           t_gen_ms()},
+        {"predicted_ms",            t_gen_ms()},
         {"predicted_per_token_ms", t_gen_per_token_ms()},
         {"predicted_per_second",   n_gen_tps()},
     };
@@ -1119,6 +1119,7 @@ json oaicompat_chat_params_parse(
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+    const bool is_responses_compaction = json_value(body, "__llamacpp_responses_compaction", false);
 
     if (!opt.use_jinja) {
         if (has_tools) {
@@ -1253,6 +1254,7 @@ json oaicompat_chat_params_parse(
         common_chat_continuation_parse(body.at("continue_final_message")) :
         COMMON_CHAT_CONTINUATION_NONE;
     if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
+        && !is_responses_compaction
         && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
         if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
