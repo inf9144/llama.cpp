@@ -15,12 +15,12 @@
     Configuration
     ------------------------------------------------------------------------- -#}
 {%- set _requested_tool_format =
-    tool_call_format if tool_call_format is defined else 'auto'
+    tool_call_format if tool_call_format is defined else 'json'
 %}
 {%- if _requested_tool_format not in ('auto', 'xml', 'json') %}
     {{- raise_exception(
         'Unexpected tool_call_format ' ~ _requested_tool_format ~
-        '. Supported values are auto (default), xml, and json.'
+        '. Supported values are auto, xml, and json (default).'
     ) }}
 {%- endif %}
 {%- set add_vision_id = add_vision_id if add_vision_id is defined else false %}
@@ -77,15 +77,13 @@
     hand-rolled scanner could not decode \uXXXX escapes correctly. Guessing
     would silently corrupt tool arguments, which is worse than any error.
 
-    So when the caller does not pin a format, render the whole prompt in the
-    JSON tool-call form if any tool call in the history carries string
-    arguments. That is lossless, needs no decoding, and keeps the system-prompt
-    instructions and the rendered history in one consistent format. Histories
-    whose arguments are all mappings still render as XML, byte-identically to
-    tool_call_format='xml'.
-
-    A caller that explicitly pins 'xml' still gets a hard error for string
-    arguments, because that request cannot be honoured faithfully.
+    This Codex-specific template defaults to JSON so the rendered system/tool
+    prefix stays stable even when compaction removes historical tool calls.
+    Callers may still explicitly request `auto`; in that mode, render the whole
+    prompt as JSON if any tool call in history carries string arguments,
+    otherwise render XML. A caller that explicitly pins `xml` still gets a hard
+    error for string arguments because that request cannot be honoured
+    faithfully.
     ------------------------------------------------------------------------- -#}
 {%- set format_scan = namespace(has_json_string_arguments=false) %}
 {%- for message in messages %}
