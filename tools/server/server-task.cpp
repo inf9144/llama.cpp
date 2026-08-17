@@ -48,6 +48,63 @@ static json server_task_build_response_function_call(const common_chat_tool_call
     return output_item;
 }
 
+static bool server_task_is_response_custom_tool(
+        const std::unordered_set<std::string> & custom_tools,
+        const common_chat_tool_call & tool_call) {
+    return custom_tools.count(tool_call.name) != 0;
+}
+
+static std::string server_task_response_custom_tool_input(const common_chat_tool_call & tool_call) {
+    json arguments;
+    try {
+        arguments = json::parse(tool_call.arguments);
+    } catch (const std::exception & e) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' produced invalid bridge arguments: " + e.what());
+    }
+
+    if (!arguments.is_object() || arguments.size() != 1 ||
+        !arguments.contains("input") || !arguments.at("input").is_string()) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one string 'input' argument");
+    }
+
+    return arguments.at("input").get<std::string>();
+}
+
+static json server_task_build_response_custom_tool_call(
+        const common_chat_tool_call & tool_call,
+        const std::string & status) {
+    std::string tool_namespace;
+    std::string tool_name;
+
+    json output_item = {
+        {"id",      "ctc_" + tool_call.id},
+        {"type",    "custom_tool_call"},
+        {"status",  status},
+        {"input",   server_task_response_custom_tool_input(tool_call)},
+        {"call_id", "call_" + tool_call.id},
+    };
+
+    if (server_chat_decode_namespace_tool_name(tool_call.name, tool_namespace, tool_name)) {
+        output_item["name"] = tool_name;
+        output_item["namespace"] = tool_namespace;
+    } else {
+        output_item["name"] = tool_call.name;
+    }
+
+    return output_item;
+}
+
+static json server_task_build_response_tool_call(
+        const common_chat_tool_call & tool_call,
+        const std::string & status,
+        const std::unordered_set<std::string> & custom_tools) {
+    return server_task_is_response_custom_tool(custom_tools, tool_call)
+        ? server_task_build_response_custom_tool_call(tool_call, status)
+        : server_task_build_response_function_call(tool_call, status);
+}
+
 //
 // task_params
 //
@@ -184,8 +241,11 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
-task_result_state::task_result_state(const common_chat_parser_params & chat_parser_params)
+task_result_state::task_result_state(
+        const common_chat_parser_params & chat_parser_params,
+        const std::unordered_set<std::string> & responses_custom_tools)
     : chat_parser_params(chat_parser_params)
+    , responses_custom_tools(responses_custom_tools)
     , oai_resp_id("resp_" + random_string())
     , oai_resp_reasoning_id("rs_" + random_string())
     , oai_resp_message_id("msg_" + random_string()) {
@@ -602,7 +662,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(server_task_build_response_function_call(tool_call, "completed"));
+        output.push_back(server_task_build_response_tool_call(
+            tool_call, "completed", generation_params.responses_custom_tools));
     }
 
     if (generation_params.responses_compaction) {
@@ -699,7 +760,33 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        const json output_item = server_task_build_response_function_call(tool_call, "completed");
+        const bool is_custom = server_task_is_response_custom_tool(
+            generation_params.responses_custom_tools, tool_call);
+        const json output_item = server_task_build_response_tool_call(
+            tool_call, "completed", generation_params.responses_custom_tools);
+
+        if (is_custom) {
+            json added_item = output_item;
+            added_item["status"] = "in_progress";
+            added_item["input"] = "";
+            server_sent_events.push_back(json {
+                {"event", "response.output_item.added"},
+                {"data", json {
+                    {"type", "response.output_item.added"},
+                    {"item", added_item}
+                }}
+            });
+            server_sent_events.push_back(json {
+                {"event", "response.custom_tool_call_input.delta"},
+                {"data", json {
+                    {"type",    "response.custom_tool_call_input.delta"},
+                    {"item_id", output_item.at("id")},
+                    {"call_id", output_item.at("call_id")},
+                    {"delta",   output_item.at("input")},
+                }}
+            });
+        }
+
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1047,6 +1134,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
     oai_resp_fc_id         = state.oai_resp_fc_id;
+    oai_resp_fc_is_custom  = state.oai_resp_fc_is_custom;
+    responses_custom_tools = state.responses_custom_tools;
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
@@ -1065,6 +1154,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
         }
         if (!diff.tool_call_delta.name.empty()) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
+            state.oai_resp_fc_is_custom =
+                state.responses_custom_tools.count(diff.tool_call_delta.name) != 0;
         }
     }
 }
@@ -1249,6 +1340,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         });
     }
 
+    bool current_tool_is_custom = oai_resp_fc_is_custom;
+    std::string current_tool_id = oai_resp_fc_id;
+
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
         if (!diff.reasoning_content_delta.empty()) {
             if (!thinking_block_started) {
@@ -1317,24 +1411,31 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.name.empty()) {
-            common_chat_tool_call tool_call = diff.tool_call_delta;
-            events.push_back(json {
-                {"event", "response.output_item.added"},
-                {"data", json {
-                    {"type",  "response.output_item.added"},
-                    {"item", server_task_build_response_function_call(tool_call, "in_progress")},
-                }},
-            });
-            oai_resp_fc_id = diff.tool_call_delta.id;
+            current_tool_id = diff.tool_call_delta.id;
+            current_tool_is_custom =
+                responses_custom_tools.count(diff.tool_call_delta.name) != 0;
+
+            if (!current_tool_is_custom) {
+                common_chat_tool_call tool_call = diff.tool_call_delta;
+                events.push_back(json {
+                    {"event", "response.output_item.added"},
+                    {"data", json {
+                        {"type",  "response.output_item.added"},
+                        {"item", server_task_build_response_function_call(tool_call, "in_progress")},
+                    }},
+                });
+            }
+            oai_resp_fc_id = current_tool_id;
+            oai_resp_fc_is_custom = current_tool_is_custom;
         }
 
-        if (!diff.tool_call_delta.arguments.empty()) {
+        if (!diff.tool_call_delta.arguments.empty() && !current_tool_is_custom) {
             events.push_back(json {
                 {"event", "response.function_call_arguments.delta"},
                 {"data", json {
                     {"type",    "response.function_call_arguments.delta"},
                     {"delta",   diff.tool_call_delta.arguments},
-                    {"item_id", "fc_" + oai_resp_fc_id},
+                    {"item_id", "fc_" + current_tool_id},
                 }},
             });
         }

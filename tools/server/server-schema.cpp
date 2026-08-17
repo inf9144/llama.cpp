@@ -40,6 +40,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("__llamacpp_responses_compaction", params.responses_compaction))
         ->set_desc("Internal Responses API context compaction marker"));
 
+    add((new field_json("__llamacpp_responses_custom_tools"))
+        ->set_desc("Internal Responses API custom tool names")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto names = data.at("__llamacpp_responses_custom_tools").get<std::vector<std::string>>();
+            ctx.params.responses_custom_tools.clear();
+            ctx.params.responses_custom_tools.insert(names.begin(), names.end());
+        }));
+
     add((new field_num("sse_ping_interval", params.sse_ping_interval))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));
