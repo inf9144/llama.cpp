@@ -1939,12 +1939,16 @@ static void test_convert_responses_to_chatcmpl() {
 
         assert_equals(true, result.contains("tools"));
         assert_equals(true, result.at("tools").is_array());
-        assert_equals((size_t)1, result.at("tools").size());
+        assert_equals((size_t)2, result.at("tools").size());
 
-        const auto & tool = result.at("tools")[0];
-        assert_equals(std::string("function"), tool.at("type").get<std::string>());
-        assert_equals(std::string("get_weather"), tool.at("function").at("name").get<std::string>());
-        assert_equals(true, tool.at("function").at("strict").get<bool>());
+        const auto & web_search_tool = result.at("tools")[0];
+        assert_equals(std::string("function"), web_search_tool.at("type").get<std::string>());
+        assert_equals(std::string("web_search"), web_search_tool.at("function").at("name").get<std::string>());
+
+        const auto & weather_tool = result.at("tools")[1];
+        assert_equals(std::string("function"), weather_tool.at("type").get<std::string>());
+        assert_equals(std::string("get_weather"), weather_tool.at("function").at("name").get<std::string>());
+        assert_equals(true, weather_tool.at("function").at("strict").get<bool>());
     }
 
     // Test non-function Responses tools are ignored
@@ -1972,7 +1976,10 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
-        assert_equals(false, result.contains("tools"));
+        assert_equals(true, result.contains("tools"));
+        assert_equals((size_t)1, result.at("tools").size());
+        assert_equals(std::string("web_search"),
+            result.at("tools")[0].at("function").at("name").get<std::string>());
     }
 }
 

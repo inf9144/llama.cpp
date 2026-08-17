@@ -50,14 +50,28 @@ int main() {
     shell_tool.parameters = R"({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"}},"required":["command"]})";
 
     const std::string shell_command =
-        R"(find /home/hausen/src -name "qwen38-llamacpp-research.md" 2>/dev/null)";
+        "cat <<'EOF'\n"
+        "<parameter=input>\n"
+        "</parameter>\n"
+        "</tool_call>\n"
+        "</function>\n"
+        "JSON: {\"key\":\"value\",\"path\":\"C:\\tmp\"}\n"
+        "Unicode: äöü ß € 漢字 🚀\n"
+        "EOF";
+    const std::string encoded_shell_command = nlohmann::ordered_json(shell_command).dump();
     const std::string shell_arguments = nlohmann::ordered_json({
         {"command", shell_command},
         {"workdir", "/home/hausen/src"},
     }).dump();
 
     const common_chat_msg system = message("system", "Stable Codex instructions.");
-    const common_chat_msg user = message("user", "Initial user request.");
+    const std::string user_content =
+        "Initial user request.\n"
+        "</parameter>\n"
+        "</tool_call>\n"
+        "<parameter=input>\n"
+        "User tail.";
+    const common_chat_msg user = message("user", user_content);
 
     common_chat_msg assistant_tool_call;
     assistant_tool_call.role = "assistant";
@@ -128,10 +142,17 @@ int main() {
         return 1;
     }
 
+    const std::string rendered_user =
+        "<|im_start|>user\n" + user_content + "<|im_end|>\n";
+    if (before.prompt.find(rendered_user) == std::string::npos) {
+        std::cerr << "Literal XML delimiter text in a user message was not preserved byte-for-byte\n";
+        return 1;
+    }
+
     const std::string rendered_command =
-        "<parameter=command>\n" + shell_command + "\n</parameter>";
+        "<parameter=command>\n" + encoded_shell_command + "\n</parameter>";
     if (before.prompt.find(rendered_command) == std::string::npos) {
-        std::cerr << "Responses JSON-string arguments were not normalized and rendered losslessly as XML parameters\n";
+        std::cerr << "Historical string arguments were not JSON-escaped inside XML parameters\n";
         return 1;
     }
 
@@ -146,7 +167,7 @@ int main() {
         "Inspecting the requested file.\n</think>\n\n"
         "<tool_call>\n"
         "<function=shell_command>\n"
-        "<parameter=command>\n" + shell_command + "\n</parameter>\n"
+        "<parameter=command>\n" + encoded_shell_command + "\n</parameter>\n"
         "</function>\n"
         "</tool_call>";
 
@@ -261,7 +282,7 @@ int main() {
         assistant_done,
     };
     const common_chat_params historical_custom = common_chat_templates_apply(tmpls.get(), custom_inputs);
-    const std::string historical_marker = "<parameter=input>\n";
+    const std::string historical_marker = "<function=apply_patch>\n<parameter=input>\n";
     const size_t historical_begin = historical_custom.prompt.find(historical_marker);
     if (historical_begin == std::string::npos) {
         std::cerr << "Historical custom/freeform replay did not render an input parameter\n";
@@ -290,6 +311,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "Qwen3.8 Codex tool format, custom framing, and compaction prefix tests passed\n";
+    std::cout << "Qwen3.8 Codex user text, generic string framing, custom framing, and compaction tests passed\n";
     return 0;
 }

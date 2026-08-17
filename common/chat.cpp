@@ -1152,6 +1152,7 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
     auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+    const bool json_string_args   = tmpl.source().find("llama.cpp:xml-string-args=json") != std::string::npos;
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
@@ -1218,9 +1219,13 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
 
-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
-                        arg_string :
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    // Preserve the legacy raw-string parser exactly unless the selected
+                    // template explicitly uses JSON string literals inside XML parameters.
+                    auto arg_value = arg_string;
+                    if (!schema_info.resolves_to_string(param_schema) || json_string_args) {
+                        arg_value = p.tool_arg_json_value(
+                            p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 

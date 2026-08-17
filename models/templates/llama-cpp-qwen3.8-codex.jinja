@@ -1,4 +1,5 @@
 {%- set template_version = "qwen3.8-codex-safe-v1" %}
+{#- llama.cpp:xml-string-args=json -#}
 {#- -------------------------------------------------------------------------
     Whitespace contract: every tag opener in this file carries a leading minus,
     so it strips the whitespace and newlines that precede it. All emitted text
@@ -297,7 +298,7 @@
     {%- if _tool_format == 'json' %}
         {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n{"name": "example_function_name", "arguments": {"example_parameter_1": "value_1", "example_parameter_2": "This is the value for the second parameter"}}\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: a single JSON object with "name" and "arguments" keys must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
     {%- else %}
-        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"value_1"\n</parameter>\n<parameter=example_parameter_2>\n"This is the value for the second parameter\\nthat can span\\nmultiple lines"\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- String parameter values MUST use JSON string syntax inside the XML parameter, including surrounding double quotes and JSON escapes such as \\n for embedded newlines\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
     {%- endif %}
     {%- if _system_content %}
         {{- '\n\n' ~ _system_content }}
@@ -491,18 +492,12 @@
                                     ~ _argument_name
                                     ~ '>\n'
                                 }}
-                                {#- Preserve strings verbatim. Serialize every
-                                    other type as JSON so booleans and null stay
-                                    true/false/null instead of True/False/None. -#}
-                                {%- if args_value is string %}
-                                    {%- set _argument_value =
-                                        args_value
-                                    %}
-                                {%- else %}
-                                    {%- set _argument_value =
-                                        args_value | tojson
-                                    %}
-                                {%- endif %}
+                                {#- Serialize every XML parameter value as JSON. In
+                                    particular, JSON quoting/escaping makes string values
+                                    unable to collide with XML closing delimiters. -#}
+                                {%- set _argument_value =
+                                    args_value | tojson
+                                %}
                                 {%- if max_tool_arg_chars > 0
                                        and _argument_value | length
                                            > max_tool_arg_chars %}
