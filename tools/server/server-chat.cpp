@@ -267,14 +267,14 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "custom_tool_call"
             ) {
-                // Responses custom/freeform calls are represented internally as a
-                // single-string function argument and restored on Responses egress.
+                // Responses custom/freeform calls use a nested JSON transport so
+                // arbitrary payload text cannot collide with XML parameter framing.
                 const std::string tool_name = server_chat_encode_namespace_tool_name(
                     json_value(item, "namespace", std::string()),
                     item.at("name").get<std::string>());
                 json tool_call = {
                     {"function", json {
-                        {"arguments", json({{"input", item.at("input")}}).dump()},
+                        {"arguments", json({{"input", json({{"data", item.at("input")}})}}).dump()},
                         {"name",      tool_name},
                     }},
                     {"id",   item.at("call_id")},
@@ -460,7 +460,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             if (!description.empty()) {
                 description += "\n\n";
             }
-            description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the raw freeform payload verbatim in the single `input` parameter; do not add another serialization layer inside that string.";
+            description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the raw freeform payload verbatim in the `data` string inside the single `input` object. The `input.data` wrapper is transport-only; the Responses API receives only the decoded raw string.";
 
             chatcmpl_tools.push_back(json {
                 {"type", "function"},
@@ -471,9 +471,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     {"parameters", json {
                         {"type", "object"},
                         {"properties", json {
+                            // Keep the XML parameter itself non-string so Qwen3-Coder
+                            // parses it as JSON rather than raw text terminated by
+                            // </parameter>. The nested data field remains string-only.
                             {"input", json {
-                                {"type", "string"},
-                                {"description", "Raw freeform input for the custom tool."},
+                                {"type", "object"},
+                                {"description", "Transport wrapper for a Responses custom/freeform payload."},
+                                {"properties", json {
+                                    {"data", json {
+                                        {"type", "string"},
+                                        {"description", "Raw freeform input passed verbatim to the custom tool."},
+                                    }},
+                                }},
+                                {"required", json::array({"data"})},
+                                {"additionalProperties", false},
                             }},
                         }},
                         {"required", json::array({"input"})},

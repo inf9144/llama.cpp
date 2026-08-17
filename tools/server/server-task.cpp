@@ -64,12 +64,18 @@ static std::string server_task_response_custom_tool_input(const common_chat_tool
     }
 
     if (!arguments.is_object() || arguments.size() != 1 ||
-        !arguments.contains("input") || !arguments.at("input").is_string()) {
+        !arguments.contains("input") || !arguments.at("input").is_object()) {
         throw std::runtime_error(
-            "Responses custom tool '" + tool_call.name + "' must produce exactly one string 'input' argument");
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one 'input' transport object");
     }
 
-    return arguments.at("input").get<std::string>();
+    const json & input = arguments.at("input");
+    if (input.size() != 1 || !input.contains("data") || !input.at("data").is_string()) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one string 'input.data' argument");
+    }
+
+    return input.at("data").get<std::string>();
 }
 
 static json server_task_build_response_custom_tool_call(

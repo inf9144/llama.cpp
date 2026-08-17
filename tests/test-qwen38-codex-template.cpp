@@ -171,6 +171,125 @@ int main() {
         return 1;
     }
 
-    std::cout << "Qwen3.8 Codex tool format and compaction prefix tests passed\n";
+    // Responses custom/freeform tools wrap the raw payload in input.data. The
+    // outer object forces Qwen3-Coder onto its JSON-value PEG path, while the
+    // nested string schema still guarantees that the transported value is text.
+    common_chat_tool custom_tool;
+    custom_tool.name = "apply_patch";
+    custom_tool.description = "Responses custom/freeform transport test";
+    custom_tool.parameters = R"({"type":"object","properties":{"input":{"type":"object","properties":{"data":{"type":"string"}},"required":["data"],"additionalProperties":false}},"required":["input"],"additionalProperties":false})";
+
+    const std::string custom_input =
+        "*** Begin Patch\n"
+        "*** Add File: xml_delim_test.txt\n"
+        "+<function=apply_patch>\n"
+        "+<parameter=input>\n"
+        "+</parameter>\n"
+        "+</function>\n"
+        "+quote: \"hello\" backslash: C:\\tmp\\x unicode: Ä € 🚀\n"
+        "*** End Patch";
+    const std::string encoded_custom_input = nlohmann::ordered_json({{"data", custom_input}}).dump();
+
+    common_chat_templates_inputs custom_inputs;
+    custom_inputs.messages = { system, user };
+    custom_inputs.tools = { custom_tool };
+    custom_inputs.add_generation_prompt = true;
+    custom_inputs.enable_thinking = true;
+    custom_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const common_chat_params custom_params = common_chat_templates_apply(tmpls.get(), custom_inputs);
+
+    if (custom_params.format != COMMON_CHAT_FORMAT_PEG_NATIVE || custom_params.parser.empty()) {
+        std::cerr << "Custom/freeform test did not select the specialized Qwen3-Coder PEG parser\n";
+        return 1;
+    }
+
+    common_chat_parser_params custom_parser_params(custom_params);
+    custom_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    custom_parser_params.parser.load(custom_params.parser);
+
+    const std::string generated_custom =
+        "Preparing a literal delimiter patch.\n</think>\n\n"
+        "<tool_call>\n"
+        "<function=apply_patch>\n"
+        "<parameter=input>\n" + encoded_custom_input + "\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    const common_chat_msg parsed_custom = common_chat_parse(generated_custom, false, custom_parser_params);
+    if (parsed_custom.tool_calls.size() != 1 || parsed_custom.tool_calls[0].name != "apply_patch") {
+        std::cerr << "Qwen3-Coder PEG parser did not recover the custom/freeform tool call\n";
+        return 1;
+    }
+
+    nlohmann::ordered_json parsed_custom_arguments;
+    try {
+        parsed_custom_arguments = nlohmann::ordered_json::parse(parsed_custom.tool_calls[0].arguments);
+    } catch (const std::exception & e) {
+        std::cerr << "Custom/freeform PEG transport produced invalid JSON arguments: " << e.what() << "\n";
+        return 1;
+    }
+
+    if (!parsed_custom_arguments.contains("input") ||
+        !parsed_custom_arguments.at("input").is_object() ||
+        !parsed_custom_arguments.at("input").contains("data") ||
+        !parsed_custom_arguments.at("input").at("data").is_string() ||
+        parsed_custom_arguments.at("input").at("data").get<std::string>() != custom_input) {
+        std::cerr << "Custom/freeform PEG transport corrupted literal XML delimiter content\n";
+        return 1;
+    }
+
+    // Match the Responses ingress representation for historical custom_tool_call.
+    // Parse the rendered parameter semantically instead of assuming a particular
+    // tojson whitespace layout. A raw framing leak would introduce an actual
+    // newline before </parameter> and therefore truncate this JSON value.
+    common_chat_msg historical_custom_call;
+    historical_custom_call.role = "assistant";
+    historical_custom_call.tool_calls.push_back({
+        "apply_patch",
+        nlohmann::ordered_json({{"input", {{"data", custom_input}}}}).dump(),
+        "call_custom",
+    });
+    common_chat_msg historical_custom_result = message("tool", "Done!");
+    historical_custom_result.tool_name = "apply_patch";
+    historical_custom_result.tool_call_id = "call_custom";
+
+    custom_inputs.messages = {
+        system,
+        user,
+        historical_custom_call,
+        historical_custom_result,
+        assistant_done,
+    };
+    const common_chat_params historical_custom = common_chat_templates_apply(tmpls.get(), custom_inputs);
+    const std::string historical_marker = "<parameter=input>\n";
+    const size_t historical_begin = historical_custom.prompt.find(historical_marker);
+    if (historical_begin == std::string::npos) {
+        std::cerr << "Historical custom/freeform replay did not render an input parameter\n";
+        return 1;
+    }
+    const size_t historical_value_begin = historical_begin + historical_marker.size();
+    const size_t historical_end = historical_custom.prompt.find("\n</parameter>", historical_value_begin);
+    if (historical_end == std::string::npos) {
+        std::cerr << "Historical custom/freeform replay did not close the input parameter\n";
+        return 1;
+    }
+
+    nlohmann::ordered_json historical_value;
+    try {
+        historical_value = nlohmann::ordered_json::parse(
+            historical_custom.prompt.substr(historical_value_begin, historical_end - historical_value_begin));
+    } catch (const std::exception & e) {
+        std::cerr << "Historical custom/freeform input leaked through XML framing: " << e.what() << "\n";
+        return 1;
+    }
+
+    if (!historical_value.is_object() || historical_value.size() != 1 ||
+        !historical_value.contains("data") || !historical_value.at("data").is_string() ||
+        historical_value.at("data").get<std::string>() != custom_input) {
+        std::cerr << "Historical custom/freeform replay corrupted the transported payload\n";
+        return 1;
+    }
+
+    std::cout << "Qwen3.8 Codex tool format, custom framing, and compaction prefix tests passed\n";
     return 0;
 }
