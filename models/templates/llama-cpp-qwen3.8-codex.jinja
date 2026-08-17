@@ -148,6 +148,10 @@
         {%- set reasoning_instructions =
             'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.'
         %}
+    {%- elif _reasoning_effort == 'medium' %}
+        {%- set reasoning_instructions =
+            'Reasoning effort is set to medium. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.'
+        %}
     {%- elif _reasoning_effort == 'low' %}
         {%- set reasoning_instructions =
             'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.'
