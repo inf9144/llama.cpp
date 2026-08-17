@@ -10,7 +10,7 @@
 
 using json = nlohmann::ordered_json;
 
-static uint64_t server_chat_responses_fingerprint(const std::string & value) {
+inline uint64_t server_chat_responses_fingerprint(const std::string & value) {
     uint64_t hash = 14695981039346656037ULL;
     for (unsigned char c : value) {
         hash ^= c;
@@ -19,7 +19,7 @@ static uint64_t server_chat_responses_fingerprint(const std::string & value) {
     return hash;
 }
 
-static void server_chat_responses_content_stats(
+inline void server_chat_responses_content_stats(
         const json & content,
         size_t & parts,
         size_t & text_chars,
@@ -56,7 +56,7 @@ static void server_chat_responses_content_stats(
     }
 }
 
-static void server_chat_log_responses_structure(const json & body) {
+inline void server_chat_log_responses_structure(const json & body) {
     const json & input = body.at("input");
     bool is_compaction = false;
     if (input.is_array()) {
@@ -169,7 +169,7 @@ static void server_chat_log_responses_structure(const json & body) {
 // Intercept the string-valued previous_response_id lookup at the start of the
 // Responses converter. This keeps diagnostics on the raw wire body without
 // changing conversion or cache behavior.
-static std::string json_value(const json & body, const std::string & key, const std::string & default_value) {
+inline std::string json_value(const json & body, const std::string & key, const std::string & default_value) {
     if (key == "previous_response_id" && body.contains("input")) {
         server_chat_log_responses_structure(body);
     }
