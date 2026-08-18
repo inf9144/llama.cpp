@@ -48,6 +48,36 @@ static json server_task_build_response_function_call(const common_chat_tool_call
     return output_item;
 }
 
+static bool server_task_is_response_tool_search(
+        bool responses_tool_search,
+        const common_chat_tool_call & tool_call) {
+    return responses_tool_search && tool_call.name == "tool_search";
+}
+
+static json server_task_build_response_tool_search_call(
+        const common_chat_tool_call & tool_call,
+        const std::string & status) {
+    json arguments;
+    try {
+        arguments = json::parse(tool_call.arguments);
+    } catch (const std::exception & e) {
+        throw std::runtime_error(
+            "Responses tool_search produced invalid JSON arguments: " + std::string(e.what()));
+    }
+    if (!arguments.is_object()) {
+        throw std::runtime_error("Responses tool_search arguments must be a JSON object");
+    }
+
+    return json {
+        {"id",        "tsc_" + tool_call.id},
+        {"type",      "tool_search_call"},
+        {"status",    status},
+        {"execution", "client"},
+        {"arguments", std::move(arguments)},
+        {"call_id",   "call_" + tool_call.id},
+    };
+}
+
 static bool server_task_is_response_custom_tool(
         const std::unordered_set<std::string> & custom_tools,
         const common_chat_tool_call & tool_call) {
@@ -105,7 +135,11 @@ static json server_task_build_response_custom_tool_call(
 static json server_task_build_response_tool_call(
         const common_chat_tool_call & tool_call,
         const std::string & status,
-        const std::unordered_set<std::string> & custom_tools) {
+        const std::unordered_set<std::string> & custom_tools,
+        bool responses_tool_search) {
+    if (server_task_is_response_tool_search(responses_tool_search, tool_call)) {
+        return server_task_build_response_tool_search_call(tool_call, status);
+    }
     return server_task_is_response_custom_tool(custom_tools, tool_call)
         ? server_task_build_response_custom_tool_call(tool_call, status)
         : server_task_build_response_function_call(tool_call, status);
@@ -249,9 +283,11 @@ json task_params::to_json(bool only_metrics) const {
 //
 task_result_state::task_result_state(
         const common_chat_parser_params & chat_parser_params,
-        const std::unordered_set<std::string> & responses_custom_tools)
+        const std::unordered_set<std::string> & responses_custom_tools,
+        bool responses_tool_search)
     : chat_parser_params(chat_parser_params)
     , responses_custom_tools(responses_custom_tools)
+    , responses_tool_search(responses_tool_search)
     , oai_resp_id("resp_" + random_string())
     , oai_resp_reasoning_id("rs_" + random_string())
     , oai_resp_message_id("msg_" + random_string()) {
@@ -669,7 +705,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
         output.push_back(server_task_build_response_tool_call(
-            tool_call, "completed", generation_params.responses_custom_tools));
+            tool_call, "completed", generation_params.responses_custom_tools,
+            generation_params.responses_tool_search));
     }
 
     if (generation_params.responses_compaction) {
@@ -769,7 +806,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         const bool is_custom = server_task_is_response_custom_tool(
             generation_params.responses_custom_tools, tool_call);
         const json output_item = server_task_build_response_tool_call(
-            tool_call, "completed", generation_params.responses_custom_tools);
+            tool_call, "completed", generation_params.responses_custom_tools,
+            generation_params.responses_tool_search);
 
         if (is_custom) {
             json added_item = output_item;
@@ -1139,9 +1177,11 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
-    oai_resp_fc_id         = state.oai_resp_fc_id;
-    oai_resp_fc_is_custom  = state.oai_resp_fc_is_custom;
-    responses_custom_tools = state.responses_custom_tools;
+    oai_resp_fc_id             = state.oai_resp_fc_id;
+    oai_resp_fc_is_custom      = state.oai_resp_fc_is_custom;
+    oai_resp_fc_is_tool_search = state.oai_resp_fc_is_tool_search;
+    responses_custom_tools     = state.responses_custom_tools;
+    responses_tool_search      = state.responses_tool_search;
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
@@ -1162,6 +1202,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
             state.oai_resp_fc_is_custom =
                 state.responses_custom_tools.count(diff.tool_call_delta.name) != 0;
+            state.oai_resp_fc_is_tool_search =
+                state.responses_tool_search && diff.tool_call_delta.name == "tool_search";
         }
     }
 }
@@ -1347,6 +1389,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     }
 
     bool current_tool_is_custom = oai_resp_fc_is_custom;
+    bool current_tool_is_tool_search = oai_resp_fc_is_tool_search;
     std::string current_tool_id = oai_resp_fc_id;
 
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
@@ -1420,8 +1463,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             current_tool_id = diff.tool_call_delta.id;
             current_tool_is_custom =
                 responses_custom_tools.count(diff.tool_call_delta.name) != 0;
+            current_tool_is_tool_search =
+                responses_tool_search && diff.tool_call_delta.name == "tool_search";
 
-            if (!current_tool_is_custom) {
+            if (!current_tool_is_custom && !current_tool_is_tool_search) {
                 common_chat_tool_call tool_call = diff.tool_call_delta;
                 events.push_back(json {
                     {"event", "response.output_item.added"},
@@ -1433,9 +1478,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             }
             oai_resp_fc_id = current_tool_id;
             oai_resp_fc_is_custom = current_tool_is_custom;
+            oai_resp_fc_is_tool_search = current_tool_is_tool_search;
         }
 
-        if (!diff.tool_call_delta.arguments.empty() && !current_tool_is_custom) {
+        if (!diff.tool_call_delta.arguments.empty() &&
+            !current_tool_is_custom && !current_tool_is_tool_search) {
             events.push_back(json {
                 {"event", "response.function_call_arguments.delta"},
                 {"data", json {

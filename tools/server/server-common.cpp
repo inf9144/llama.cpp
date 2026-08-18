@@ -1133,7 +1133,10 @@ json oaicompat_chat_params_parse(
     json llama_params;
 
     auto tools = json_value(body, "tools", json());
-    auto has_tools = tools.is_array() && !tools.empty();
+    auto deferred_tools = json_value(body, "__llamacpp_responses_deferred_tools", json());
+    body.erase("__llamacpp_responses_deferred_tools");
+    auto has_tools = (tools.is_array() && !tools.empty()) ||
+        (deferred_tools.is_array() && !deferred_tools.empty());
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
     const bool is_responses_compaction = json_value(body, "__llamacpp_responses_compaction", false);
@@ -1261,6 +1264,7 @@ json oaicompat_chat_params_parse(
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    const auto deferred_parser_tools = common_chat_tools_parse_oaicompat(deferred_tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1287,7 +1291,8 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+    if ((!inputs.tools.empty() || !deferred_parser_tools.empty()) &&
+        inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
@@ -1324,8 +1329,31 @@ json oaicompat_chat_params_parse(
 
     inputs.force_pure_content = opt.force_pure_content;
 
-    // Apply chat template to the list of messages
+    // Apply the chat template with only the stable top-level tools. Deferred
+    // tool_search results live in the chronological message suffix, so adding
+    // them to this render would invalidate the prompt cache near the front.
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+
+    if (!deferred_parser_tools.empty()) {
+        auto parser_inputs = inputs;
+        parser_inputs.tools.insert(
+            parser_inputs.tools.end(), deferred_parser_tools.begin(), deferred_parser_tools.end());
+        const auto parser_chat_params = common_chat_templates_apply(opt.tmpls.get(), parser_inputs);
+
+        if (parser_chat_params.format != chat_params.format ||
+            parser_chat_params.generation_prompt != chat_params.generation_prompt) {
+            throw std::runtime_error(
+                "Deferred tool loading changed the chat generation prefix; this template cannot preserve the prompt cache");
+        }
+
+        // Keep the prompt rendered from the stable tool set, but allow the PEG
+        // parser/grammar to accept tools exposed by historical tool_search_output.
+        chat_params.grammar = parser_chat_params.grammar;
+        chat_params.grammar_lazy = parser_chat_params.grammar_lazy;
+        chat_params.grammar_triggers = parser_chat_params.grammar_triggers;
+        chat_params.preserved_tokens = parser_chat_params.preserved_tokens;
+        chat_params.parser = parser_chat_params.parser;
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

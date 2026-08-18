@@ -40,6 +40,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("__llamacpp_responses_compaction", params.responses_compaction))
         ->set_desc("Internal Responses API context compaction marker"));
 
+    add((new field_bool("__llamacpp_responses_tool_search", params.responses_tool_search))
+        ->set_desc("Internal Responses API client tool_search marker"));
+
     add((new field_json("__llamacpp_responses_custom_tools"))
         ->set_desc("Internal Responses API custom tool names")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

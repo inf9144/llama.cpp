@@ -1,4 +1,6 @@
 #include "chat.h"
+#include "server-chat.h"
+#include "server-task.h"
 
 #include <nlohmann/json.hpp>
 
@@ -308,6 +310,241 @@ int main() {
         !historical_value.contains("data") || !historical_value.at("data").is_string() ||
         historical_value.at("data").get<std::string>() != custom_input) {
         std::cerr << "Historical custom/freeform replay corrupted the transported payload\n";
+        return 1;
+    }
+
+    // Codex 0.147 client-side tool_search is bridged through an internal
+    // function, while discovered tools remain out of the stable top-level tool
+    // block and are carried separately for parser/grammar expansion.
+    const nlohmann::ordered_json tool_search_request = {
+        {"model", "test-model"},
+        {"input", "Find calendar tools"},
+        {"tools", nlohmann::ordered_json::array({
+            {
+                {"type", "tool_search"},
+                {"execution", "client"},
+                {"description", "Search deferred tools"},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {{"query", {{"type", "string"}}}}},
+                    {"required", nlohmann::ordered_json::array({"query"})},
+                    {"additionalProperties", false},
+                }},
+            },
+            {{"type", "web_search"}},
+        })},
+    };
+    const auto converted_search = server_chat_convert_responses_to_chatcmpl(tool_search_request);
+    if (!converted_search.value("__llamacpp_responses_tool_search", false) ||
+        !converted_search.contains("tools") || converted_search.at("tools").size() != 1 ||
+        converted_search.at("tools")[0]["function"]["name"] != "tool_search") {
+        std::cerr << "Responses tool_search was not exposed as the sole internal client tool\n";
+        return 1;
+    }
+
+    const nlohmann::ordered_json followup_request = {
+        {"model", "test-model"},
+        {"input", nlohmann::ordered_json::array({
+            {
+                {"type", "message"},
+                {"role", "user"},
+                {"content", nlohmann::ordered_json::array({{{"type", "input_text"}, {"text", "Find calendar tools"}}})},
+            },
+            {
+                {"type", "tool_search_call"},
+                {"call_id", "search-1"},
+                {"execution", "client"},
+                {"arguments", {{"query", "calendar"}}},
+            },
+            {
+                {"type", "tool_search_output"},
+                {"call_id", "search-1"},
+                {"status", "completed"},
+                {"execution", "client"},
+                {"tools", nlohmann::ordered_json::array({
+                    {
+                        {"type", "namespace"},
+                        {"name", "mcp__calendar"},
+                        {"description", "Calendar tools"},
+                        {"tools", nlohmann::ordered_json::array({
+                            {
+                                {"type", "function"},
+                                {"name", "create_event"},
+                                {"description", "Create an event"},
+                                {"defer_loading", true},
+                                {"parameters", {
+                                    {"type", "object"},
+                                    {"properties", {{"title", {{"type", "string"}}}}},
+                                    {"required", nlohmann::ordered_json::array({"title"})},
+                                    {"additionalProperties", false},
+                                }},
+                            },
+                        })},
+                    },
+                })},
+            },
+        })},
+        {"tools", tool_search_request.at("tools")},
+    };
+    const auto converted_followup = server_chat_convert_responses_to_chatcmpl(followup_request);
+    if (!converted_followup.contains("__llamacpp_responses_deferred_tools") ||
+        converted_followup.at("__llamacpp_responses_deferred_tools").size() != 1 ||
+        converted_followup.at("__llamacpp_responses_deferred_tools")[0]["function"]["name"] !=
+            "mcp__calendar.create_event") {
+        std::cerr << "tool_search_output did not expose the discovered namespaced tool to the parser layer\n";
+        return 1;
+    }
+    for (const auto & tool : converted_followup.at("tools")) {
+        if (tool["function"]["name"] == "mcp__calendar.create_event") {
+            std::cerr << "Deferred tool leaked into the stable top-level tools block\n";
+            return 1;
+        }
+    }
+
+    const auto & followup_messages = converted_followup.at("messages");
+    if (followup_messages.size() < 3 ||
+        followup_messages[1]["tool_calls"][0]["function"]["name"] != "tool_search" ||
+        followup_messages[2]["role"] != "tool" ||
+        followup_messages[2]["content"].get<std::string>().find("mcp__calendar.create_event") == std::string::npos) {
+        std::cerr << "tool_search call/output history was not preserved in chronological model context\n";
+        return 1;
+    }
+
+    common_chat_tool tool_search_tool;
+    tool_search_tool.name = "tool_search";
+    tool_search_tool.description = "Search deferred tools";
+    tool_search_tool.parameters = R"({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false})";
+
+    common_chat_tool deferred_tool;
+    deferred_tool.name = "mcp__calendar.create_event";
+    deferred_tool.description = "Create an event";
+    deferred_tool.parameters = R"({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})";
+
+    common_chat_msg search_call;
+    search_call.role = "assistant";
+    search_call.tool_calls.push_back({
+        "tool_search",
+        nlohmann::ordered_json({{"query", "calendar"}}).dump(),
+        "search-1",
+    });
+    common_chat_msg search_result = message(
+        "tool",
+        nlohmann::ordered_json({{"tools", converted_followup.at("__llamacpp_responses_deferred_tools")}}).dump());
+    search_result.tool_call_id = "search-1";
+
+    common_chat_templates_inputs stable_inputs;
+    stable_inputs.messages = { system, user, search_call, search_result };
+    stable_inputs.tools = { tool_search_tool };
+    stable_inputs.add_generation_prompt = true;
+    stable_inputs.enable_thinking = true;
+    stable_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const auto stable_params = common_chat_templates_apply(tmpls.get(), stable_inputs);
+
+    auto parser_inputs = stable_inputs;
+    parser_inputs.tools.push_back(deferred_tool);
+    const auto expanded_parser_params = common_chat_templates_apply(tmpls.get(), parser_inputs);
+    if (stable_params.generation_prompt != expanded_parser_params.generation_prompt) {
+        std::cerr << "Deferred tool expansion changed the Qwen generation prefix\n";
+        return 1;
+    }
+    const std::string stable_prefix = prefix_before_first_user(stable_params.prompt);
+    if (stable_prefix.find("mcp__calendar.create_event") != std::string::npos) {
+        std::cerr << "Deferred tool polluted the cache-stable Qwen system/tools prefix\n";
+        return 1;
+    }
+    if (stable_params.prompt.find("mcp__calendar.create_event") == std::string::npos) {
+        std::cerr << "Deferred tool was not visible in the chronological tool_search result\n";
+        return 1;
+    }
+
+    common_chat_parser_params deferred_parser(expanded_parser_params);
+    deferred_parser.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    deferred_parser.parser.load(expanded_parser_params.parser);
+    const std::string generated_deferred =
+        "Using the discovered calendar tool.\n</think>\n\n"
+        "<tool_call>\n"
+        "<function=mcp__calendar.create_event>\n"
+        "<parameter=title>\n\"Lunch\"\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const auto parsed_deferred = common_chat_parse(generated_deferred, false, deferred_parser);
+    if (parsed_deferred.tool_calls.size() != 1 ||
+        parsed_deferred.tool_calls[0].name != "mcp__calendar.create_event") {
+        std::cerr << "Expanded parser did not accept the deferred MCP tool\n";
+        return 1;
+    }
+
+    auto repeated_search_request = followup_request;
+    auto repeated_call = repeated_search_request.at("input")[1];
+    repeated_call["call_id"] = "search-2";
+    auto repeated_output = repeated_search_request.at("input")[2];
+    repeated_output["call_id"] = "search-2";
+    repeated_search_request["input"].push_back(repeated_call);
+    repeated_search_request["input"].push_back(repeated_output);
+    const auto converted_repeated_search =
+        server_chat_convert_responses_to_chatcmpl(repeated_search_request);
+    if (!converted_repeated_search.contains("__llamacpp_responses_deferred_tools") ||
+        converted_repeated_search.at("__llamacpp_responses_deferred_tools").size() != 1) {
+        std::cerr << "Repeated tool_search results duplicated the parser-visible tool set\n";
+        return 1;
+    }
+    size_t repeated_tool_results = 0;
+    for (const auto & msg : converted_repeated_search.at("messages")) {
+        if (msg.value("role", std::string()) == "tool" &&
+            (msg.value("tool_call_id", std::string()) == "search-1" ||
+             msg.value("tool_call_id", std::string()) == "search-2")) {
+            ++repeated_tool_results;
+        }
+    }
+    if (repeated_tool_results != 2) {
+        std::cerr << "Repeated tool_search outputs were not preserved chronologically\n";
+        return 1;
+    }
+
+    // Verify that an internally parsed tool_search function call is emitted
+    // using Codex's dedicated Responses item instead of a normal function_call.
+    server_task_result_cmpl_final tool_search_result;
+    tool_search_result.oaicompat_model = "test-model";
+    tool_search_result.oai_resp_id = "resp_tool_search_test";
+    tool_search_result.generation_params.responses_tool_search = true;
+    tool_search_result.oaicompat_msg.role = "assistant";
+    tool_search_result.oaicompat_msg.tool_calls.push_back({
+        "tool_search",
+        nlohmann::ordered_json({{"query", "calendar"}, {"limit", 8}}).dump(),
+        "search_generated",
+    });
+
+    const auto tool_search_response = tool_search_result.to_json_oaicompat_resp();
+    if (!tool_search_response.contains("output") || tool_search_response.at("output").size() != 1) {
+        std::cerr << "Responses tool_search egress did not produce exactly one output item\n";
+        return 1;
+    }
+    const auto & tool_search_item = tool_search_response.at("output")[0];
+    if (tool_search_item.value("type", std::string()) != "tool_search_call" ||
+        tool_search_item.value("execution", std::string()) != "client" ||
+        tool_search_item.value("call_id", std::string()) != "call_search_generated" ||
+        !tool_search_item.contains("arguments") || !tool_search_item.at("arguments").is_object() ||
+        tool_search_item.at("arguments").value("query", std::string()) != "calendar" ||
+        tool_search_item.at("arguments").value("limit", 0) != 8) {
+        std::cerr << "Responses tool_search egress emitted the wrong wire shape\n";
+        return 1;
+    }
+
+    const auto tool_search_stream = tool_search_result.to_json_oaicompat_resp_stream();
+    bool saw_tool_search_done = false;
+    bool saw_function_argument_delta = false;
+    for (const auto & event : tool_search_stream) {
+        if (event.value("event", std::string()) == "response.function_call_arguments.delta") {
+            saw_function_argument_delta = true;
+        }
+        if (event.value("event", std::string()) == "response.output_item.done" &&
+            event.contains("data") && event.at("data").contains("item") &&
+            event.at("data").at("item").value("type", std::string()) == "tool_search_call") {
+            saw_tool_search_done = true;
+        }
+    }
+    if (!saw_tool_search_done || saw_function_argument_delta) {
+        std::cerr << "Responses tool_search streaming used normal function-call streaming semantics\n";
         return 1;
     }
 

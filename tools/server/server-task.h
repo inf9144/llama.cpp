@@ -54,6 +54,7 @@ struct task_params {
     bool return_tokens   = false;
     bool return_progress = false;
     bool responses_compaction = false;
+    bool responses_tool_search = false;
     std::unordered_set<std::string> responses_custom_tools;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
@@ -113,6 +114,7 @@ struct task_result_state {
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
     std::unordered_set<std::string> responses_custom_tools;
+    bool responses_tool_search = false;
 
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
@@ -126,10 +128,12 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
     bool oai_resp_fc_is_custom = false;
+    bool oai_resp_fc_is_tool_search = false;
 
     task_result_state(
         const common_chat_parser_params & chat_parser_params,
-        const std::unordered_set<std::string> & responses_custom_tools);
+        const std::unordered_set<std::string> & responses_custom_tools,
+        bool responses_tool_search);
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -253,7 +257,8 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params, params.responses_custom_tools);
+        return task_result_state(
+            params.chat_parser_params, params.responses_custom_tools, params.responses_tool_search);
     }
 
     bool is_parent() const {
@@ -457,7 +462,9 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;
     bool oai_resp_fc_is_custom = false;
+    bool oai_resp_fc_is_tool_search = false;
     std::unordered_set<std::string> responses_custom_tools;
+    bool responses_tool_search = false;
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
