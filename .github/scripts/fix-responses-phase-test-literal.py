@@ -23,4 +23,50 @@ replacement = r'''    const std::string generated_commentary =
 '''
 
 text = text[:start] + replacement + text[end:]
+
+old_history = r'''        {"input", nlohmann::ordered_json::array({
+            {
+                {"type", "message"},
+                {"role", "assistant"},
+                {"status", "completed"},
+                {"phase", "commentary"},
+                {"content", nlohmann::ordered_json::array({
+                    {{"type", "output_text"}, {"text", "Checking the repository."}},
+                })},
+            },
+        })},
+'''
+new_history = r'''        {"input", nlohmann::ordered_json::array({
+            {
+                {"type", "message"},
+                {"role", "user"},
+                {"content", nlohmann::ordered_json::array({
+                    {{"type", "input_text"}, {"text", "Inspect the repository."}},
+                })},
+            },
+            {
+                {"type", "message"},
+                {"role", "assistant"},
+                {"status", "completed"},
+                {"phase", "commentary"},
+                {"content", nlohmann::ordered_json::array({
+                    {{"type", "output_text"}, {"text", "Checking the repository."}},
+                })},
+            },
+        })},
+'''
+if text.count(old_history) != 1:
+    raise RuntimeError("expected exactly one assistant-only Responses phase history fixture")
+text = text.replace(old_history, new_history, 1)
+
+old_assert = r'''        converted_phase_history.at("messages").size() != 1 ||
+        converted_phase_history.at("messages")[0].value("phase", std::string()) != "commentary") {
+'''
+new_assert = r'''        converted_phase_history.at("messages").size() != 2 ||
+        converted_phase_history.at("messages")[1].value("phase", std::string()) != "commentary") {
+'''
+if text.count(old_assert) != 1:
+    raise RuntimeError("expected exactly one Responses phase history assertion")
+text = text.replace(old_assert, new_assert, 1)
+
 path.write_text(text)
