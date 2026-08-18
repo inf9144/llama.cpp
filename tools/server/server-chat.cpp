@@ -510,24 +510,6 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 }
                 continue;
             }
-            if (type == "web_search") {
-                register_tool_kind("web_search", false);
-                json chatcmpl_web_search_tool;
-                chatcmpl_web_search_tool["type"] = "function";
-                chatcmpl_web_search_tool["function"] = {
-                    {"name", "web_search"},
-                    {"description", "Search the web"},
-                    {"strict", true},
-                    {"parameters", {
-                        {"type", "object"},
-                        {"properties", {{"query", {{"type", "string"}, {"description", "Search query"}}}}
-                        },
-                        {"required", json::array({"query"})}
-                    }}
-                };
-                chatcmpl_tools.push_back(chatcmpl_web_search_tool);
-                continue;
-            }
             if (type == "custom") {
                 add_custom_tool(resp_tool, "");
                 continue;
