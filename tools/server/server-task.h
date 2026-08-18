@@ -54,6 +54,7 @@ struct task_params {
     bool return_tokens   = false;
     bool return_progress = false;
     bool responses_compaction = false;
+    bool responses_tool_search = false;
     std::unordered_set<std::string> responses_custom_tools;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
@@ -61,7 +62,7 @@ struct task_params {
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
-    int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
+    int32_t n_indent  =  0; // minimum line indentation in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
@@ -113,6 +114,7 @@ struct task_result_state {
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
     std::unordered_set<std::string> responses_custom_tools;
+    bool responses_tool_search = false;
 
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
@@ -126,10 +128,12 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
     bool oai_resp_fc_is_custom = false;
+    bool oai_resp_fc_is_tool_search = false;
 
     task_result_state(
         const common_chat_parser_params & chat_parser_params,
-        const std::unordered_set<std::string> & responses_custom_tools);
+        const std::unordered_set<std::string> & responses_custom_tools,
+        bool responses_tool_search);
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -222,7 +226,7 @@ struct server_task {
     // utility function
     static std::unordered_set<int> get_list_id(const std::vector<server_task> & tasks) {
         std::unordered_set<int> ids(tasks.size());
-        for (size_t i = 0; i < tasks.size(); i++) {
+        for (size_t i = 0; i < tasks.size(); ++i) {
             ids.insert(tasks[i].id);
             for (auto & child : tasks[i].child_tasks) {
                 ids.insert(child.id);
@@ -253,7 +257,10 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params, params.responses_custom_tools);
+        return task_result_state(
+            params.chat_parser_params,
+            params.responses_custom_tools,
+            params.responses_tool_search);
     }
 
     bool is_parent() const {
@@ -279,7 +286,7 @@ struct server_task_result {
     int id_slot      = -1;
 
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
-    size_t index = 0; // to be used for batched tasks
+    size_t index = 0; // to be used when there are multiple prompts (batch request)
 
     virtual bool is_error() {
         // only used by server_task_result_error
@@ -299,28 +306,20 @@ struct server_task_result {
     }
 };
 
-// using shared_ptr for polymorphism of server_task_result
+// using shared_ptr for polymorphism
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
 
 struct completion_token_output {
-    llama_token tok;
-    float prob;
+    int32_t id;
     std::string text_to_send;
     struct prob_info {
-        llama_token tok;
+        int32_t tok;
         std::string txt;
         float prob;
     };
     std::vector<prob_info> probs;
 
-    json to_json(bool post_sampling_probs) const;
-
-    static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
-
-    static float logarithm(float x);
-
-    static std::vector<unsigned char> str_to_bytes(const std::string & str);
-
+    json to_json() const;
 };
 
 struct server_task_result_cmpl_final : server_task_result {
@@ -457,9 +456,11 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;
     bool oai_resp_fc_is_custom = false;
+    bool oai_resp_fc_is_tool_search = false;
     std::unordered_set<std::string> responses_custom_tools;
+    bool responses_tool_search = false;
 
-    // for Anthropic API: track if any reasoning content has been generated
+    // for Anthropic API: track if any reasoning content was generated
     bool anthropic_has_reasoning = false;
 
     virtual bool is_stop() override {
