@@ -70,7 +70,9 @@ jobs:
             fi
           fi
 
-          git diff --cached --check
+          # Upstream itself currently contains a whitespace warning in a newly added
+          # template. Check only our compatibility delta against upstream master.
+          git diff --cached --check upstream/master
           git commit -m "sync: merge upstream master"
 
       - name: Configure focused regression build
