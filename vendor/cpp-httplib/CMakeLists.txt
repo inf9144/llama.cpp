@@ -3,6 +3,26 @@ license_add_file("cpp-httplib" "LICENSE")
 
 find_package(Threads REQUIRED)
 
+# cpp-httplib already implements zstd request-body decompression; enable it
+# automatically when a system libzstd is available. zstd < 1.5.6 does not
+# provide the zstd::libzstd CMake target, so keep a pkg-config fallback.
+set(CPPHTTPLIB_ZSTD_SUPPORT FALSE CACHE INTERNAL "cpp-httplib zstd support" FORCE)
+if (NOT TARGET zstd::libzstd)
+    find_package(zstd 1.5.6 CONFIG QUIET)
+endif()
+if (NOT TARGET zstd::libzstd)
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(zstd QUIET IMPORTED_TARGET libzstd)
+        if (TARGET PkgConfig::zstd)
+            add_library(zstd::libzstd ALIAS PkgConfig::zstd)
+        endif()
+    endif()
+endif()
+if (TARGET zstd::libzstd)
+    set(CPPHTTPLIB_ZSTD_SUPPORT TRUE CACHE INTERNAL "cpp-httplib zstd support" FORCE)
+endif()
+
 llama_add_compile_flags()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -19,6 +39,12 @@ else()
 endif()
 
 target_link_libraries(${TARGET} PRIVATE Threads::Threads)
+
+if (CPPHTTPLIB_ZSTD_SUPPORT)
+    message(STATUS "cpp-httplib: zstd request decompression enabled")
+    target_link_libraries(${TARGET} PUBLIC zstd::libzstd)
+    target_compile_definitions(${TARGET} PUBLIC CPPHTTPLIB_ZSTD_SUPPORT)
+endif()
 
 if (WIN32 AND NOT MSVC)
     target_link_libraries(${TARGET} PUBLIC ws2_32)

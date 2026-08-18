@@ -236,6 +236,11 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-qwen38-codex-template.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-log.cpp)
+if (CPPHTTPLIB_ZSTD_SUPPORT)
+    add_executable(test-http-zstd test-http-zstd.cpp)
+    target_link_libraries(test-http-zstd PRIVATE vendor::cpp-httplib)
+    llama_test(test-http-zstd)
+endif()
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
