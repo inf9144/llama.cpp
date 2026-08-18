@@ -145,6 +145,13 @@ static json server_task_build_response_tool_call(
         : server_task_build_response_function_call(tool_call, status);
 }
 
+static std::string server_task_response_message_phase(const common_chat_msg & msg) {
+    if (msg.phase == "commentary" || msg.phase == "final_answer") {
+        return msg.phase;
+    }
+    return msg.tool_calls.empty() ? "final_answer" : "commentary";
+}
+
 //
 // task_params
 //
@@ -698,6 +705,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             }})},
             {"id",     "msg_" + random_string()},
             {"role",   msg.role},
+            {"phase",  server_task_response_message_phase(msg)},
             {"status", "completed"},
             {"type",   "message"},
         });
@@ -789,7 +797,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"status",  "completed"},
             {"id",      oai_resp_message_id},
             {"content", json::array({content_part})},
-            {"role",    "assistant"}
+            {"role",    "assistant"},
+            {"phase",   server_task_response_message_phase(oaicompat_msg)}
         };
 
         server_sent_events.push_back(json {
@@ -1177,6 +1186,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
+    oai_resp_message_phase = state.chat_msg.phase;
     oai_resp_fc_id             = state.oai_resp_fc_id;
     oai_resp_fc_is_custom      = state.oai_resp_fc_is_custom;
     oai_resp_fc_is_tool_search = state.oai_resp_fc_is_tool_search;
@@ -1423,17 +1433,21 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 
         if (!diff.content_delta.empty()) {
             if (!text_block_started) {
+                json message_item = {
+                    {"content", json::array()},
+                    {"id",      oai_resp_message_id},
+                    {"role",    "assistant"},
+                    {"status",  "in_progress"},
+                    {"type",    "message"},
+                };
+                if (!oai_resp_message_phase.empty()) {
+                    message_item["phase"] = oai_resp_message_phase;
+                }
                 events.push_back(json {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type", "response.output_item.added"},
-                        {"item", json {
-                            {"content", json::array()},
-                            {"id",      oai_resp_message_id},
-                            {"role",    "assistant"},
-                            {"status",  "in_progress"},
-                            {"type",    "message"},
-                        }},
+                        {"item", std::move(message_item)},
                     }},
                 });
                 events.push_back(json {

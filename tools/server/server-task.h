@@ -460,6 +460,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_id;
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
+    std::string oai_resp_message_phase;
     std::string oai_resp_fc_id;
     bool oai_resp_fc_is_custom = false;
     bool oai_resp_fc_is_tool_search = false;

@@ -39,6 +39,12 @@ int main() {
     const std::string template_path = "models/templates/llama-cpp-qwen3.8-codex.jinja";
     auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, read_file(template_path)));
 
+    const std::string template_source = read_file(template_path);
+    if (template_source.find("llama.cpp:responses-phase=marker-v1") == std::string::npos) {
+        std::cerr << "Codex template did not opt into the Responses phase protocol\n";
+        return 1;
+    }
+
     const auto caps = common_chat_templates_get_caps(tmpls.get());
     const auto supports_object_arguments = caps.find("supports_object_arguments");
     if (supports_object_arguments == caps.end() || !supports_object_arguments->second) {
@@ -548,6 +554,246 @@ int main() {
         return 1;
     }
 
-    std::cout << "Qwen3.8 Codex user text, generic string framing, custom framing, and compaction tests passed\n";
+    // Responses phase is internal metadata: it must survive Responses history ->
+    // template rendering, but never leak through normal Chat Completions JSON.
+    common_chat_msg chat_only_phase = message("assistant", "Internal metadata test.");
+    chat_only_phase.phase = "commentary";
+    if (chat_only_phase.to_json_oaicompat().contains("phase")) {
+        std::cerr << "Responses phase leaked through Chat Completions serialization\n";
+        return 1;
+    }
+
+    const nlohmann::ordered_json phase_history_request = {
+        {"model", "test-model"},
+        {"input", nlohmann::ordered_json::array({
+            {
+                {"type", "message"},
+                {"role", "user"},
+                {"content", nlohmann::ordered_json::array({
+                    {{"type", "input_text"}, {"text", "Inspect the repository."}},
+                })},
+            },
+            {
+                {"type", "message"},
+                {"role", "assistant"},
+                {"status", "completed"},
+                {"phase", "commentary"},
+                {"content", nlohmann::ordered_json::array({
+                    {{"type", "output_text"}, {"text", "Checking the repository."}},
+                })},
+            },
+        })},
+    };
+    const auto converted_phase_history = server_chat_convert_responses_to_chatcmpl(phase_history_request);
+    if (!converted_phase_history.contains("chat_template_kwargs") ||
+        !converted_phase_history.at("chat_template_kwargs").value("responses_phase_protocol", false) ||
+        !converted_phase_history.contains("messages") ||
+        converted_phase_history.at("messages").size() != 2 ||
+        converted_phase_history.at("messages")[1].value("phase", std::string()) != "commentary") {
+        std::cerr << "Responses phase metadata was not preserved for the internal template bridge\n";
+        return 1;
+    }
+
+    common_chat_templates_inputs phase_inputs;
+    phase_inputs.messages = common_chat_msgs_parse_oaicompat(converted_phase_history.at("messages"));
+    phase_inputs.tools = { shell_tool };
+    phase_inputs.add_generation_prompt = true;
+    phase_inputs.enable_thinking = true;
+    phase_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    phase_inputs.chat_template_kwargs["responses_phase_protocol"] = "true";
+    const auto phase_params = common_chat_templates_apply(tmpls.get(), phase_inputs);
+
+    const std::string historical_phase_marker =
+        "</think>\n<response_phase>commentary</response_phase>\nChecking the repository.";
+    if (phase_params.prompt.find(historical_phase_marker) == std::string::npos ||
+        phase_params.prompt.find("Responses message phases are transport metadata") == std::string::npos) {
+        std::cerr << "Qwen phase protocol was not taught/replayed through the Codex template\n";
+        return 1;
+    }
+
+    common_chat_parser_params phase_parser(phase_params);
+    phase_parser.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    phase_parser.parser.load(phase_params.parser);
+
+    const std::string commentary_marker = "<response_phase>commentary</response_phase>";
+    const std::string generated_commentary =
+        std::string("I should inspect the workspace.\n</think>\n") + commentary_marker + "\n"
+        "I'll inspect the repository.\n\n"
+        "<tool_call>\n"
+        "<function=shell_command>\n"
+        "<parameter=command>\n" +
+        nlohmann::ordered_json("pwd").dump() +
+        "\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const auto parsed_commentary = common_chat_parse(generated_commentary, false, phase_parser);
+    if (parsed_commentary.phase != "commentary" ||
+        parsed_commentary.content.find("response_phase") != std::string::npos ||
+        parsed_commentary.reasoning_content.find("response_phase") != std::string::npos ||
+        parsed_commentary.tool_calls.size() != 1) {
+        std::cerr << "Qwen commentary phase marker was not consumed as metadata\n";
+        return 1;
+    }
+
+    // Exercise partial parsing of the internal marker. No marker prefix may
+    // escape into a streamed reasoning/content delta while it is incomplete.
+    for (size_t n = 1; n < commentary_marker.size(); ++n) {
+        const auto partial_phase = common_chat_parse(
+            "I should inspect the workspace.\n</think>\n" + commentary_marker.substr(0, n), true, phase_parser);
+        if (partial_phase.content.find("response_phase") != std::string::npos ||
+            partial_phase.reasoning_content.find("response_phase") != std::string::npos) {
+            std::cerr << "Partial Qwen phase marker leaked into streamed model text\n";
+            return 1;
+        }
+    }
+
+    const std::string generated_final =
+        "The task is complete.\n</think>\n<response_phase>final_answer</response_phase>\nDone.";
+    const auto parsed_final = common_chat_parse(generated_final, false, phase_parser);
+    if (parsed_final.phase != "final_answer" || parsed_final.content != "Done." ||
+        parsed_final.reasoning_content.find("response_phase") != std::string::npos) {
+        std::cerr << "Qwen final_answer phase marker was not consumed as metadata\n";
+        return 1;
+    }
+
+    // The model signal is preferred, but omission must remain backward
+    // compatible: the old Qwen parse still succeeds and leaves phase empty so
+    // Responses egress can apply its structural fallback.
+    const auto parsed_unmarked = common_chat_parse(
+        "Legacy reasoning.\n</think>\n\nLegacy final text.", false, phase_parser);
+    if (!parsed_unmarked.phase.empty() || parsed_unmarked.content != "Legacy final text.") {
+        std::cerr << "Unmarked Qwen output did not preserve Responses phase fallback\n";
+        return 1;
+    }
+
+    auto no_think_inputs = phase_inputs;
+    no_think_inputs.messages = { system, user };
+    no_think_inputs.enable_thinking = false;
+    const auto no_think_params = common_chat_templates_apply(tmpls.get(), no_think_inputs);
+    if (no_think_params.generation_prompt.find("<think>\n\n</think>\n\n") == std::string::npos) {
+        std::cerr << "Qwen thinking-disabled generation prompt lost its empty think framing\n";
+        return 1;
+    }
+    common_chat_parser_params no_think_parser(no_think_params);
+    no_think_parser.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    no_think_parser.parser.load(no_think_params.parser);
+    const auto parsed_no_think = common_chat_parse(
+        "<response_phase>final_answer</response_phase>\nDone without thinking.", false, no_think_parser);
+    if (parsed_no_think.phase != "final_answer" || parsed_no_think.content != "Done without thinking.") {
+        std::cerr << "Qwen phase protocol depended on model-generated reasoning\n";
+        return 1;
+    }
+
+    task_result_state final_phase_stream_state(phase_parser, {}, false);
+    server_task_result_cmpl_partial final_phase_partial;
+    final_phase_partial.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    final_phase_partial.content = generated_final;
+    final_phase_partial.n_decoded = 1;
+    final_phase_partial.update(final_phase_stream_state);
+    bool saw_final_phase_added = false;
+    for (const auto & event : final_phase_partial.to_json_oaicompat_resp()) {
+        if (event.value("event", std::string()) == "response.output_item.added" &&
+            event.contains("data") && event.at("data").contains("item") &&
+            event.at("data").at("item").value("type", std::string()) == "message") {
+            saw_final_phase_added =
+                event.at("data").at("item").value("phase", std::string()) == "final_answer";
+        }
+    }
+    if (!saw_final_phase_added) {
+        std::cerr << "Streaming Responses output_item.added lost final_answer phase\n";
+        return 1;
+    }
+
+    server_task_result_cmpl_final final_phase_result;
+    final_phase_result.oaicompat_model = "test-model";
+    final_phase_result.oai_resp_id = "resp_final_phase_test";
+    final_phase_result.oai_resp_message_id = "msg_final_phase_test";
+    final_phase_result.n_prompt_tokens = 0;
+    final_phase_result.n_prompt_tokens_cache = 0;
+    final_phase_result.n_decoded = 0;
+    final_phase_result.oaicompat_msg = parsed_final;
+    final_phase_result.oaicompat_msg.role = "assistant";
+
+    const auto final_phase_response = final_phase_result.to_json_oaicompat_resp();
+    bool saw_final_phase_nonstream = false;
+    if (final_phase_response.contains("output") && final_phase_response.at("output").is_array()) {
+        for (const auto & item : final_phase_response.at("output")) {
+            if (item.value("type", std::string()) == "message") {
+                saw_final_phase_nonstream = item.value("phase", std::string()) == "final_answer";
+                break;
+            }
+        }
+    }
+    if (!saw_final_phase_nonstream) {
+        std::cerr << "Responses egress lost the model-selected final_answer phase\n";
+        return 1;
+    }
+
+    bool saw_final_phase_done = false;
+    bool saw_final_phase_completed = false;
+    for (const auto & event : final_phase_result.to_json_oaicompat_resp_stream()) {
+        if (event.value("event", std::string()) == "response.output_item.done" &&
+            event.contains("data") && event.at("data").contains("item") &&
+            event.at("data").at("item").value("type", std::string()) == "message") {
+            saw_final_phase_done =
+                event.at("data").at("item").value("phase", std::string()) == "final_answer";
+        }
+        if (event.value("event", std::string()) == "response.completed" &&
+            event.contains("data") && event.at("data").contains("response") &&
+            event.at("data").at("response").contains("output") &&
+            event.at("data").at("response").at("output").is_array()) {
+            for (const auto & item : event.at("data").at("response").at("output")) {
+                if (item.value("type", std::string()) == "message") {
+                    saw_final_phase_completed = item.value("phase", std::string()) == "final_answer";
+                    break;
+                }
+            }
+        }
+    }
+    if (!saw_final_phase_done || !saw_final_phase_completed) {
+        std::cerr << "Streaming Responses egress lost final_answer phase\n";
+        return 1;
+    }
+
+    server_task_result_cmpl_final commentary_phase_result;
+    commentary_phase_result.oaicompat_model = "test-model";
+    commentary_phase_result.oaicompat_msg = parsed_commentary;
+    commentary_phase_result.oaicompat_msg.role = "assistant";
+    const auto commentary_phase_response = commentary_phase_result.to_json_oaicompat_resp();
+    bool saw_commentary_message = false;
+    bool saw_commentary_tool_call = false;
+    if (commentary_phase_response.contains("output") && commentary_phase_response.at("output").is_array()) {
+        for (const auto & item : commentary_phase_response.at("output")) {
+            const auto type = item.value("type", std::string());
+            if (type == "message") {
+                saw_commentary_message = item.value("phase", std::string()) == "commentary";
+            } else if (type == "function_call") {
+                saw_commentary_tool_call = true;
+            }
+        }
+    }
+    if (!saw_commentary_message || !saw_commentary_tool_call) {
+        std::cerr << "Responses egress lost the model-selected commentary phase\n";
+        return 1;
+    }
+
+    // Backward compatibility: an unmarked parser result still gets the old
+    // structural fallback, so non-participating templates/models keep working.
+    common_chat_msg fallback_msg = message("assistant", "Legacy preamble.");
+    fallback_msg.tool_calls.push_back({
+        "shell_command",
+        nlohmann::ordered_json({{"command", "pwd"}}).dump(),
+        "fallback_tool",
+    });
+    server_task_result_cmpl_final fallback_result;
+    fallback_result.oaicompat_model = "test-model";
+    fallback_result.oaicompat_msg = fallback_msg;
+    const auto fallback_response = fallback_result.to_json_oaicompat_resp();
+    if (fallback_response.at("output")[0].value("phase", std::string()) != "commentary") {
+        std::cerr << "Unmarked Responses message lost the tool-call phase fallback\n";
+        return 1;
+    }
+
+    std::cout << "Qwen3.8 Codex user text, generic string framing, custom framing, compaction, tool search, and Responses phase tests passed\n";
     return 0;
 }
