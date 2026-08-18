@@ -1,0 +1,44 @@
+name: tool-search-compat
+on:
+  push:
+    branches:
+      - codex-compat-tool-search
+permissions:
+  contents: write
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex-compat-tool-search
+          fetch-depth: 0
+      - name: Apply tool_search compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/apply-tool-search-compat.py
+          git diff --check
+      - name: Configure
+        run: cmake -B build-tool-search -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF
+      - name: Build focused targets
+        run: cmake --build build-tool-search --target llama-server test-chat test-qwen38-codex-template -j2
+      - name: Run test-chat
+        run: ./build-tool-search/bin/test-chat
+      - name: Run Qwen Codex regression
+        run: ./build-tool-search/bin/test-qwen38-codex-template
+      - name: Verify delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git status --short
+      - name: Commit validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tools/server/server-chat.cpp tools/server/server-common.cpp tools/server/server-schema.cpp tools/server/server-task.cpp tools/server/server-task.h tests/CMakeLists.txt tests/test-qwen38-codex-template.cpp
+          git commit -m "server: support Responses client tool search"
+          git push origin HEAD:codex-compat-tool-search
