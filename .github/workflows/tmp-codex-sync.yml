@@ -1,4 +1,4 @@
-name: Temporary Codex compatibility sync
+name: Temporary hosted web search degradation validation
 
 on:
   pull_request:
@@ -9,207 +9,122 @@ permissions:
   contents: write
 
 jobs:
-  zstd:
+  websearch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Prepare zstd compatibility patch
+      - name: Prepare hosted web search degradation patch
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin codex-compat
-          git checkout -B codex-compat-zstd origin/codex-compat
+          git checkout -B codex-compat-websearch-degrade origin/codex-compat
 
           python3 - <<'PY'
           from pathlib import Path
 
-          cmake = Path("vendor/cpp-httplib/CMakeLists.txt")
-          text = cmake.read_text()
-          detect_anchor = "find_package(Threads REQUIRED)\n"
-          detect_lines = [
-              "",
-              "# cpp-httplib already implements zstd request-body decompression; enable it",
-              "# automatically when a system libzstd is available. zstd < 1.5.6 does not",
-              "# provide the zstd::libzstd CMake target, so keep a pkg-config fallback.",
-              "set(CPPHTTPLIB_ZSTD_SUPPORT FALSE CACHE INTERNAL \"cpp-httplib zstd support\" FORCE)",
-              "if (NOT TARGET zstd::libzstd)",
-              "    find_package(zstd 1.5.6 CONFIG QUIET)",
-              "endif()",
-              "if (NOT TARGET zstd::libzstd)",
-              "    find_package(PkgConfig QUIET)",
-              "    if (PKG_CONFIG_FOUND)",
-              "        pkg_check_modules(zstd QUIET IMPORTED_TARGET libzstd)",
-              "        if (TARGET PkgConfig::zstd)",
-              "            add_library(zstd::libzstd ALIAS PkgConfig::zstd)",
-              "        endif()",
-              "    endif()",
-              "endif()",
-              "if (TARGET zstd::libzstd)",
-              "    set(CPPHTTPLIB_ZSTD_SUPPORT TRUE CACHE INTERNAL \"cpp-httplib zstd support\" FORCE)",
-              "endif()",
-              "",
-          ]
-          detect = "\n".join(detect_lines)
-          if "CPPHTTPLIB_ZSTD_SUPPORT FALSE CACHE INTERNAL" not in text:
-              if detect_anchor not in text:
-                  raise SystemExit("zstd detection anchor not found")
-              text = text.replace(detect_anchor, detect_anchor + detect, 1)
+          server = Path('tools/server/server-chat.cpp')
+          text = server.read_text()
+          old = '''            if (type == "web_search") {
+                register_tool_kind("web_search", false);
+                json chatcmpl_web_search_tool;
+                chatcmpl_web_search_tool["type"] = "function";
+                chatcmpl_web_search_tool["function"] = {
+                    {"name", "web_search"},
+                    {"description", "Search the web"},
+                    {"strict", true},
+                    {"parameters", {
+                        {"type", "object"},
+                        {"properties", {{"query", {{"type", "string"}, {"description", "Search query"}}}}
+                        },
+                        {"required", json::array({"query"})}
+                    }}
+                };
+                chatcmpl_tools.push_back(chatcmpl_web_search_tool);
+                continue;
+            }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one web_search compatibility block, found {text.count(old)}')
+          server.write_text(text.replace(old, ''))
 
-          link_anchor = "target_link_libraries(${TARGET} PRIVATE Threads::Threads)\n"
-          link_lines = [
-              "",
-              "if (CPPHTTPLIB_ZSTD_SUPPORT)",
-              "    message(STATUS \"cpp-httplib: zstd request decompression enabled\")",
-              "    target_link_libraries(${TARGET} PUBLIC zstd::libzstd)",
-              "    target_compile_definitions(${TARGET} PUBLIC CPPHTTPLIB_ZSTD_SUPPORT)",
-              "endif()",
-              "",
-          ]
-          link = "\n".join(link_lines)
-          if "cpp-httplib: zstd request decompression enabled" not in text:
-              if link_anchor not in text:
-                  raise SystemExit("zstd link anchor not found")
-              text = text.replace(link_anchor, link_anchor + link, 1)
-          cmake.write_text(text)
-
-          tests = Path("tests/CMakeLists.txt")
+          tests = Path('tests/test-chat.cpp')
           text = tests.read_text()
-          test_anchor = "llama_build_and_test(test-log.cpp)\n"
-          test_lines = [
-              "if (CPPHTTPLIB_ZSTD_SUPPORT)",
-              "    add_executable(test-http-zstd test-http-zstd.cpp)",
-              "    target_link_libraries(test-http-zstd PRIVATE vendor::cpp-httplib)",
-              "    llama_test(test-http-zstd)",
-              "endif()",
-              "",
-          ]
-          test_block = "\n".join(test_lines)
-          if "add_executable(test-http-zstd" not in text:
-              if test_anchor not in text:
-                  raise SystemExit("zstd test anchor not found")
-              text = text.replace(test_anchor, test_anchor + test_block, 1)
-          tests.write_text(text)
+          old = '''        assert_equals(true, result.contains("tools"));
+        assert_equals(true, result.at("tools").is_array());
+        assert_equals((size_t)2, result.at("tools").size());
 
-          test_source = "\n".join([
-              '#include "../vendor/cpp-httplib/httplib.h"',
-              '',
-              '#include <zstd.h>',
-              '',
-              '#include <cstdio>',
-              '#include <string>',
-              '#include <thread>',
-              '',
-              '#ifndef CPPHTTPLIB_ZSTD_SUPPORT',
-              '#error "test-http-zstd requires CPPHTTPLIB_ZSTD_SUPPORT"',
-              '#endif',
-              '',
-              'static int fail(const char * message) {',
-              '    std::fprintf(stderr, "test-http-zstd: %s\\n", message);',
-              '    return 1;',
-              '}',
-              '',
-              'int main() {',
-              '    const std::string payload =',
-              '        R"({\\"model\\":\\"qwen3.8-27b\\",\\"input\\":[{\\"role\\":\\"user\\",\\"content\\":\\"zstd request body\\"}],\\"stream\\":true})";',
-              '',
-              '    httplib::Server server;',
-              '    bool body_matches = false;',
-              '    server.Post("/v1/responses", [&](const httplib::Request & req, httplib::Response & res) {',
-              '        body_matches = req.body == payload;',
-              '        res.status = body_matches ? 200 : 400;',
-              '        res.set_content(body_matches ? "ok" : "body mismatch", "text/plain");',
-              '    });',
-              '',
-              '    const int port = server.bind_to_any_port("127.0.0.1");',
-              '    if (port <= 0) {',
-              '        return fail("failed to bind loopback server");',
-              '    }',
-              '',
-              '    std::thread worker([&]() {',
-              '        server.listen_after_bind();',
-              '    });',
-              '',
-              '    std::string compressed(ZSTD_compressBound(payload.size()), \'\\0\');',
-              '    const size_t compressed_size = ZSTD_compress(',
-              '        compressed.data(), compressed.size(), payload.data(), payload.size(), 1);',
-              '    if (ZSTD_isError(compressed_size)) {',
-              '        server.stop();',
-              '        worker.join();',
-              '        return fail(ZSTD_getErrorName(compressed_size));',
-              '    }',
-              '    compressed.resize(compressed_size);',
-              '',
-              '    httplib::Client client("127.0.0.1", port);',
-              '    const httplib::Headers headers = {{"Content-Encoding", "zstd"}};',
-              '    const auto result = client.Post("/v1/responses", headers, compressed, "application/json");',
-              '',
-              '    server.stop();',
-              '    worker.join();',
-              '',
-              '    if (!result) {',
-              '        return fail("compressed POST failed");',
-              '    }',
-              '    if (result->status != 200) {',
-              '        return fail("handler did not receive the decompressed request body");',
-              '    }',
-              '    if (!body_matches) {',
-              '        return fail("request body mismatch after zstd decompression");',
-              '    }',
-              '',
-              '    std::puts("test-http-zstd: passed");',
-              '    return 0;',
-              '}',
-              '',
-          ])
-          Path("tests/test-http-zstd.cpp").write_text(test_source)
+        const auto & web_search_tool = result.at("tools")[0];
+        assert_equals(std::string("function"), web_search_tool.at("type").get<std::string>());
+        assert_equals(std::string("web_search"), web_search_tool.at("function").at("name").get<std::string>());
+
+        const auto & weather_tool = result.at("tools")[1];
+'''
+          new = '''        assert_equals(true, result.contains("tools"));
+        assert_equals(true, result.at("tools").is_array());
+        assert_equals((size_t)1, result.at("tools").size());
+
+        const auto & weather_tool = result.at("tools")[0];
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one mixed web_search/function assertion block, found {text.count(old)}')
+          text = text.replace(old, new)
+
+          old = '''        assert_equals(true, result.contains("tools"));
+        assert_equals((size_t)1, result.at("tools").size());
+        assert_equals(std::string("web_search"),
+            result.at("tools")[0].at("function").at("name").get<std::string>());
+'''
+          new = '''        assert_equals(false, result.contains("tools"));
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one unsupported-only web_search assertion block, found {text.count(old)}')
+          tests.write_text(text.replace(old, new))
           PY
 
           git diff --check
-          git add vendor/cpp-httplib/CMakeLists.txt tests/CMakeLists.txt tests/test-http-zstd.cpp
-          git commit -m "server: support zstd-compressed HTTP requests"
-
-      - name: Ensure libzstd development files
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libzstd-dev
+          ! grep -n 'register_tool_kind("web_search"' tools/server/server-chat.cpp
+          git add tools/server/server-chat.cpp tests/test-chat.cpp
+          git diff --cached --check
+          git commit -m "server: gracefully ignore hosted Responses web search"
 
       - name: Configure focused regression build
         shell: bash
         run: |
-          cmake -S . -B build-zstd -G Ninja \
+          cmake -S . -B build-websearch -G Ninja \
             -DGGML_NATIVE=OFF \
             -DLLAMA_CURL=OFF \
-            -DLLAMA_BUILD_TESTS=ON
-          cmake --build build-zstd --target help | grep -q 'test-http-zstd'
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_SERVER=ON
 
-      - name: Build zstd and compatibility targets
+      - name: Build compatibility targets
         shell: bash
         run: |
-          cmake --build build-zstd --target \
-            test-http-zstd \
+          cmake --build build-websearch --target \
             test-qwen38-codex-template \
             test-chat \
             llama-server \
             -j 2
 
-      - name: Run zstd request regression
-        shell: bash
-        run: ./build-zstd/bin/test-http-zstd
-
       - name: Run Qwen Codex regression
         shell: bash
-        run: ./build-zstd/bin/test-qwen38-codex-template
+        run: ./build-websearch/bin/test-qwen38-codex-template
 
       - name: Run chat regression suite
         shell: bash
-        run: ./build-zstd/bin/test-chat
+        run: ./build-websearch/bin/test-chat
 
-      - name: Publish validated zstd branch
+      - name: Verify final delta
         shell: bash
-        run: git push --force origin HEAD:refs/heads/codex-compat-zstd
+        run: |
+          git diff --check origin/codex-compat...HEAD
+          test "$(git diff --name-only origin/codex-compat...HEAD | sort)" = $'tests/test-chat.cpp\ntools/server/server-chat.cpp'
+
+      - name: Publish validated web search branch
+        shell: bash
+        run: git push --force origin HEAD:refs/heads/codex-compat-websearch-degrade
