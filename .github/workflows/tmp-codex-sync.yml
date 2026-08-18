@@ -28,63 +28,47 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          server = Path('tools/server/server-chat.cpp')
+          server = Path("tools/server/server-chat.cpp")
           text = server.read_text()
-          old = '''            if (type == "web_search") {
-                register_tool_kind("web_search", false);
-                json chatcmpl_web_search_tool;
-                chatcmpl_web_search_tool["type"] = "function";
-                chatcmpl_web_search_tool["function"] = {
-                    {"name", "web_search"},
-                    {"description", "Search the web"},
-                    {"strict", true},
-                    {"parameters", {
-                        {"type", "object"},
-                        {"properties", {{"query", {{"type", "string"}, {"description", "Search query"}}}}
-                        },
-                        {"required", json::array({"query"})}
-                    }}
-                };
-                chatcmpl_tools.push_back(chatcmpl_web_search_tool);
-                continue;
-            }
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one web_search compatibility block, found {text.count(old)}')
-          server.write_text(text.replace(old, ''))
+          marker = '            if (type == "web_search") {'
+          next_marker = '            if (type == "custom") {'
+          if text.count(marker) != 1 or text.count(next_marker) != 1:
+              raise SystemExit("unexpected Responses tool conversion layout")
+          start = text.index(marker)
+          end = text.index(next_marker, start)
+          server.write_text(text[:start] + text[end:])
 
-          tests = Path('tests/test-chat.cpp')
+          tests = Path("tests/test-chat.cpp")
           text = tests.read_text()
-          old = '''        assert_equals(true, result.contains("tools"));
-        assert_equals(true, result.at("tools").is_array());
-        assert_equals((size_t)2, result.at("tools").size());
 
-        const auto & web_search_tool = result.at("tools")[0];
-        assert_equals(std::string("function"), web_search_tool.at("type").get<std::string>());
-        assert_equals(std::string("web_search"), web_search_tool.at("function").at("name").get<std::string>());
+          web_tool = '        const auto & web_search_tool = result.at("tools")[0];\n'
+          weather_tool = '        const auto & weather_tool = result.at("tools")[1];\n'
+          if text.count(web_tool) != 1 or text.count(weather_tool) != 1:
+              raise SystemExit("unexpected mixed web_search/function regression layout")
+          start = text.index(web_tool)
+          end = text.index(weather_tool, start) + len(weather_tool)
+          text = text[:start] + '        const auto & weather_tool = result.at("tools")[0];\n' + text[end:]
 
-        const auto & weather_tool = result.at("tools")[1];
-'''
-          new = '''        assert_equals(true, result.contains("tools"));
-        assert_equals(true, result.at("tools").is_array());
-        assert_equals((size_t)1, result.at("tools").size());
+          mixed_size = '        assert_equals((size_t)2, result.at("tools").size());\n\n        const auto & weather_tool = result.at("tools")[0];\n'
+          mixed_size_new = '        assert_equals((size_t)1, result.at("tools").size());\n\n        const auto & weather_tool = result.at("tools")[0];\n'
+          if text.count(mixed_size) != 1:
+              raise SystemExit("unexpected mixed web_search/function size assertion")
+          text = text.replace(mixed_size, mixed_size_new, 1)
 
-        const auto & weather_tool = result.at("tools")[0];
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one mixed web_search/function assertion block, found {text.count(old)}')
-          text = text.replace(old, new)
+          web_assert = '        assert_equals(std::string("web_search"),\n            result.at("tools")[0].at("function").at("name").get<std::string>());\n'
+          if text.count(web_assert) != 1:
+              raise SystemExit("unexpected unsupported-only web_search regression layout")
+          pos = text.index(web_assert)
+          block_start_marker = '        assert_equals(true, result.contains("tools"));\n'
+          block_start = text.rfind(block_start_marker, 0, pos)
+          if block_start < 0:
+              raise SystemExit("web_search-only tools assertion start not found")
+          block_end = pos + len(web_assert)
+          text = text[:block_start] + '        assert_equals(false, result.contains("tools"));\n' + text[block_end:]
 
-          old = '''        assert_equals(true, result.contains("tools"));
-        assert_equals((size_t)1, result.at("tools").size());
-        assert_equals(std::string("web_search"),
-            result.at("tools")[0].at("function").at("name").get<std::string>());
-'''
-          new = '''        assert_equals(false, result.contains("tools"));
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected exactly one unsupported-only web_search assertion block, found {text.count(old)}')
-          tests.write_text(text.replace(old, new))
+          if "web_search_tool" in text:
+              raise SystemExit("stale synthetic web_search regression remains")
+          tests.write_text(text)
           PY
 
           git diff --check
