@@ -1,0 +1,101 @@
+name: Temporary Codex compatibility sync
+
+on:
+  push:
+    branches:
+      - sync/merge-runner-20260818
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream master and reapply compatibility overlap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch upstream master
+          git fetch origin codex-compat
+          git checkout -B sync/resolved-upstream-20260818 origin/codex-compat
+
+          base="$(git merge-base HEAD upstream/master)"
+          overlap=(
+            common/chat.cpp
+            tools/server/server-common.cpp
+            tests/CMakeLists.txt
+            tests/test-chat.cpp
+          )
+          git diff --binary "$base" HEAD -- "${overlap[@]}" > /tmp/codex-overlap.patch
+
+          set +e
+          git merge --no-ff --no-commit upstream/master
+          merge_rc=$?
+          set -e
+
+          unexpected="$(git diff --name-only --diff-filter=U | grep -v -E '^(common/chat\.cpp|tools/server/server-common\.cpp|tests/CMakeLists\.txt|tests/test-chat\.cpp)$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "Unexpected merge conflicts:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+          # Make the four known overlap files deterministic: use current upstream as
+          # their base, then reapply the exact net codex-compat delta extracted above.
+          git checkout upstream/master -- "${overlap[@]}"
+          git add "${overlap[@]}"
+          git apply --check /tmp/codex-overlap.patch
+          git apply /tmp/codex-overlap.patch
+          git add "${overlap[@]}"
+
+          if [[ $merge_rc -ne 0 ]]; then
+            remaining="$(git diff --name-only --diff-filter=U)"
+            if [[ -n "$remaining" ]]; then
+              echo "Unresolved merge conflicts remain:"
+              echo "$remaining"
+              exit 1
+            fi
+          fi
+
+          git diff --cached --check
+          git commit -m "sync: merge upstream master"
+
+      - name: Configure focused regression build
+        shell: bash
+        run: |
+          cmake -S . -B build-sync -G Ninja \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON
+
+      - name: Build focused regression targets
+        shell: bash
+        run: |
+          cmake --build build-sync --target \
+            test-qwen38-codex-template \
+            test-chat \
+            llama-server \
+            -j 2
+
+      - name: Run Qwen Codex regression
+        shell: bash
+        run: ./build-sync/bin/test-qwen38-codex-template
+
+      - name: Run chat regression suite
+        shell: bash
+        run: ./build-sync/bin/test-chat
+
+      - name: Publish validated sync branch
+        shell: bash
+        run: |
+          git push --force origin HEAD:refs/heads/sync/resolved-upstream-20260818
