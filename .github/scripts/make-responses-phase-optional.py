@@ -101,3 +101,67 @@ replace_once(
         }
 ''',
 )
+
+# Commentary with visible text plus a tool call also carries a reasoning item.
+# Find the semantic output items by type instead of depending on array indices.
+replace_once(
+    "tests/test-qwen38-codex-template.cpp",
+    '''    const auto commentary_phase_response = commentary_phase_result.to_json_oaicompat_resp();
+    if (!commentary_phase_response.contains("output") || commentary_phase_response.at("output").size() != 2 ||
+        commentary_phase_response.at("output")[0].value("type", std::string()) != "message" ||
+        commentary_phase_response.at("output")[0].value("phase", std::string()) != "commentary" ||
+        commentary_phase_response.at("output")[1].value("type", std::string()) != "function_call") {
+        std::cerr << "Responses egress lost the model-selected commentary phase\\n";
+        return 1;
+    }
+''',
+    '''    const auto commentary_phase_response = commentary_phase_result.to_json_oaicompat_resp();
+    bool saw_commentary_message = false;
+    bool saw_commentary_tool_call = false;
+    if (commentary_phase_response.contains("output") && commentary_phase_response.at("output").is_array()) {
+        for (const auto & item : commentary_phase_response.at("output")) {
+            const auto type = item.value("type", std::string());
+            if (type == "message") {
+                saw_commentary_message = item.value("phase", std::string()) == "commentary";
+            } else if (type == "function_call") {
+                saw_commentary_tool_call = true;
+            }
+        }
+    }
+    if (!saw_commentary_message || !saw_commentary_tool_call) {
+        std::cerr << "Responses egress lost the model-selected commentary phase\\n";
+        return 1;
+    }
+''',
+)
+
+# Lock down the early streaming contract too. Codex can act on the message phase
+# before response.output_item.done, so the first message output_item.added event
+# must already carry the parser-selected phase.
+replace_once(
+    "tests/test-qwen38-codex-template.cpp",
+    '''    server_task_result_cmpl_final final_phase_result;
+''',
+    '''    task_result_state final_phase_stream_state(phase_parser, {}, false);
+    server_task_result_cmpl_partial final_phase_partial;
+    final_phase_partial.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    final_phase_partial.content = generated_final;
+    final_phase_partial.n_decoded = 1;
+    final_phase_partial.update(final_phase_stream_state);
+    bool saw_final_phase_added = false;
+    for (const auto & event : final_phase_partial.to_json_oaicompat_resp()) {
+        if (event.value("event", std::string()) == "response.output_item.added" &&
+            event.contains("data") && event.at("data").contains("item") &&
+            event.at("data").at("item").value("type", std::string()) == "message") {
+            saw_final_phase_added =
+                event.at("data").at("item").value("phase", std::string()) == "final_answer";
+        }
+    }
+    if (!saw_final_phase_added) {
+        std::cerr << "Streaming Responses output_item.added lost final_answer phase\\n";
+        return 1;
+    }
+
+    server_task_result_cmpl_final final_phase_result;
+''',
+)
