@@ -1,0 +1,210 @@
+name: Temporary Codex zstd validation
+
+on:
+  pull_request:
+    branches:
+      - zstd/runner-20260818
+
+permissions:
+  contents: write
+
+jobs:
+  zstd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare zstd compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin codex-compat
+          git checkout -B codex-compat-zstd origin/codex-compat
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake = Path("vendor/cpp-httplib/CMakeLists.txt")
+          text = cmake.read_text()
+
+          detect_anchor = "find_package(Threads REQUIRED)\n"
+          detect = r'''
+
+# cpp-httplib already implements zstd request-body decompression; enable it
+# automatically when a system libzstd is available. zstd < 1.5.6 does not
+# provide the zstd::libzstd CMake target, so keep a pkg-config fallback.
+set(CPPHTTPLIB_ZSTD_SUPPORT FALSE CACHE INTERNAL "cpp-httplib zstd support" FORCE)
+if (NOT TARGET zstd::libzstd)
+    find_package(zstd 1.5.6 CONFIG QUIET)
+endif()
+if (NOT TARGET zstd::libzstd)
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(zstd QUIET IMPORTED_TARGET libzstd)
+        if (TARGET PkgConfig::zstd)
+            add_library(zstd::libzstd ALIAS PkgConfig::zstd)
+        endif()
+    endif()
+endif()
+if (TARGET zstd::libzstd)
+    set(CPPHTTPLIB_ZSTD_SUPPORT TRUE CACHE INTERNAL "cpp-httplib zstd support" FORCE)
+endif()
+'''
+          if "CPPHTTPLIB_ZSTD_SUPPORT FALSE CACHE INTERNAL" not in text:
+              if detect_anchor not in text:
+                  raise SystemExit("zstd detection anchor not found")
+              text = text.replace(detect_anchor, detect_anchor + detect, 1)
+
+          link_anchor = "target_link_libraries(${TARGET} PRIVATE Threads::Threads)\n"
+          link = r'''
+
+if (CPPHTTPLIB_ZSTD_SUPPORT)
+    message(STATUS "cpp-httplib: zstd request decompression enabled")
+    target_link_libraries(${TARGET} PUBLIC zstd::libzstd)
+    target_compile_definitions(${TARGET} PUBLIC CPPHTTPLIB_ZSTD_SUPPORT)
+endif()
+'''
+          if "cpp-httplib: zstd request decompression enabled" not in text:
+              if link_anchor not in text:
+                  raise SystemExit("zstd link anchor not found")
+              text = text.replace(link_anchor, link_anchor + link, 1)
+
+          cmake.write_text(text)
+
+          tests = Path("tests/CMakeLists.txt")
+          text = tests.read_text()
+          test_anchor = "llama_build_and_test(test-log.cpp)\n"
+          test_block = r'''
+if (CPPHTTPLIB_ZSTD_SUPPORT)
+    add_executable(test-http-zstd test-http-zstd.cpp)
+    target_link_libraries(test-http-zstd PRIVATE vendor::cpp-httplib)
+    llama_test(test-http-zstd)
+endif()
+
+'''
+          if "add_executable(test-http-zstd" not in text:
+              if test_anchor not in text:
+                  raise SystemExit("zstd test anchor not found")
+              text = text.replace(test_anchor, test_anchor + test_block, 1)
+          tests.write_text(text)
+          PY
+
+          cat > tests/test-http-zstd.cpp <<'CPP'
+          #include "../vendor/cpp-httplib/httplib.h"
+
+          #include <zstd.h>
+
+          #include <cstdio>
+          #include <string>
+          #include <thread>
+
+          #ifndef CPPHTTPLIB_ZSTD_SUPPORT
+          #error "test-http-zstd requires CPPHTTPLIB_ZSTD_SUPPORT"
+          #endif
+
+          static int fail(const char * message) {
+              std::fprintf(stderr, "test-http-zstd: %s\n", message);
+              return 1;
+          }
+
+          int main() {
+              const std::string payload =
+                  R"({"model":"qwen3.8-27b","input":[{"role":"user","content":"zstd request body"}],"stream":true})";
+
+              httplib::Server server;
+              bool body_matches = false;
+              server.Post("/v1/responses", [&](const httplib::Request & req, httplib::Response & res) {
+                  body_matches = req.body == payload;
+                  res.status = body_matches ? 200 : 400;
+                  res.set_content(body_matches ? "ok" : "body mismatch", "text/plain");
+              });
+
+              const int port = server.bind_to_any_port("127.0.0.1");
+              if (port <= 0) {
+                  return fail("failed to bind loopback server");
+              }
+
+              std::thread worker([&]() {
+                  server.listen_after_bind();
+              });
+
+              std::string compressed(ZSTD_compressBound(payload.size()), '\0');
+              const size_t compressed_size = ZSTD_compress(
+                  compressed.data(), compressed.size(), payload.data(), payload.size(), 1);
+              if (ZSTD_isError(compressed_size)) {
+                  server.stop();
+                  worker.join();
+                  return fail(ZSTD_getErrorName(compressed_size));
+              }
+              compressed.resize(compressed_size);
+
+              httplib::Client client("127.0.0.1", port);
+              const httplib::Headers headers = {{"Content-Encoding", "zstd"}};
+              const auto result = client.Post("/v1/responses", headers, compressed, "application/json");
+
+              server.stop();
+              worker.join();
+
+              if (!result) {
+                  return fail("compressed POST failed");
+              }
+              if (result->status != 200) {
+                  return fail("handler did not receive the decompressed request body");
+              }
+              if (!body_matches) {
+                  return fail("request body mismatch after zstd decompression");
+              }
+
+              std::puts("test-http-zstd: passed");
+              return 0;
+          }
+          CPP
+
+          git diff --check
+          git add vendor/cpp-httplib/CMakeLists.txt tests/CMakeLists.txt tests/test-http-zstd.cpp
+          git commit -m "server: support zstd-compressed HTTP requests"
+
+      - name: Ensure libzstd development files
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libzstd-dev
+
+      - name: Configure focused regression build
+        shell: bash
+        run: |
+          cmake -S . -B build-zstd -G Ninja \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON
+          cmake --build build-zstd --target help | grep -q 'test-http-zstd'
+
+      - name: Build zstd and compatibility targets
+        shell: bash
+        run: |
+          cmake --build build-zstd --target \
+            test-http-zstd \
+            test-qwen38-codex-template \
+            test-chat \
+            llama-server \
+            -j 2
+
+      - name: Run zstd request regression
+        shell: bash
+        run: ./build-zstd/bin/test-http-zstd
+
+      - name: Run Qwen Codex regression
+        shell: bash
+        run: ./build-zstd/bin/test-qwen38-codex-template
+
+      - name: Run chat regression suite
+        shell: bash
+        run: ./build-zstd/bin/test-chat
+
+      - name: Publish validated zstd branch
+        shell: bash
+        run: git push --force origin HEAD:refs/heads/codex-compat-zstd
