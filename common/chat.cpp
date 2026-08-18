@@ -452,6 +452,12 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             if (message.contains("reasoning_content")) {
                 msg.reasoning_content = message.at("reasoning_content");
             }
+            if (message.contains("phase") && !message.at("phase").is_null()) {
+                if (!message.at("phase").is_string()) {
+                    throw std::invalid_argument("Invalid 'phase' type: expected string");
+                }
+                msg.phase = message.at("phase");
+            }
             if (message.contains("name")) {
                 msg.tool_name = message.at("name");
             }
@@ -534,14 +540,21 @@ struct messages_inp_normalizer {
     }
 };
 
-static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
+static json render_message_to_json(
+        const std::vector<common_chat_msg> & msgs,
+        const jinja::caps & c,
+        bool include_phase = false) {
     if (!c.supports_string_content && !c.supports_typed_content) {
         LOG_WRN("%s: Neither string content nor typed content is supported by the template. This is unexpected and may lead to issues.\n", __func__);
     }
 
     json messages = json::array();
     for (const auto & msg : msgs) {
-        messages.push_back(msg.to_json_oaicompat(/* concat_typed_text= */ false));
+        json rendered = msg.to_json_oaicompat(/* concat_typed_text= */ false);
+        if (include_phase && !msg.phase.empty()) {
+            rendered["phase"] = msg.phase;
+        }
+        messages.push_back(std::move(rendered));
     }
     return messages_inp_normalizer(c).normalize(messages);
 }
@@ -1198,6 +1211,10 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     const bool json_string_args   = tmpl.source().find("llama.cpp:xml-string-args=json") != std::string::npos;
+    const bool responses_phase_protocol =
+        tmpl.source().find("llama.cpp:responses-phase=marker-v1") != std::string::npos &&
+        inputs.extra_context.is_object() &&
+        inputs.extra_context.value("responses_phase_protocol", false);
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
@@ -1236,9 +1253,18 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
                                    (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
         }
 
+        auto phase = p.eps();
+        if (responses_phase_protocol) {
+            auto phase_block = p.atomic(
+                p.literal("<response_phase>") +
+                p.phase(p.literal("commentary") | p.literal("final_answer")) +
+                p.literal("</response_phase>"));
+            phase = p.optional(phase_block + p.space());
+        }
+
         // Response format parser
         if (has_response_format) {
-            return generation_prompt + (reasoning << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
+            return generation_prompt + (reasoning << phase << p.content(p.schema(p.json(), "response-format", inputs.json_schema)));
         }
 
         // Tool call parser
@@ -1302,11 +1328,11 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
 
             return generation_prompt +
-                   (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
+                   (reasoning << phase << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
         }
 
         // Content only parser
-        return generation_prompt + (reasoning << p.content(p.rest()));
+        return generation_prompt + (reasoning << phase << p.content(p.rest()));
     });
 
     data.parser = parser.save();
@@ -3619,7 +3645,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::trim_all_content(trimmed_messages);
         messages_to_render = &trimmed_messages;
     }
-    params.messages              = render_message_to_json(*messages_to_render, tmpl.original_caps());
+    const auto phase_protocol_it = inputs.chat_template_kwargs.find("responses_phase_protocol");
+    const bool responses_phase_protocol =
+        phase_protocol_it != inputs.chat_template_kwargs.end() && phase_protocol_it->second == "true";
+    params.messages              = render_message_to_json(
+        *messages_to_render, tmpl.original_caps(), responses_phase_protocol);
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
     params.enable_thinking       = inputs.enable_thinking;

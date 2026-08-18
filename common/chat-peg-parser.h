@@ -63,6 +63,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     static constexpr const char * REASONING_BLOCK = "reasoning-block";
     static constexpr const char * REASONING       = "reasoning";
     static constexpr const char * CONTENT         = "content";
+    static constexpr const char * PHASE           = "phase";
 
     // Tag constants
     static constexpr const char * TOOL           = "tool";
@@ -84,6 +85,8 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     common_peg_parser reasoning(const common_peg_parser & p) { return tag(REASONING, p); }
 
     common_peg_parser content(const common_peg_parser & p) { return tag(CONTENT, p); }
+
+    common_peg_parser phase(const common_peg_parser & p) { return atomic(tag(PHASE, p)); }
 
     common_peg_parser tag_with_safe_content(const std::string &       tag_name,
                         const std::string &       marker,

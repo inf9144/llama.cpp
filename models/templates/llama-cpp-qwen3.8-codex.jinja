@@ -1,5 +1,6 @@
 {%- set template_version = "qwen3.8-codex-safe-v1" %}
 {#- llama.cpp:xml-string-args=json -#}
+{#- llama.cpp:responses-phase=marker-v1 -#}
 {#- -------------------------------------------------------------------------
     Whitespace contract: every tag opener in this file carries a leading minus,
     so it strips the whitespace and newlines that precede it. All emitted text
@@ -26,6 +27,9 @@
 {%- endif %}
 {%- set add_vision_id = add_vision_id if add_vision_id is defined else false %}
 {%- set enable_thinking = enable_thinking if enable_thinking is defined else true %}
+{%- set responses_phase_protocol =
+    responses_phase_protocol if responses_phase_protocol is defined else false
+%}
 {%- set auto_disable_thinking_with_tools =
     auto_disable_thinking_with_tools
     if auto_disable_thinking_with_tools is defined
@@ -157,6 +161,20 @@
         {%- set reasoning_instructions =
             'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.'
         %}
+    {%- endif %}
+{%- endif %}
+{%- if responses_phase_protocol %}
+    {%- set phase_instructions =
+        'Responses message phases are transport metadata and are separate from reasoning. Emit exactly one internal phase block immediately after </think> and before any visible assistant text or tool call: <response_phase>commentary</response_phase> when the visible assistant message is an intermediate update before tool use or further work, or <response_phase>final_answer</response_phase> when the visible assistant message is the terminal answer of the turn. If the template has already supplied an empty <think></think> block, begin your generation with the phase block. Never repeat or mention the phase block in visible text.'
+    %}
+    {%- if reasoning_instructions %}
+        {%- set reasoning_instructions =
+            reasoning_instructions ~ '
+
+' ~ phase_instructions
+        %}
+    {%- else %}
+        {%- set reasoning_instructions = phase_instructions %}
     {%- endif %}
 {%- endif %}
 {#- -------------------------------------------------------------------------
@@ -378,17 +396,32 @@
             {%- endif %}
         {%- endif %}
         {%- set reasoning_content = reasoning_content | trim %}
+        {%- set phase_prefix = '' %}
+        {%- set after_think = '\n\n' %}
+        {%- if responses_phase_protocol
+               and message.phase is defined
+               and message.phase is not none
+               and message.phase %}
+            {%- if message.phase not in ('commentary', 'final_answer') %}
+                {{- raise_exception('Unexpected Responses message phase ' ~ message.phase ~ '.') }}
+            {%- endif %}
+            {%- set phase_prefix =
+                '<response_phase>' ~ message.phase ~ '</response_phase>\n'
+            %}
+            {%- set after_think = '\n' ~ phase_prefix %}
+        {%- endif %}
         {#- Preserve the original invariant: when thinking is preserved,
             always reconstruct the thinking block, even when it is empty. -#}
         {%- if _preserve_thinking
                or loop.index0 > ns.last_query_index %}
             {{- '<|im_start|>assistant\n<think>\n'
                 ~ reasoning_content
-                ~ '\n</think>\n\n'
+                ~ '\n</think>'
+                ~ after_think
                 ~ content
             }}
         {%- else %}
-            {{- '<|im_start|>assistant\n' ~ content }}
+            {{- '<|im_start|>assistant\n' ~ phase_prefix ~ content }}
         {%- endif %}
         {%- if message.tool_calls is defined
                and message.tool_calls is not none
