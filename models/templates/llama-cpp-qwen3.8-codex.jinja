@@ -127,20 +127,29 @@
 {%- if auto_disable_thinking_with_tools and _has_tools %}
     {%- set _thinking_enabled = false %}
 {%- endif %}
-{#- Validate reasoning effort even when thinking is disabled. -#}
+{#- Normalize common client effort names onto four Qwen-facing modes.
+    `medium` intentionally adds no steering and is the model-native baseline.
+    `high` is a focused, bounded reasoning mode for agentic workloads. -#}
 {%- set _effort_raw =
-    reasoning_effort if reasoning_effort is defined else 'xhigh'
+    reasoning_effort if reasoning_effort is defined else 'high'
 %}
-{%- if _effort_raw == 'high' or _effort_raw == 'xhigh' %}
-    {%- set _reasoning_effort = 'xhigh' %}
+{%- if _effort_raw == 'none' or _effort_raw == 'off' %}
+    {%- set _reasoning_effort = 'none' %}
+    {%- set _thinking_enabled = false %}
+{%- elif _effort_raw == 'minimal' or _effort_raw == 'low' %}
+    {%- set _reasoning_effort = 'low' %}
 {%- elif _effort_raw == 'medium' %}
     {%- set _reasoning_effort = 'medium' %}
-{%- elif _effort_raw == 'low' %}
-    {%- set _reasoning_effort = 'low' %}
+{%- elif _effort_raw == 'high' %}
+    {%- set _reasoning_effort = 'high' %}
+{%- elif _effort_raw == 'xhigh'
+       or _effort_raw == 'max'
+       or _effort_raw == 'ultra' %}
+    {%- set _reasoning_effort = 'xhigh' %}
 {%- else %}
     {{- raise_exception(
         'Unexpected reasoning effort ' ~ _effort_raw ~
-        '. Supported values are high/xhigh, medium, and low.'
+        '. Supported values are none/off, minimal/low, medium, high, and xhigh/max/ultra.'
     ) }}
 {%- endif %}
 {%- set reasoning_instructions = '' %}
@@ -149,9 +158,9 @@
         {%- set reasoning_instructions =
             'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.'
         %}
-    {%- elif _reasoning_effort == 'medium' %}
+    {%- elif _reasoning_effort == 'high' %}
         {%- set reasoning_instructions =
-            'Reasoning effort is set to medium. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.'
+            'Reasoning effort is set to high. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.'
         %}
     {%- elif _reasoning_effort == 'low' %}
         {%- set reasoning_instructions =
@@ -378,8 +387,11 @@
             {%- endif %}
         {%- endif %}
         {%- set reasoning_content = reasoning_content | trim %}
-        {#- Preserve the original invariant: when thinking is preserved,
-            always reconstruct the thinking block, even when it is empty. -#}
+        {#- Match Qwen3.8's canonical history shape: preserved assistant
+            turns keep a thinking block even when its content is empty. This is
+            intentional for genuine non-thinking/zero-reasoning turns. When
+            preserve_reasoning=false, older thinking blocks are omitted entirely;
+            non-empty reasoning is never replaced by a synthetic empty block. -#}
         {%- if _preserve_thinking
                or loop.index0 > ns.last_query_index %}
             {{- '<|im_start|>assistant\n<think>\n'

@@ -35,6 +35,11 @@ static std::string prefix_before_first_user(const std::string & prompt) {
     return prompt.substr(0, pos);
 }
 
+static bool ends_with(const std::string & value, const std::string & suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 int main() {
     const std::string template_path = "models/templates/llama-cpp-qwen3.8-codex.jinja";
     auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, read_file(template_path)));
@@ -548,6 +553,149 @@ int main() {
         return 1;
     }
 
-    std::cout << "Qwen3.8 Codex user text, generic string framing, custom framing, and compaction tests passed\n";
+    // Qwen3.8 reasoning-effort compatibility. Medium is the model-native
+    // unsteered baseline; high is the bounded anti-overthinking mode used by
+    // default for this Codex-oriented template.
+    const std::string low_reasoning_instruction =
+        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+    const std::string high_reasoning_instruction =
+        "Reasoning effort is set to high. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.";
+    const std::string xhigh_reasoning_instruction =
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+    auto render_reasoning = [&](const std::vector<common_chat_msg> & messages,
+                                const std::string & effort,
+                                bool enable_thinking,
+                                bool preserve_reasoning) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = messages;
+        inputs.add_generation_prompt = true;
+        inputs.enable_thinking = enable_thinking;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.chat_template_kwargs["preserve_reasoning"] = preserve_reasoning ? "true" : "false";
+        if (!effort.empty()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = nlohmann::ordered_json(effort).dump();
+        }
+        return common_chat_templates_apply(tmpls.get(), inputs);
+    };
+
+    const std::vector<common_chat_msg> simple_reasoning_messages = { system, user };
+    const auto default_reasoning = render_reasoning(simple_reasoning_messages, "", true, true);
+    if (default_reasoning.prompt.find(high_reasoning_instruction) == std::string::npos ||
+        default_reasoning.prompt.find(low_reasoning_instruction) != std::string::npos ||
+        default_reasoning.prompt.find(xhigh_reasoning_instruction) != std::string::npos) {
+        std::cerr << "Qwen3.8 default reasoning effort was not the focused high mode\n";
+        return 1;
+    }
+    if (!ends_with(default_reasoning.prompt, "<|im_start|>assistant\n<think>\n")) {
+        std::cerr << "Thinking-enabled Qwen3.8 generation prompt did not leave <think> open\n";
+        return 1;
+    }
+
+    const auto medium_reasoning = render_reasoning(simple_reasoning_messages, "medium", true, true);
+    if (medium_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+        std::cerr << "Qwen3.8 medium reasoning effort unexpectedly injected steering\n";
+        return 1;
+    }
+
+    const auto explicit_high = render_reasoning(simple_reasoning_messages, "high", true, true);
+    if (explicit_high.prompt.find(high_reasoning_instruction) == std::string::npos) {
+        std::cerr << "Qwen3.8 high reasoning effort lost bounded reasoning steering\n";
+        return 1;
+    }
+
+    for (const std::string effort : {"low", "minimal"}) {
+        const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
+        if (params.prompt.find(low_reasoning_instruction) == std::string::npos) {
+            std::cerr << "Qwen3.8 low/minimal reasoning alias did not use low steering\n";
+            return 1;
+        }
+    }
+    for (const std::string effort : {"xhigh", "max", "ultra"}) {
+        const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
+        if (params.prompt.find(xhigh_reasoning_instruction) == std::string::npos) {
+            std::cerr << "Qwen3.8 xhigh/max/ultra reasoning alias did not use xhigh steering\n";
+            return 1;
+        }
+    }
+    for (const std::string effort : {"none", "off"}) {
+        const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
+        if (!ends_with(params.prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
+            params.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+            std::cerr << "Qwen3.8 none/off reasoning alias did not disable thinking canonically\n";
+            return 1;
+        }
+    }
+    const auto disabled_reasoning = render_reasoning(simple_reasoning_messages, "high", false, true);
+    if (!ends_with(disabled_reasoning.prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
+        disabled_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+        std::cerr << "Explicitly disabled Qwen3.8 thinking did not use the canonical closed block\n";
+        return 1;
+    }
+
+    bool rejected_unknown_effort = false;
+    try {
+        (void) render_reasoning(simple_reasoning_messages, "turbo", true, true);
+    } catch (const std::exception &) {
+        rejected_unknown_effort = true;
+    }
+    if (!rejected_unknown_effort) {
+        std::cerr << "Unknown Qwen3.8 reasoning effort was not rejected\n";
+        return 1;
+    }
+
+    // Preserve Qwen3.8's canonical history representation. An empty historical
+    // thinking block is meaningful for a genuine non-thinking/zero-reasoning
+    // turn; stripping old reasoning must omit the whole block instead of
+    // replacing non-empty reasoning with a synthetic empty block.
+    common_chat_msg historical_reasoned = message("assistant", "Prior answer.");
+    historical_reasoned.reasoning_content = "Prior reasoning.";
+    common_chat_msg historical_empty = message("assistant", "No hidden reasoning.");
+    const common_chat_msg later_user = message("user", "Next question.");
+
+    const auto preserved_reasoned = render_reasoning(
+        { system, user, historical_reasoned, later_user }, "medium", true, true);
+    if (preserved_reasoned.prompt.find(
+            "<|im_start|>assistant\n<think>\nPrior reasoning.\n</think>\n\nPrior answer.<|im_end|>\n") == std::string::npos) {
+        std::cerr << "Non-empty historical Qwen3.8 reasoning was not preserved\n";
+        return 1;
+    }
+
+    const auto preserved_empty = render_reasoning(
+        { system, user, historical_empty, later_user }, "medium", true, true);
+    if (preserved_empty.prompt.find(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\nNo hidden reasoning.<|im_end|>\n") == std::string::npos) {
+        std::cerr << "Canonical empty historical Qwen3.8 thinking block was not preserved\n";
+        return 1;
+    }
+
+    const auto stripped_history = render_reasoning(
+        { system, user, historical_reasoned, later_user }, "medium", true, false);
+    if (stripped_history.prompt.find("Prior reasoning.") != std::string::npos ||
+        stripped_history.prompt.find(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\nPrior answer.") != std::string::npos ||
+        stripped_history.prompt.find(
+            "<|im_start|>assistant\nPrior answer.<|im_end|>\n") == std::string::npos) {
+        std::cerr << "preserve_reasoning=false synthesized or retained old thinking history\n";
+        return 1;
+    }
+
+    common_chat_msg latest_tool_reasoning;
+    latest_tool_reasoning.role = "assistant";
+    latest_tool_reasoning.reasoning_content = "Latest tool reasoning.";
+    latest_tool_reasoning.tool_calls.push_back({
+        "shell_command",
+        nlohmann::ordered_json({{"command", "pwd"}}).dump(),
+        "latest_tool",
+    });
+    const auto latest_preserved = render_reasoning(
+        { system, user, latest_tool_reasoning }, "medium", true, false);
+    if (latest_preserved.prompt.find(
+            "<|im_start|>assistant\n<think>\nLatest tool reasoning.\n</think>\n\n") == std::string::npos) {
+        std::cerr << "Latest agent-loop reasoning was stripped despite preserve_reasoning=false\n";
+        return 1;
+    }
+
+    std::cout << "Qwen3.8 Codex tool framing, reasoning compatibility, and compaction tests passed\n";
     return 0;
 }
