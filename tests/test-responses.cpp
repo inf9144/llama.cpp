@@ -73,6 +73,34 @@ int main() {
         return 1;
     }
 
-    std::cout << "Responses assistant message phase tests passed\n";
+    server_task_result_cmpl_partial reasoning_chunk {};
+    reasoning_chunk.is_updated = true;
+    reasoning_chunk.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    reasoning_chunk.oai_resp_reasoning_id = "rs_test";
+    common_chat_msg_diff reasoning_diff;
+    reasoning_diff.reasoning_content_delta = "Thinking...";
+    reasoning_chunk.oaicompat_msg_diffs.push_back(reasoning_diff);
+
+    const auto reasoning_events = reasoning_chunk.to_json_oaicompat_resp();
+    bool found_reasoning_delta = false;
+    for (const auto & event : reasoning_events) {
+        if (event.value("event", std::string()) != "response.reasoning_text.delta") {
+            continue;
+        }
+        found_reasoning_delta = true;
+        const auto & data = event.at("data");
+        if (data.value("item_id", std::string()) != "rs_test" ||
+            data.value("delta", std::string()) != "Thinking..." ||
+            data.value("content_index", -1) != 0) {
+            std::cerr << "Streaming Responses reasoning delta metadata was incorrect\n";
+            return 1;
+        }
+    }
+    if (!found_reasoning_delta) {
+        std::cerr << "Streaming Responses reasoning delta was not emitted\n";
+        return 1;
+    }
+
+    std::cout << "Responses assistant message phase and reasoning stream tests passed\n";
     return 0;
 }
