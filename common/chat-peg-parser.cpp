@@ -318,7 +318,6 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     // Handle reasoning/content tags
     bool is_reasoning = node.tag == common_chat_peg_builder::REASONING;
     bool is_content   = node.tag == common_chat_peg_builder::CONTENT;
-    bool is_phase     = node.tag == common_chat_peg_builder::PHASE;
 
     if (is_reasoning) { // GPT OSS can have more than 1 reasoning block, so concatenate here
         result.reasoning_content += std::string(node.text);
@@ -328,10 +327,6 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         // Concatenate content from multiple content nodes (e.g., when reasoning markers
         // are preserved before content markers in reasoning_format=NONE mode)
         result.content += std::string(node.text);
-    }
-
-    if (is_phase) {
-        result.phase = std::string(node.text);
     }
 
     // Handle tool-related tags (supporting both JSON and tagged formats)

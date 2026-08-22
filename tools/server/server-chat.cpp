@@ -319,9 +319,6 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    if (exists_and_is_string(item, "phase")) {
-                        prev_msg["phase"] = item.at("phase");
-                    }
                     if (!exists_and_is_array(prev_msg, "content")) {
                         prev_msg["content"] = json::array();
                     }
@@ -552,26 +549,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
-    {
+    if (is_compaction_request) {
         json chat_template_kwargs = json_value(chatcmpl_body, "chat_template_kwargs", json::object());
         if (!chat_template_kwargs.is_object()) {
             throw std::invalid_argument("'chat_template_kwargs' must be an object");
         }
 
-        // Responses phase metadata is model-assisted by templates that know how
-        // to signal it; templates that do not recognize the flag simply ignore it.
-        chat_template_kwargs["responses_phase_protocol"] = true;
-
-        if (is_compaction_request) {
-            // Keep model-specific compaction prompting in the chat template. This
-            // flag does not alter durable history; a template can append its own
-            // compaction tail after rendering the normal message/tool prefix.
-            chat_template_kwargs["is_compaction"] = true;
-        }
+        // Keep model-specific compaction prompting in the chat template. This
+        // flag does not alter durable history; a template can append its own
+        // compaction tail after rendering the normal message/tool prefix.
+        chat_template_kwargs["is_compaction"] = true;
         chatcmpl_body["chat_template_kwargs"] = std::move(chat_template_kwargs);
-    }
-
-    if (is_compaction_request) {
         chatcmpl_body["__llamacpp_responses_compaction"] = true;
     }
 
