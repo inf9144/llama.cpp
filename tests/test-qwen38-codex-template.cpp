@@ -1,8 +1,7 @@
 #include "chat.h"
+#include "json.h"
 #include "server-chat.h"
 #include "server-task.h"
-
-#include <nlohmann/json.hpp>
 
 #include <fstream>
 #include <iostream>
@@ -10,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+using json = common_json;
 
 static std::string read_file(const std::string & path) {
     std::ifstream file(path, std::ios::binary);
@@ -65,8 +66,8 @@ int main() {
         "JSON: {\"key\":\"value\",\"path\":\"C:\\tmp\"}\n"
         "Unicode: äöü ß € 漢字 🚀\n"
         "EOF";
-    const std::string encoded_shell_command = nlohmann::ordered_json(shell_command).dump();
-    const std::string shell_arguments = nlohmann::ordered_json({
+    const std::string encoded_shell_command = json(shell_command).dump();
+    const std::string shell_arguments = json({
         {"command", shell_command},
         {"workdir", "/home/hausen/src"},
     }).dump();
@@ -184,9 +185,9 @@ int main() {
         return 1;
     }
 
-    nlohmann::ordered_json parsed_arguments;
+    json parsed_arguments;
     try {
-        parsed_arguments = nlohmann::ordered_json::parse(parsed.tool_calls[0].arguments);
+        parsed_arguments = json::parse(parsed.tool_calls[0].arguments);
     } catch (const std::exception & e) {
         std::cerr << "Qwen3-Coder PEG parser produced invalid JSON arguments: " << e.what() << "\n";
         return 1;
@@ -216,7 +217,7 @@ int main() {
         "+</function>\n"
         "+quote: \"hello\" backslash: C:\\tmp\\x unicode: Ä € 🚀\n"
         "*** End Patch";
-    const std::string encoded_custom_input = nlohmann::ordered_json({{"data", custom_input}}).dump();
+    const std::string encoded_custom_input = json({{"data", custom_input}}).dump();
 
     common_chat_templates_inputs custom_inputs;
     custom_inputs.messages = { system, user };
@@ -249,9 +250,9 @@ int main() {
         return 1;
     }
 
-    nlohmann::ordered_json parsed_custom_arguments;
+    json parsed_custom_arguments;
     try {
-        parsed_custom_arguments = nlohmann::ordered_json::parse(parsed_custom.tool_calls[0].arguments);
+        parsed_custom_arguments = json::parse(parsed_custom.tool_calls[0].arguments);
     } catch (const std::exception & e) {
         std::cerr << "Custom/freeform PEG transport produced invalid JSON arguments: " << e.what() << "\n";
         return 1;
@@ -274,7 +275,7 @@ int main() {
     historical_custom_call.role = "assistant";
     historical_custom_call.tool_calls.push_back({
         "apply_patch",
-        nlohmann::ordered_json({{"input", {{"data", custom_input}}}}).dump(),
+        json({{"input", {{"data", custom_input}}}}).dump(),
         "call_custom",
     });
     common_chat_msg historical_custom_result = message("tool", "Done!");
@@ -302,9 +303,9 @@ int main() {
         return 1;
     }
 
-    nlohmann::ordered_json historical_value;
+    json historical_value;
     try {
-        historical_value = nlohmann::ordered_json::parse(
+        historical_value = json::parse(
             historical_custom.prompt.substr(historical_value_begin, historical_end - historical_value_begin));
     } catch (const std::exception & e) {
         std::cerr << "Historical custom/freeform input leaked through XML framing: " << e.what() << "\n";
@@ -321,10 +322,10 @@ int main() {
     // Codex 0.147 client-side tool_search is bridged through an internal
     // function, while discovered tools remain out of the stable top-level tool
     // block and are carried separately for parser/grammar expansion.
-    const nlohmann::ordered_json tool_search_request = {
+    const json tool_search_request = {
         {"model", "test-model"},
         {"input", "Find calendar tools"},
-        {"tools", nlohmann::ordered_json::array({
+        {"tools", json::array({
             {
                 {"type", "tool_search"},
                 {"execution", "client"},
@@ -332,7 +333,7 @@ int main() {
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {{"query", {{"type", "string"}}}}},
-                    {"required", nlohmann::ordered_json::array({"query"})},
+                    {"required", json::array({"query"})},
                     {"additionalProperties", false},
                 }},
             },
@@ -347,13 +348,13 @@ int main() {
         return 1;
     }
 
-    const nlohmann::ordered_json followup_request = {
+    const json followup_request = {
         {"model", "test-model"},
-        {"input", nlohmann::ordered_json::array({
+        {"input", json::array({
             {
                 {"type", "message"},
                 {"role", "user"},
-                {"content", nlohmann::ordered_json::array({{{"type", "input_text"}, {"text", "Find calendar tools"}}})},
+                {"content", json::array({{{"type", "input_text"}, {"text", "Find calendar tools"}}})},
             },
             {
                 {"type", "tool_search_call"},
@@ -366,12 +367,12 @@ int main() {
                 {"call_id", "search-1"},
                 {"status", "completed"},
                 {"execution", "client"},
-                {"tools", nlohmann::ordered_json::array({
+                {"tools", json::array({
                     {
                         {"type", "namespace"},
                         {"name", "mcp__calendar"},
                         {"description", "Calendar tools"},
-                        {"tools", nlohmann::ordered_json::array({
+                        {"tools", json::array({
                             {
                                 {"type", "function"},
                                 {"name", "create_event"},
@@ -380,7 +381,7 @@ int main() {
                                 {"parameters", {
                                     {"type", "object"},
                                     {"properties", {{"title", {{"type", "string"}}}}},
-                                    {"required", nlohmann::ordered_json::array({"title"})},
+                                    {"required", json::array({"title"})},
                                     {"additionalProperties", false},
                                 }},
                             },
@@ -415,6 +416,63 @@ int main() {
         return 1;
     }
 
+    const json standalone_output_request = {
+        {"model", "test-model"},
+        {"input", json::array({
+            {
+                {"type", "function_call_output"},
+                {"name", "notifications"},
+                {"namespace", "slack"},
+                {"output", "Alice mentioned you."},
+            },
+        })},
+    };
+    const json converted_standalone_output =
+        server_chat_convert_responses_to_chatcmpl(standalone_output_request);
+    const json & standalone_messages = converted_standalone_output.at("messages");
+    if (standalone_messages.size() != 1 ||
+        standalone_messages[0].value("role", std::string()) != "tool" ||
+        standalone_messages[0].value("name", std::string()) != "slack.notifications" ||
+        standalone_messages[0].value("content", std::string()) != "Alice mentioned you." ||
+        standalone_messages[0].contains("tool_call_id")) {
+        std::cerr << "Standalone named function output was not preserved as unpaired tool context\n";
+        return 1;
+    }
+
+    json null_call_id_request = standalone_output_request;
+    null_call_id_request["input"][0]["call_id"] = nullptr;
+    const json converted_null_call_id = server_chat_convert_responses_to_chatcmpl(null_call_id_request);
+    const json & null_call_id_messages = converted_null_call_id.at("messages");
+    if (null_call_id_messages.size() != 1 ||
+        null_call_id_messages[0].value("role", std::string()) != "tool" ||
+        null_call_id_messages[0].value("name", std::string()) != "slack.notifications" ||
+        null_call_id_messages[0].value("content", std::string()) != "Alice mentioned you." ||
+        null_call_id_messages[0].contains("tool_call_id")) {
+        std::cerr << "Standalone named function output with null call ID was not preserved as unpaired tool context\n";
+        return 1;
+    }
+
+    const json paired_output_request = {
+        {"model", "test-model"},
+        {"input", json::array({
+            {
+                {"type", "function_call_output"},
+                {"call_id", "call_123"},
+                {"output", "Paired output"},
+            },
+        })},
+    };
+    const json converted_paired_output = server_chat_convert_responses_to_chatcmpl(paired_output_request);
+    const json & paired_messages = converted_paired_output.at("messages");
+    if (paired_messages.size() != 1 ||
+        paired_messages[0].value("role", std::string()) != "tool" ||
+        paired_messages[0].value("content", std::string()) != "Paired output" ||
+        paired_messages[0].value("tool_call_id", std::string()) != "call_123" ||
+        paired_messages[0].contains("name")) {
+        std::cerr << "Paired function output did not preserve its call ID\n";
+        return 1;
+    }
+
     common_chat_tool tool_search_tool;
     tool_search_tool.name = "tool_search";
     tool_search_tool.description = "Search deferred tools";
@@ -429,12 +487,12 @@ int main() {
     search_call.role = "assistant";
     search_call.tool_calls.push_back({
         "tool_search",
-        nlohmann::ordered_json({{"query", "calendar"}}).dump(),
+        json({{"query", "calendar"}}).dump(),
         "search-1",
     });
     common_chat_msg search_result = message(
         "tool",
-        nlohmann::ordered_json({{"tools", converted_followup.at("__llamacpp_responses_deferred_tools")}}).dump());
+        json({{"tools", converted_followup.at("__llamacpp_responses_deferred_tools")}}).dump());
     search_result.tool_call_id = "search-1";
 
     common_chat_templates_inputs stable_inputs;
@@ -515,7 +573,7 @@ int main() {
     tool_search_result.oaicompat_msg.role = "assistant";
     tool_search_result.oaicompat_msg.tool_calls.push_back({
         "tool_search",
-        nlohmann::ordered_json({{"query", "calendar"}, {"limit", 8}}).dump(),
+        json({{"query", "calendar"}, {"limit", 8}}).dump(),
         "search_generated",
     });
 
@@ -574,7 +632,7 @@ int main() {
         inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
         inputs.chat_template_kwargs["preserve_reasoning"] = preserve_reasoning ? "true" : "false";
         if (!effort.empty()) {
-            inputs.chat_template_kwargs["reasoning_effort"] = nlohmann::ordered_json(effort).dump();
+            inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
         }
         return common_chat_templates_apply(tmpls.get(), inputs);
     };
@@ -685,7 +743,7 @@ int main() {
     latest_tool_reasoning.reasoning_content = "Latest tool reasoning.";
     latest_tool_reasoning.tool_calls.push_back({
         "shell_command",
-        nlohmann::ordered_json({{"command", "pwd"}}).dump(),
+        json({{"command", "pwd"}}).dump(),
         "latest_tool",
     });
     const auto latest_preserved = render_reasoning(
