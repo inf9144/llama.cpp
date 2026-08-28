@@ -477,7 +477,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     });
                 }
             } else if (item_type == "function_call_output" &&
-                !item.contains("call_id") &&
+                (!item.contains("call_id") || item.at("call_id").is_null()) &&
                 exists_and_is_string(item, "name") &&
                 !item.at("name").get<std::string>().empty() &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output"))

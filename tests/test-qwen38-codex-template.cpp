@@ -439,6 +439,40 @@ int main() {
         return 1;
     }
 
+    json null_call_id_request = standalone_output_request;
+    null_call_id_request["input"][0]["call_id"] = nullptr;
+    const json converted_null_call_id = server_chat_convert_responses_to_chatcmpl(null_call_id_request);
+    const json & null_call_id_messages = converted_null_call_id.at("messages");
+    if (null_call_id_messages.size() != 1 ||
+        null_call_id_messages[0].value("role", std::string()) != "tool" ||
+        null_call_id_messages[0].value("name", std::string()) != "slack.notifications" ||
+        null_call_id_messages[0].value("content", std::string()) != "Alice mentioned you." ||
+        null_call_id_messages[0].contains("tool_call_id")) {
+        std::cerr << "Standalone named function output with null call ID was not preserved as unpaired tool context\n";
+        return 1;
+    }
+
+    const json paired_output_request = {
+        {"model", "test-model"},
+        {"input", json::array({
+            {
+                {"type", "function_call_output"},
+                {"call_id", "call_123"},
+                {"output", "Paired output"},
+            },
+        })},
+    };
+    const json converted_paired_output = server_chat_convert_responses_to_chatcmpl(paired_output_request);
+    const json & paired_messages = converted_paired_output.at("messages");
+    if (paired_messages.size() != 1 ||
+        paired_messages[0].value("role", std::string()) != "tool" ||
+        paired_messages[0].value("content", std::string()) != "Paired output" ||
+        paired_messages[0].value("tool_call_id", std::string()) != "call_123" ||
+        paired_messages[0].contains("name")) {
+        std::cerr << "Paired function output did not preserve its call ID\n";
+        return 1;
+    }
+
     common_chat_tool tool_search_tool;
     tool_search_tool.name = "tool_search";
     tool_search_tool.description = "Search deferred tools";
