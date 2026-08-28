@@ -199,6 +199,36 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             return j.contains(key) && j.at(key).is_string();
         };
 
+        auto convert_tool_output = [&](const json & output) {
+            if (output.is_string()) {
+                return output;
+            }
+
+            json content = output;
+            for (json & part : content) {
+                const std::string type = json_value(part, "type", std::string());
+                if (type == "input_text" || type == "output_text" || type == "text") {
+                    if (!exists_and_is_string(part, "text")) {
+                        throw std::invalid_argument("Text output of tool call requires 'text'");
+                    }
+                    part["type"] = "text";
+                } else if (type == "input_image") {
+                    if (!exists_and_is_string(part, "image_url")) {
+                        throw std::invalid_argument("Image output of tool call requires 'image_url'");
+                    }
+                    part = json {
+                        {"type", "image_url"},
+                        {"image_url", json {
+                            {"url", part.at("image_url")},
+                        }},
+                    };
+                } else {
+                    throw std::invalid_argument("Output of tool call must be text or input_image");
+                }
+            }
+            return content;
+        };
+
         for (size_t input_index = 0; input_index < input_value.size(); ++input_index) {
             json item = input_value.at(input_index);
             const std::string item_type = json_value(item, "type", std::string());
@@ -446,59 +476,35 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_calls", json::array({tool_call})}
                     });
                 }
+            } else if (item_type == "function_call_output" &&
+                !item.contains("call_id") &&
+                exists_and_is_string(item, "name") &&
+                !item.at("name").get<std::string>().empty() &&
+                (exists_and_is_string(item, "output") || exists_and_is_array(item, "output"))
+            ) {
+                std::string tool_namespace;
+                if (item.contains("namespace") && !item.at("namespace").is_null()) {
+                    if (!item.at("namespace").is_string()) {
+                        throw std::invalid_argument("Standalone function output 'namespace' must be a string or null");
+                    }
+                    tool_namespace = item.at("namespace").get<std::string>();
+                }
+                chatcmpl_messages.push_back(json {
+                    {"content", convert_tool_output(item.at("output"))},
+                    {"role", "tool"},
+                    {"name", server_chat_encode_namespace_tool_name(
+                        tool_namespace, item.at("name").get<std::string>())},
+                });
             } else if (exists_and_is_string(item, "call_id") &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
                 exists_and_is_string(item, "type") &&
                 (item.at("type") == "function_call_output" || item.at("type") == "custom_tool_call_output")
             ) {
-                // Responses function/custom tool call output
-                if (item.at("output").is_string()) {
-                    chatcmpl_messages.push_back(json {
-                        {"content",      item.at("output")},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
-                } else {
-                    json chatcmpl_outputs = item.at("output");
-
-                    // Support Codex view_image tool outputs.
-
-                    for (json & chatcmpl_output : chatcmpl_outputs) {
-                        const std::string output_type = json_value(chatcmpl_output, "type", std::string());
-
-                        if (output_type == "input_text" ||
-                            output_type == "output_text" ||
-                            output_type == "text") {
-                            if (!exists_and_is_string(chatcmpl_output, "text")) {
-                                throw std::invalid_argument("Text output of tool call requires 'text'");
-                            }
-                            chatcmpl_output["type"] = "text";
-                        } else if (output_type == "input_image") {
-                            if (!exists_and_is_string(chatcmpl_output, "image_url")) {
-                                throw std::invalid_argument("Image output of tool call requires 'image_url'");
-                            }
-
-                            const std::string image_url =
-                                chatcmpl_output.at("image_url").get<std::string>();
-
-                            chatcmpl_output = json {
-                                {"type", "image_url"},
-                                {"image_url", json {
-                                    {"url", image_url}
-                                }}
-                            };
-                        } else {
-                            throw std::invalid_argument(
-                                "Output of tool call must be text or input_image");
-                        }
-                    }
-
-                    chatcmpl_messages.push_back(json {
-                        {"content",      chatcmpl_outputs},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
-                }
+                chatcmpl_messages.push_back(json {
+                    {"content",      convert_tool_output(item.at("output"))},
+                    {"role",         "tool"},
+                    {"tool_call_id", item.at("call_id")},
+                });
             } else if (item_type == "compaction" && exists_and_is_string(item, "encrypted_content")) {
                 static constexpr const char * compaction_prefix = "llama.cpp.compaction.v1\n";
                 const std::string encrypted_content = item.at("encrypted_content").get<std::string>();

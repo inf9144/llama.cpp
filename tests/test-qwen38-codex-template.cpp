@@ -416,6 +416,29 @@ int main() {
         return 1;
     }
 
+    const json standalone_output_request = {
+        {"model", "test-model"},
+        {"input", json::array({
+            {
+                {"type", "function_call_output"},
+                {"name", "notifications"},
+                {"namespace", "slack"},
+                {"output", "Alice mentioned you."},
+            },
+        })},
+    };
+    const json converted_standalone_output =
+        server_chat_convert_responses_to_chatcmpl(standalone_output_request);
+    const json & standalone_messages = converted_standalone_output.at("messages");
+    if (standalone_messages.size() != 1 ||
+        standalone_messages[0].value("role", std::string()) != "tool" ||
+        standalone_messages[0].value("name", std::string()) != "slack.notifications" ||
+        standalone_messages[0].value("content", std::string()) != "Alice mentioned you." ||
+        standalone_messages[0].contains("tool_call_id")) {
+        std::cerr << "Standalone named function output was not preserved as unpaired tool context\n";
+        return 1;
+    }
+
     common_chat_tool tool_search_tool;
     tool_search_tool.name = "tool_search";
     tool_search_tool.description = "Search deferred tools";
