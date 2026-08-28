@@ -6,9 +6,7 @@
 #include "server-common.h"
 #include "server-http.h"
 
-#include <nlohmann/json_fwd.hpp>
-
-using json = nlohmann::ordered_json;
+#include "json.h"
 
 inline uint64_t server_chat_responses_fingerprint(const std::string & value) {
     uint64_t hash = 14695981039346656037ULL;
@@ -19,6 +17,28 @@ inline uint64_t server_chat_responses_fingerprint(const std::string & value) {
     return hash;
 }
 
+inline const char * server_chat_json_type_name(const json & value) {
+    if (value.is_null()) {
+        return "null";
+    }
+    if (value.is_object()) {
+        return "object";
+    }
+    if (value.is_array()) {
+        return "array";
+    }
+    if (value.is_string()) {
+        return "string";
+    }
+    if (value.is_boolean()) {
+        return "boolean";
+    }
+    if (value.is_number()) {
+        return "number";
+    }
+    return "unknown";
+}
+
 inline void server_chat_responses_content_stats(
         const json & content,
         size_t & parts,
@@ -27,7 +47,7 @@ inline void server_chat_responses_content_stats(
         size_t & other) {
     if (content.is_string()) {
         parts = 1;
-        text_chars = content.get_ref<const std::string &>().size();
+        text_chars = content.get<std::string>().size();
         return;
     }
     if (!content.is_array()) {
@@ -44,7 +64,7 @@ inline void server_chat_responses_content_stats(
             continue;
         }
         if (part.contains("text") && part.at("text").is_string()) {
-            text_chars += part.at("text").get_ref<const std::string &>().size();
+            text_chars += part.at("text").get<std::string>().size();
             continue;
         }
         if ((part.contains("image_url") && !part.at("image_url").is_null()) ||
@@ -82,7 +102,7 @@ inline void server_chat_log_responses_structure(const json & body) {
         }
     }
 
-    const char * input_kind = input.is_array() ? "array" : input.is_string() ? "string" : input.type_name();
+    const char * input_kind = server_chat_json_type_name(input);
     const size_t input_count = input.is_array() ? input.size() : input.is_null() ? 0 : 1;
     SRV_INF(
         "Responses structure: kind=%s instructions={chars=%zu,hash=%016llx} tools={count=%zu,bytes=%zu,hash=%016llx} input={kind=%s,count=%zu}\n",
@@ -96,7 +116,7 @@ inline void server_chat_log_responses_structure(const json & body) {
         input_count);
 
     if (input.is_string()) {
-        SRV_INF("Responses input[0]: type=input_text role=user text_chars=%zu\n", input.get_ref<const std::string &>().size());
+        SRV_INF("Responses input[0]: type=input_text role=user text_chars=%zu\n", input.get<std::string>().size());
         return;
     }
     if (!input.is_array()) {
@@ -106,7 +126,7 @@ inline void server_chat_log_responses_structure(const json & body) {
     for (size_t i = 0; i < input.size(); ++i) {
         const json & item = input.at(i);
         if (!item.is_object()) {
-            SRV_INF("Responses input[%zu]: type=%s\n", i, item.type_name());
+            SRV_INF("Responses input[%zu]: type=%s\n", i, server_chat_json_type_name(item));
             continue;
         }
 
@@ -130,7 +150,7 @@ inline void server_chat_log_responses_structure(const json & body) {
 
         size_t arguments_chars = 0;
         if (item.contains("arguments") && item.at("arguments").is_string()) {
-            arguments_chars = item.at("arguments").get_ref<const std::string &>().size();
+            arguments_chars = item.at("arguments").get<std::string>().size();
         }
 
         size_t output_parts = 0;
@@ -144,7 +164,7 @@ inline void server_chat_log_responses_structure(const json & body) {
 
         size_t encrypted_chars = 0;
         if (item.contains("encrypted_content") && item.at("encrypted_content").is_string()) {
-            encrypted_chars = item.at("encrypted_content").get_ref<const std::string &>().size();
+            encrypted_chars = item.at("encrypted_content").get<std::string>().size();
         }
 
         SRV_INF(
