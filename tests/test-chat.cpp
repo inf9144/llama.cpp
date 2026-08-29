@@ -1883,6 +1883,134 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(std::string("You are a helpful assistant."), sys_msg.at("content").get<std::string>());
     }
 
+    // Test function call outputs
+    {
+        json input = json::parse(R"({
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_string",
+                    "output": "string output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_text",
+                    "output": [
+                        {"type": "input_text", "text": "input text"},
+                        {"type": "output_text", "text": "output text"},
+                        {"type": "text", "text": "text"}
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "name": "notifications",
+                    "output": "standalone output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": null,
+                    "name": "notifications",
+                    "output": "standalone null output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "name": "foo",
+                    "output": "standalone empty output"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_paired",
+                    "name": "notifications",
+                    "output": "paired output"
+                }
+            ],
+            "model": "test-model"
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+        const auto & messages = result.at("messages");
+        assert_equals((size_t)7, messages.size());
+
+        assert_equals(std::string("string output"), messages[0].at("content").get<std::string>());
+        assert_equals(std::string("call_string"), messages[0].at("tool_call_id").get<std::string>());
+
+        assert_equals(std::string("text"), messages[1].at("content")[0].at("type").get<std::string>());
+        assert_equals(std::string("input text"), messages[1].at("content")[0].at("text").get<std::string>());
+        assert_equals(std::string("text"), messages[1].at("content")[1].at("type").get<std::string>());
+        assert_equals(std::string("output text"), messages[1].at("content")[1].at("text").get<std::string>());
+        assert_equals(std::string("text"), messages[1].at("content")[2].at("type").get<std::string>());
+        assert_equals(std::string("text"), messages[1].at("content")[2].at("text").get<std::string>());
+
+        assert_equals(std::string("image_url"), messages[2].at("content")[0].at("type").get<std::string>());
+        assert_equals(std::string("data:image/png;base64,AAAA"), messages[2].at("content")[0].at("image_url").at("url").get<std::string>());
+
+        assert_equals(std::string("notifications"), messages[3].at("name").get<std::string>());
+        assert_equals(false, messages[3].contains("tool_call_id"));
+        assert_equals(std::string("standalone output"), messages[3].at("content").get<std::string>());
+
+        assert_equals(std::string("notifications"), messages[4].at("name").get<std::string>());
+        assert_equals(false, messages[4].contains("tool_call_id"));
+        assert_equals(std::string("standalone null output"), messages[4].at("content").get<std::string>());
+
+        assert_equals(std::string("foo"), messages[5].at("name").get<std::string>());
+        assert_equals(false, messages[5].contains("tool_call_id"));
+        assert_equals(std::string("standalone empty output"), messages[5].at("content").get<std::string>());
+
+        assert_equals(std::string("call_paired"), messages[6].at("tool_call_id").get<std::string>());
+        assert_equals(false, messages[6].contains("name"));
+        assert_equals(std::string("paired output"), messages[6].at("content").get<std::string>());
+    }
+
+    // Test standalone function call outputs without a non-empty name
+    {
+        const json items = json::parse(R"([
+            {
+                "type": "function_call_output",
+                "name": "",
+                "output": "standalone output"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "output": "standalone output"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "",
+                "name": "",
+                "output": "standalone output"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": null,
+                "name": "",
+                "output": "standalone output"
+            }
+        ])");
+
+        for (const json & item : items) {
+            const json input = {
+                {"input", json::array({item})},
+                {"model", "test-model"},
+            };
+            bool threw = false;
+            try {
+                server_chat_convert_responses_to_chatcmpl(input);
+            } catch (const std::invalid_argument &) {
+                threw = true;
+            }
+            assert_equals(true, threw);
+        }
+    }
+
     // Test with max_output_tokens conversion
     {
         json input = json::parse(R"({

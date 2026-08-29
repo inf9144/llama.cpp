@@ -39,6 +39,39 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         static auto exists_and_is_string = [](const json & j, const char * key) -> bool {
             return j.contains(key) && j.at(key).is_string();
         };
+        static auto exists_and_is_non_empty_string = [](const json & j, const char * key) -> bool {
+            return j.contains(key) && j.at(key).is_string() && !j.at(key).get<std::string>().empty();
+        };
+
+        auto convert_tool_output = [&](const json & output) {
+            if (output.is_string()) {
+                return output;
+            }
+
+            json content = output;
+            for (json & part : content) {
+                const std::string type = json_value(part, "type", std::string());
+                if (type == "input_text" || type == "output_text" || type == "text") {
+                    if (!exists_and_is_string(part, "text")) {
+                        throw std::invalid_argument("Text output of tool call requires 'text'");
+                    }
+                    part["type"] = "text";
+                } else if (type == "input_image") {
+                    if (!exists_and_is_string(part, "image_url")) {
+                        throw std::invalid_argument("Image output of tool call requires 'image_url'");
+                    }
+                    part = json {
+                        {"type", "image_url"},
+                        {"image_url", json {
+                            {"url", part.at("image_url")},
+                        }},
+                    };
+                } else {
+                    throw std::invalid_argument("Output of tool call must be text or input_image");
+                }
+            }
+            return content;
+        };
 
         for (json item : input_value) {
             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
@@ -188,32 +221,25 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_calls", json::array({tool_call})}
                     });
                 }
-            } else if (exists_and_is_string(item, "call_id") &&
+            } else if (exists_and_is_string(item, "type") &&
+                item.at("type") == "function_call_output" &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
-                exists_and_is_string(item, "type") &&
-                item.at("type") == "function_call_output"
+                (exists_and_is_non_empty_string(item, "call_id") ||
+                    ((!item.contains("call_id") || item.at("call_id").is_null() ||
+                        (item.at("call_id").is_string() && item.at("call_id").get<std::string>().empty())) &&
+                        exists_and_is_non_empty_string(item, "name")))
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call_output
-                if (item.at("output").is_string()) {
-                    chatcmpl_messages.push_back(json {
-                        {"content",      item.at("output")},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
+                json message = {
+                    {"content", convert_tool_output(item.at("output"))},
+                    {"role",    "tool"},
+                };
+                if (exists_and_is_non_empty_string(item, "call_id")) {
+                    message["tool_call_id"] = item.at("call_id");
                 } else {
-                    json chatcmpl_outputs = item.at("output");
-                    for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            throw std::invalid_argument("Output of tool call should be 'Input text'");
-                        }
-                        chatcmpl_output["type"] = "text";
-                    }
-                    chatcmpl_messages.push_back(json {
-                        {"content",      chatcmpl_outputs},
-                        {"role",         "tool"},
-                        {"tool_call_id", item.at("call_id")},
-                    });
+                    message["name"] = item.at("name");
                 }
+                chatcmpl_messages.push_back(std::move(message));
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
