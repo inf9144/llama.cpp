@@ -337,8 +337,11 @@ int main() {
     }
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
-    if (custom_tool_description.find("@@ -1,3 +1,4 @@") == std::string::npos ||
-        custom_tool_description.find("@@ <context>") == std::string::npos ||
+    if (custom_tool_description.find("@@ -10,4 +10,5 @@") == std::string::npos ||
+        custom_tool_description.find("literal source line") == std::string::npos ||
+        custom_tool_description.find("there is no closing `@@`") == std::string::npos ||
+        custom_tool_description.find("@@ fn calculate()") == std::string::npos ||
+        custom_tool_description.find("must be an actual line") == std::string::npos ||
         custom_tool_description.find("+*** literal content") == std::string::npos) {
         std::cerr << "Responses apply_patch bridge did not expose Codex patch-format guidance\n";
         return 1;
