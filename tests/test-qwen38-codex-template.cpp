@@ -374,6 +374,18 @@ int main() {
         std::cerr << "Responses tool_search was not exposed as the sole internal client tool\n";
         return 1;
     }
+    const std::string tool_search_description =
+        converted_search.at("tools")[0]["function"].value("description", std::string());
+    if (tool_search_description.find("Search deferred tools") == std::string::npos ||
+        tool_search_description.find("deferred tool metadata") == std::string::npos ||
+        tool_search_description.find("does not perform the underlying task") == std::string::npos ||
+        tool_search_description.find("not for the task-specific data or arguments") == std::string::npos ||
+        tool_search_description.find("dynamically callable") == std::string::npos ||
+        tool_search_description.find("exact returned tool name") == std::string::npos ||
+        tool_search_description.find("desired tool or capability") == std::string::npos) {
+        std::cerr << "Responses tool_search bridge did not expose deferred-tool lifecycle guidance\n";
+        return 1;
+    }
 
     const json followup_request = {
         {"model", "test-model"},
@@ -440,6 +452,23 @@ int main() {
         followup_messages[2]["role"] != "tool" ||
         followup_messages[2]["content"].get<std::string>().find("mcp__calendar.create_event") == std::string::npos) {
         std::cerr << "tool_search call/output history was not preserved in chronological model context\n";
+        return 1;
+    }
+    json followup_tool_context;
+    try {
+        followup_tool_context = json::parse(followup_messages[2]["content"].get<std::string>());
+    } catch (const std::exception & e) {
+        std::cerr << "tool_search_output model context was not valid JSON: " << e.what() << "\n";
+        return 1;
+    }
+    if (!followup_tool_context.value("deferred_tools_now_callable", false) ||
+        followup_tool_context.value("instruction", std::string()).find("dynamically callable") == std::string::npos ||
+        followup_tool_context.value("instruction", std::string()).find("exact returned tool name") == std::string::npos ||
+        !followup_tool_context.contains("tools") ||
+        !followup_tool_context.at("tools").is_array() ||
+        followup_tool_context.at("tools").size() != 1 ||
+        followup_tool_context.at("tools")[0]["function"]["name"] != "mcp__calendar.create_event") {
+        std::cerr << "tool_search_output did not mark the discovered tool as dynamically callable\n";
         return 1;
     }
 

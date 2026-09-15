@@ -414,8 +414,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     }
                 }
 
+                const json discovered_tool_context = {
+                    {"deferred_tools_now_callable", !discovered_tools.empty()},
+                    {"instruction",
+                        "Any tools listed below are dynamically callable on this model turn even if they were absent "
+                        "from the original static tool list. Invoke an exact returned tool name using its returned "
+                        "argument schema."},
+                    {"tools", discovered_tools},
+                };
+
                 chatcmpl_messages.push_back(json {
-                    {"content", json({{"tools", discovered_tools}}).dump()},
+                    {"content", discovered_tool_context.dump()},
                     {"role", "tool"},
                     {"tool_call_id", item.at("call_id")},
                 });
@@ -591,9 +600,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     SRV_WRN("%s\n", "unsupported server-executed Responses tool_search skipped");
                     continue;
                 }
+                std::string description = json_value(resp_tool, "description", std::string());
+                if (!description.empty()) {
+                    description += "\n\n";
+                }
+                description +=
+                   "This searches deferred tool metadata; it does not perform the underlying task. "
+                    "Search for the tool or capability you need, not for the task-specific data or arguments that you intend to pass to that tool. "
+                    "Tools returned by tool_search are dynamically callable on the following model turn even if they were absent from the original static tool list. "
+                    "After discovery, invoke the exact returned tool name using its returned argument schema. "
+                    "Do not substitute a different tool, shell command, or placeholder merely because the discovered tool was absent from the original static tool list. "
+                    "If the needed capability was not returned, search again using the desired tool or capability rather than guessing a substitute.";
                 json function_tool = {
                     {"name", "tool_search"},
-                    {"description", json_value(resp_tool, "description", std::string())},
+                    {"description", std::move(description)},
                     {"parameters", json_value(resp_tool, "parameters", json::object())},
                     {"strict", true},
                 };
