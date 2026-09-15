@@ -335,6 +335,14 @@ int main() {
         std::cerr << "Responses custom/freeform bridge did not expose direct string input\n";
         return 1;
     }
+    const std::string custom_tool_description =
+        converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
+    if (custom_tool_description.find("@@ -1,3 +1,4 @@") == std::string::npos ||
+        custom_tool_description.find("@@ <context>") == std::string::npos ||
+        custom_tool_description.find("+*** literal content") == std::string::npos) {
+        std::cerr << "Responses apply_patch bridge did not expose Codex patch-format guidance\n";
+        return 1;
+    }
 
     const json tool_search_request = {
         {"model", "test-model"},
