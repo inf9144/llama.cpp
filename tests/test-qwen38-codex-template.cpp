@@ -200,13 +200,13 @@ int main() {
         return 1;
     }
 
-    // Responses custom/freeform tools wrap the raw payload in input.data. The
-    // outer object forces Qwen3-Coder onto its JSON-value PEG path, while the
-    // nested string schema still guarantees that the transported value is text.
+    // Responses custom/freeform tools use one direct string argument. The
+    // llama.cpp:xml-string-args=json template marker forces that string through
+    // the JSON-value PEG path, so embedded XML delimiter text remains data.
     common_chat_tool custom_tool;
     custom_tool.name = "apply_patch";
     custom_tool.description = "Responses custom/freeform transport test";
-    custom_tool.parameters = R"({"type":"object","properties":{"input":{"type":"object","properties":{"data":{"type":"string"}},"required":["data"],"additionalProperties":false}},"required":["input"],"additionalProperties":false})";
+    custom_tool.parameters = R"({"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false})";
 
     const std::string custom_input =
         "*** Begin Patch\n"
@@ -217,7 +217,7 @@ int main() {
         "+</function>\n"
         "+quote: \"hello\" backslash: C:\\tmp\\x unicode: Ä € 🚀\n"
         "*** End Patch";
-    const std::string encoded_custom_input = json({{"data", custom_input}}).dump();
+    const std::string encoded_custom_input = json(custom_input).dump();
 
     common_chat_templates_inputs custom_inputs;
     custom_inputs.messages = { system, user };
@@ -259,10 +259,8 @@ int main() {
     }
 
     if (!parsed_custom_arguments.contains("input") ||
-        !parsed_custom_arguments.at("input").is_object() ||
-        !parsed_custom_arguments.at("input").contains("data") ||
-        !parsed_custom_arguments.at("input").at("data").is_string() ||
-        parsed_custom_arguments.at("input").at("data").get<std::string>() != custom_input) {
+        !parsed_custom_arguments.at("input").is_string() ||
+        parsed_custom_arguments.at("input").get<std::string>() != custom_input) {
         std::cerr << "Custom/freeform PEG transport corrupted literal XML delimiter content\n";
         return 1;
     }
@@ -275,7 +273,7 @@ int main() {
     historical_custom_call.role = "assistant";
     historical_custom_call.tool_calls.push_back({
         "apply_patch",
-        json({{"input", {{"data", custom_input}}}}).dump(),
+        json({{"input", custom_input}}).dump(),
         "call_custom",
     });
     common_chat_msg historical_custom_result = message("tool", "Done!");
@@ -312,9 +310,7 @@ int main() {
         return 1;
     }
 
-    if (!historical_value.is_object() || historical_value.size() != 1 ||
-        !historical_value.contains("data") || !historical_value.at("data").is_string() ||
-        historical_value.at("data").get<std::string>() != custom_input) {
+    if (!historical_value.is_string() || historical_value.get<std::string>() != custom_input) {
         std::cerr << "Historical custom/freeform replay corrupted the transported payload\n";
         return 1;
     }
@@ -322,6 +318,24 @@ int main() {
     // Codex 0.147 client-side tool_search is bridged through an internal
     // function, while discovered tools remain out of the stable top-level tool
     // block and are carried separately for parser/grammar expansion.
+    const json custom_tool_request = {
+        {"model", "test-model"},
+        {"input", "Apply a patch"},
+        {"tools", json::array({
+            {
+                {"type", "custom"},
+                {"name", "apply_patch"},
+                {"description", "Apply a patch"},
+            },
+        })},
+    };
+    const auto converted_custom_tool = server_chat_convert_responses_to_chatcmpl(custom_tool_request);
+    if (!converted_custom_tool.contains("tools") || converted_custom_tool.at("tools").size() != 1 ||
+        converted_custom_tool.at("tools")[0]["function"]["parameters"]["properties"]["input"].value("type", std::string()) != "string") {
+        std::cerr << "Responses custom/freeform bridge did not expose direct string input\n";
+        return 1;
+    }
+
     const json tool_search_request = {
         {"model", "test-model"},
         {"input", "Find calendar tools"},

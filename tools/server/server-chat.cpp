@@ -122,7 +122,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         if (!description.empty()) {
             description += "\n\n";
         }
-        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the raw freeform payload verbatim in the `data` string inside the single `input` object. The `input.data` wrapper is transport-only; the Responses API receives only the decoded raw string.";
+        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. Do not wrap it in another object. String arguments are JSON-encoded by the model-facing XML transport so embedded newlines, quotes, backslashes, and XML-like delimiter text remain data. The Responses API receives the decoded raw string.";
 
         out.push_back(json {
             {"type", "function"},
@@ -134,16 +134,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     {"type", "object"},
                     {"properties", json {
                         {"input", json {
-                            {"type", "object"},
-                            {"description", "Transport wrapper for a Responses custom/freeform payload."},
-                            {"properties", json {
-                                {"data", json {
-                                    {"type", "string"},
-                                    {"description", "Raw freeform input passed verbatim to the custom tool."},
-                                }},
-                            }},
-                            {"required", json::array({"data"})},
-                            {"additionalProperties", false},
+                            {"type", "string"},
+                            {"description", "Complete raw freeform input passed verbatim to the custom tool."},
                         }},
                     }},
                     {"required", json::array({"input"})},
@@ -450,14 +442,15 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "custom_tool_call"
             ) {
-                // Responses custom/freeform calls use a nested JSON transport so
-                // arbitrary payload text cannot collide with XML parameter framing.
+                // Responses custom/freeform calls use one JSON-string transport argument.
+                // The chat template JSON-encodes string parameters so arbitrary payload text
+                // cannot collide with XML parameter framing.
                 const std::string tool_name = server_chat_encode_namespace_tool_name(
                     json_value(item, "namespace", std::string()),
                     item.at("name").get<std::string>());
                 json tool_call = {
                     {"function", json {
-                        {"arguments", json({{"input", json({{"data", item.at("input")}})}}).dump()},
+                        {"arguments", json({{"input", item.at("input")}}).dump()},
                         {"name",      tool_name},
                     }},
                     {"id",   item.at("call_id")},
