@@ -342,6 +342,8 @@ int main() {
         custom_tool_description.find("there is no closing `@@`") == std::string::npos ||
         custom_tool_description.find("@@ fn calculate()") == std::string::npos ||
         custom_tool_description.find("must be an actual line") == std::string::npos ||
+        custom_tool_description.find("pure append") == std::string::npos ||
+        custom_tool_description.find("inserted at EOF") == std::string::npos ||
         custom_tool_description.find("+*** literal content") == std::string::npos) {
         std::cerr << "Responses apply_patch bridge did not expose Codex patch-format guidance\n";
         return 1;

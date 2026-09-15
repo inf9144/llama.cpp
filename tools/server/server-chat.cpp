@@ -131,6 +131,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 "The form `@@ <context>` means: find the literal source line `<context>` in the target file and use that existing line as an anchor for the following change. "
                 "The anchor text must actually exist in the file, and there is no closing `@@`; write `@@ fn example()` rather than `@@ fn example() @@`. "
                 "Use bare `@@` to start another chunk when no literal anchor is needed. The first update chunk may omit `@@` entirely and begin directly with diff lines. "
+                "For a pure append to the end of an existing file, use an Update File chunk containing only `+` lines with no context and no `@@`; an add-only chunk with no old/context lines is inserted at EOF. Prefer this over copying a long final-line anchor or generating helper scripts just to preserve anchor bytes. "
                 "Every file-content line in an update hunk must start with a space for context, `+` for an added line, or `-` for a removed line. "
                 "A literal file-content line beginning with `***` must still carry its diff prefix, for example `+*** literal content` when inserting it. "
                 "Example: `*** Begin Patch\n*** Update File: src/foo.rs\n@@ fn calculate()\n     let old = 1;\n-    return old;\n+    return old + 1;\n*** End Patch`. "
