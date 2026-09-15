@@ -1,7 +1,9 @@
 #include "chat.h"
 #include "json.h"
+#include "json-schema-to-grammar.h"
 #include "server-chat.h"
 #include "server-task.h"
+#include "../src/llama-grammar.h"
 
 #include <fstream>
 #include <iostream>
@@ -39,6 +41,44 @@ static std::string prefix_before_first_user(const std::string & prompt) {
 static bool ends_with(const std::string & value, const std::string & suffix) {
     return value.size() >= suffix.size() &&
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool grammar_accepts(const std::string & grammar_str, const std::string & input) {
+    llama_grammar * grammar = llama_grammar_init_impl(
+        nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0);
+    if (grammar == nullptr) {
+        return false;
+    }
+
+    bool accepted = true;
+    try {
+        for (char c : input) {
+            // The framing regression corpus below is ASCII after JSON encoding, so
+            // feeding one byte at a time also lets us stop immediately on rejection.
+            llama_grammar_accept_str(*grammar, std::string(1, c));
+            if (llama_grammar_get_stacks(grammar).empty()) {
+                accepted = false;
+                break;
+            }
+        }
+    } catch (const std::runtime_error &) {
+        // llama_grammar_accept_str() throws when a piece makes the grammar stack
+        // empty. For negative regression cases that is an expected rejection.
+        accepted = false;
+    }
+
+    if (accepted) {
+        accepted = false;
+        for (const auto & stack : llama_grammar_get_stacks(grammar)) {
+            if (stack.empty()) {
+                accepted = true;
+                break;
+            }
+        }
+    }
+
+    llama_grammar_free_impl(grammar);
+    return accepted;
 }
 
 int main() {
@@ -335,6 +375,133 @@ int main() {
         std::cerr << "Responses custom/freeform bridge did not expose direct string input\n";
         return 1;
     }
+
+    const json & apply_patch_input_schema =
+        converted_custom_tool.at("tools")[0]["function"]["parameters"]["properties"]["input"];
+    if (!apply_patch_input_schema.contains("pattern") ||
+        !apply_patch_input_schema.at("pattern").is_string()) {
+        std::cerr << "Responses apply_patch bridge did not constrain freeform patch framing\n";
+        return 1;
+    }
+
+    common_chat_tool guarded_custom_tool;
+    guarded_custom_tool.name = "apply_patch";
+    guarded_custom_tool.description = "Guarded Responses custom/freeform tool";
+    guarded_custom_tool.parameters =
+        converted_custom_tool.at("tools")[0]["function"]["parameters"].dump();
+
+    common_chat_templates_inputs guarded_inputs;
+    guarded_inputs.messages = { system, user };
+    guarded_inputs.tools = { guarded_custom_tool };
+    guarded_inputs.add_generation_prompt = true;
+    guarded_inputs.enable_thinking = true;
+    guarded_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const common_chat_params guarded_params = common_chat_templates_apply(tmpls.get(), guarded_inputs);
+
+    if (guarded_params.grammar.empty() ||
+        guarded_params.grammar.find("*** Begin Patch") == std::string::npos ||
+        guarded_params.grammar.find("*** End Patch") == std::string::npos) {
+        std::cerr << "Responses apply_patch framing constraint did not reach the Qwen sampling grammar\n";
+        return 1;
+    }
+
+    // common_chat_parse() intentionally validates the structural PEG only. The
+    // JSON-schema pattern is compiled into GBNF by parser.build_grammar() and is
+    // enforced during sampling, so exercise that layer directly as well.
+    const std::string apply_patch_input_grammar =
+        json_schema_to_grammar(apply_patch_input_schema, true);
+    if (apply_patch_input_grammar.find("*** Begin Patch") == std::string::npos ||
+        apply_patch_input_grammar.find("*** End Patch") == std::string::npos) {
+        std::cerr << "Responses apply_patch input pattern did not compile into GBNF framing rules\n";
+        return 1;
+    }
+
+    common_chat_parser_params guarded_parser_params(guarded_params);
+    guarded_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    guarded_parser_params.parser.load(guarded_params.parser);
+
+    auto guarded_parser_accepts = [&](const std::string & input) {
+        const std::string generated_guarded =
+            "Testing guarded patch framing.\n</think>\n\n"
+            "<tool_call>\n"
+            "<function=apply_patch>\n"
+            "<parameter=input>\n" + json(input).dump() + "\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>";
+
+        try {
+            const common_chat_msg parsed_guarded =
+                common_chat_parse(generated_guarded, false, guarded_parser_params);
+            return parsed_guarded.tool_calls.size() == 1 &&
+                   parsed_guarded.tool_calls[0].name == "apply_patch";
+        } catch (const std::exception &) {
+            return false;
+        }
+    };
+
+    auto guarded_grammar_accepts = [&](const std::string & input) {
+        return grammar_accepts(apply_patch_input_grammar, json(input).dump());
+    };
+
+    const std::vector<std::string> valid_patch_inputs = {
+        "*** Begin Patch\n"
+        "*** Add File: a.txt\n"
+        "+hello\n"
+        "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Delete File: old.txt\n"
+        "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Add File: escaped.txt\n"
+        "+quote: \"hello\" backslash: C:\\tmp\\x\n"
+        "*** End Patch",
+    };
+    for (const std::string & input : valid_patch_inputs) {
+        const bool peg_accepts = guarded_parser_accepts(input);
+        const bool gbnf_accepts = guarded_grammar_accepts(input);
+        if (!peg_accepts || !gbnf_accepts) {
+            std::cerr << "Responses apply_patch guard rejected a valid framed payload: "
+                      << json(input).dump()
+                      << " (PEG=" << (peg_accepts ? "accept" : "reject")
+                      << ", GBNF=" << (gbnf_accepts ? "accept" : "reject")
+                      << ")\n";
+            return 1;
+        }
+    }
+
+    const std::vector<std::string> invalid_patch_inputs = {
+        "",
+        ">>> Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch",
+        "*** Begin Patch",
+        "*** Begin Patch\n*** End Patch",
+        "*** Begin Patch\n*** Add File: a.txt\n+hello",
+        "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\ntrailing",
+    };
+    for (const std::string & input : invalid_patch_inputs) {
+        if (guarded_grammar_accepts(input)) {
+            std::cerr << "Responses apply_patch sampling grammar accepted invalid framing: "
+                      << json(input).dump() << "\n";
+            return 1;
+        }
+    }
+
+    json generic_custom_tool_request = custom_tool_request;
+    generic_custom_tool_request["tools"][0]["name"] = "freeform_echo";
+    const auto converted_generic_custom_tool =
+        server_chat_convert_responses_to_chatcmpl(generic_custom_tool_request);
+    const json & generic_input_schema =
+        converted_generic_custom_tool.at("tools")[0]["function"]["parameters"]["properties"]["input"];
+    if (generic_input_schema.contains("pattern")) {
+        std::cerr << "Responses bridge unexpectedly constrained a non-apply_patch custom tool\n";
+        return 1;
+    }
+
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
     if (custom_tool_description.find("@@ -10,4 +10,5 @@") == std::string::npos ||

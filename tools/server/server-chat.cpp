@@ -124,7 +124,18 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         }
         description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. Do not wrap it in another object. String arguments are JSON-encoded by the model-facing XML transport so embedded newlines, quotes, backslashes, and XML-like delimiter text remain data. The Responses API receives the decoded raw string.";
 
+        json input_schema = {
+            {"type", "string"},
+            {"description", "Complete raw freeform input passed verbatim to the custom tool."},
+        };
+
         if (custom_tool.at("name").get<std::string>() == "apply_patch") {
+            // JSON-string tool arguments are grammar-constrained in their lexical encoded form.
+            // Keep arbitrary valid JSON string content in the patch body, but require the outer
+            // apply_patch framing so malformed prefixes cannot be sampled after tool selection.
+            input_schema["pattern"] =
+                R"(^\*\*\* Begin Patch\\n(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfnrt]|u[0-9a-fA-F]{4}))*\\n\*\*\* End Patch$)";
+
             description +=
                 "\n\nCodex apply_patch syntax: use `*** Begin Patch`, `*** Update File: <path>`, and `*** End Patch`. "
                 "IMPORTANT: `@@` here is NOT a standard unified-diff line-range header. Never emit range headers such as `@@ -10,4 +10,5 @@`. "
@@ -147,10 +158,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 {"parameters", json {
                     {"type", "object"},
                     {"properties", json {
-                        {"input", json {
-                            {"type", "string"},
-                            {"description", "Complete raw freeform input passed verbatim to the custom tool."},
-                        }},
+                        {"input", input_schema},
                     }},
                     {"required", json::array({"input"})},
                     {"additionalProperties", false},
