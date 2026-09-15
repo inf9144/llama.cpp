@@ -1,0 +1,237 @@
+name: Apply flat custom tool bridge
+
+on:
+  push:
+    branches:
+      - codex-compat
+    paths:
+      - .github/workflows/codex-flat-custom-tool.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex-compat
+          fetch-depth: 0
+
+      - name: Apply transport refactor
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "tools/server/server-chat.cpp",
+              '''        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the raw freeform payload verbatim in the `data` string inside the single `input` object. The `input.data` wrapper is transport-only; the Responses API receives only the decoded raw string.";
+''',
+              '''        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. The model-facing XML transport JSON-encodes string arguments, so embedded newlines, quotes, backslashes, and XML-like delimiter text remain data. The Responses API receives the decoded raw string.";
+''',
+          )
+
+          replace_once(
+              "tools/server/server-chat.cpp",
+              '''                        {"input", json {
+                            {"type", "object"},
+                            {"description", "Transport wrapper for a Responses custom/freeform payload."},
+                            {"properties", json {
+                                {"data", json {
+                                    {"type", "string"},
+                                    {"description", "Raw freeform input passed verbatim to the custom tool."},
+                                }},
+                            }},
+                            {"required", json::array({"data"})},
+                            {"additionalProperties", false},
+                        }},
+''',
+              '''                        {"input", json {
+                            {"type", "string"},
+                            {"description", "Complete raw freeform input passed verbatim to the custom tool."},
+                        }},
+''',
+          )
+
+          replace_once(
+              "tools/server/server-task.cpp",
+              '''    if (!arguments.is_object() || arguments.size() != 1 ||
+        !arguments.contains("input") || !arguments.at("input").is_object()) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one 'input' transport object");
+    }
+
+    const json & input = arguments.at("input");
+    if (input.size() != 1 || !input.contains("data") || !input.at("data").is_string()) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one string 'input.data' argument");
+    }
+
+    return input.at("data").get<std::string>();
+''',
+              '''    if (!arguments.is_object() || arguments.size() != 1 ||
+        !arguments.contains("input") || !arguments.at("input").is_string()) {
+        throw std::runtime_error(
+            "Responses custom tool '" + tool_call.name + "' must produce exactly one string 'input' argument");
+    }
+
+    return arguments.at("input").get<std::string>();
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''    // Responses custom/freeform tools wrap the raw payload in input.data. The
+    // outer object forces Qwen3-Coder onto its JSON-value PEG path, while the
+    // nested string schema still guarantees that the transported value is text.
+    common_chat_tool custom_tool;
+    custom_tool.name = "apply_patch";
+    custom_tool.description = "Responses custom/freeform transport test";
+    custom_tool.parameters = R"({"type":"object","properties":{"input":{"type":"object","properties":{"data":{"type":"string"}},"required":["data"],"additionalProperties":false}},"required":["input"],"additionalProperties":false})";
+''',
+              '''    // Responses custom/freeform tools use one direct string argument. The
+    // template marker llama.cpp:xml-string-args=json forces that string through
+    // the JSON-value PEG path, so embedded XML delimiter text remains data.
+    const json custom_request = {
+        {"model", "test-model"},
+        {"input", "Apply a test patch"},
+        {"tools", json::array({
+            {
+                {"type", "custom"},
+                {"name", "apply_patch"},
+                {"description", "Responses custom/freeform transport test"},
+            },
+        })},
+    };
+    const auto converted_custom_request = server_chat_convert_responses_to_chatcmpl(custom_request);
+    if (!converted_custom_request.contains("tools") || converted_custom_request.at("tools").size() != 1) {
+        std::cerr << "Responses custom tool was not exposed as one model-facing function\n";
+        return 1;
+    }
+    const auto & custom_function = converted_custom_request.at("tools")[0].at("function");
+    const auto & custom_input_schema = custom_function.at("parameters").at("properties").at("input");
+    if (custom_function.value("name", std::string()) != "apply_patch" ||
+        custom_input_schema.value("type", std::string()) != "string") {
+        std::cerr << "Responses custom tool did not use a direct string input bridge\n";
+        return 1;
+    }
+
+    common_chat_tool custom_tool;
+    custom_tool.name = custom_function.at("name").get<std::string>();
+    custom_tool.description = custom_function.at("description").get<std::string>();
+    custom_tool.parameters = custom_function.at("parameters").dump();
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''    const std::string encoded_custom_input = json({{"data", custom_input}}).dump();
+''',
+              '''    const std::string encoded_custom_input = json(custom_input).dump();
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''    if (!parsed_custom_arguments.contains("input") ||
+        !parsed_custom_arguments.at("input").is_object() ||
+        !parsed_custom_arguments.at("input").contains("data") ||
+        !parsed_custom_arguments.at("input").at("data").is_string() ||
+        parsed_custom_arguments.at("input").at("data").get<std::string>() != custom_input) {
+        std::cerr << "Custom/freeform PEG transport corrupted literal XML delimiter content\\n";
+        return 1;
+    }
+''',
+              '''    if (!parsed_custom_arguments.contains("input") ||
+        !parsed_custom_arguments.at("input").is_string() ||
+        parsed_custom_arguments.at("input").get<std::string>() != custom_input) {
+        std::cerr << "Custom/freeform PEG transport corrupted literal XML delimiter content\\n";
+        return 1;
+    }
+
+    server_task_result_cmpl_final custom_result;
+    custom_result.oaicompat_model = "test-model";
+    custom_result.oai_resp_id = "resp_custom_test";
+    custom_result.generation_params.responses_custom_tools.insert("apply_patch");
+    custom_result.oaicompat_msg.role = "assistant";
+    custom_result.oaicompat_msg.tool_calls.push_back({
+        "apply_patch",
+        parsed_custom.tool_calls[0].arguments,
+        "custom_generated",
+    });
+    const auto custom_response = custom_result.to_json_oaicompat_resp();
+    if (!custom_response.contains("output") || custom_response.at("output").size() != 1 ||
+        custom_response.at("output")[0].value("type", std::string()) != "custom_tool_call" ||
+        custom_response.at("output")[0].value("input", std::string()) != custom_input) {
+        std::cerr << "Responses custom/freeform egress did not recover the raw input string\\n";
+        return 1;
+    }
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''    // Match the Responses ingress representation for historical custom_tool_call.
+    // Parse the rendered parameter semantically instead of assuming a particular
+    // tojson whitespace layout. A raw framing leak would introduce an actual
+    // newline before </parameter> and therefore truncate this JSON value.
+''',
+              '''    // Replay the model-facing direct string form in history. Parse the rendered
+    // parameter semantically instead of assuming a particular tojson whitespace
+    // layout. A raw framing leak would introduce an actual newline before
+    // </parameter> and therefore truncate this JSON string literal.
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''        json({{"input", {{"data", custom_input}}}}).dump(),
+''',
+              '''        json({{"input", custom_input}}).dump(),
+''',
+          )
+
+          replace_once(
+              "tests/test-qwen38-codex-template.cpp",
+              '''    if (!historical_value.is_object() || historical_value.size() != 1 ||
+        !historical_value.contains("data") || !historical_value.at("data").is_string() ||
+        historical_value.at("data").get<std::string>() != custom_input) {
+        std::cerr << "Historical custom/freeform replay corrupted the transported payload\\n";
+        return 1;
+    }
+''',
+              '''    if (!historical_value.is_string() || historical_value.get<std::string>() != custom_input) {
+        std::cerr << "Historical custom/freeform replay corrupted the transported payload\\n";
+        return 1;
+    }
+''',
+          )
+          PY
+
+      - name: Verify diff
+        shell: bash
+        run: |
+          git diff --check
+          grep -F 'must produce exactly one string '\''input'\'' argument' tools/server/server-task.cpp
+          grep -F '"type", "string"' tools/server/server-chat.cpp
+          grep -F 'Responses custom/freeform egress did not recover the raw input string' tests/test-qwen38-codex-template.cpp
+
+      - name: Commit changes and remove staging workflow
+        shell: bash
+        run: |
+          git config user.name "Codex Lab"
+          git config user.email "2657841+inf9144@users.noreply.github.com"
+          git rm .github/workflows/codex-flat-custom-tool.yml
+          git add tools/server/server-chat.cpp tools/server/server-task.cpp tests/test-qwen38-codex-template.cpp
+          git commit -m "server: flatten Responses custom tool bridge"
+          git push origin HEAD:codex-compat
