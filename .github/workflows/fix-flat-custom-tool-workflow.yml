@@ -1,0 +1,28 @@
+name: Fix flat custom tool workflow
+
+'on':
+  push:
+    branches: [codex-compat]
+    paths:
+      - ".github/workflows/fix-flat-custom-tool-workflow.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex-compat
+          fetch-depth: 0
+      - name: Fix decoder and commit
+        run: |
+          sed -i 's/base64 -d > \/tmp\/apply.py/base64 -d -i > \/tmp\/apply.py/' .github/workflows/codex-flat-custom-tool.yml
+          git config user.name "Codex Lab"
+          git config user.email "2657841+inf9144@users.noreply.github.com"
+          git rm .github/workflows/fix-flat-custom-tool-workflow.yml
+          git add .github/workflows/codex-flat-custom-tool.yml
+          git commit -m "ci: fix custom tool bridge staging decoder"
+          git push origin HEAD:codex-compat
