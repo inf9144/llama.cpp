@@ -131,22 +131,28 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
         if (custom_tool.at("name").get<std::string>() == "apply_patch") {
             // JSON-string tool arguments are grammar-constrained in their lexical encoded form.
-            // Keep arbitrary valid JSON string content in the patch body, but require the outer
-            // apply_patch framing so malformed prefixes cannot be sampled after tool selection.
+            // Keep patch line boundaries structural. Body lines may be only known apply_patch
+            // directives, @@ markers, or diff lines, so a naked *** End Patch cannot be consumed
+            // as body text and followed by more data. Encoded newlines inside per-line content
+            // are excluded so decoded control characters cannot bypass this boundary.
             input_schema["pattern"] =
-                R"(^\*\*\* Begin Patch\\n(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfnrt]|u[0-9a-fA-F]{4}))*\\n\*\*\* End Patch$)";
+                R"(^\*\*\* Begin Patch\\n(?:(?:(?:\*\*\* (?:Environment ID: |Add File: |Delete File: |Update File: |Move to: )|@@ |[ +-])(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfrt]|u(?:[1-9a-fA-F][0-9a-fA-F]{3}|0[1-9a-fA-F][0-9a-fA-F]{2}|00[1-9a-fA-F][0-9a-fA-F]|000[0-9b-fB-F])))*|@@|\*\*\* End of File)\\n)+\*\*\* End Patch(?:\\n)?$)";
 
             description +=
-                "\n\nCodex apply_patch syntax: use `*** Begin Patch`, `*** Update File: <path>`, and `*** End Patch`. "
-                "IMPORTANT: `@@` here is NOT a standard unified-diff line-range header. Never emit range headers such as `@@ -10,4 +10,5 @@`. "
-                "The form `@@ <context>` means: find the literal source line `<context>` in the target file and use that existing line as an anchor for the following change. "
-                "The anchor text must actually exist in the file, and there is no closing `@@`; write `@@ fn example()` rather than `@@ fn example() @@`. "
-                "Use bare `@@` to start another chunk when no literal anchor is needed. The first update chunk may omit `@@` entirely and begin directly with diff lines. "
-                "For a pure append to the end of an existing file, use an Update File chunk containing only `+` lines with no context and no `@@`; an add-only chunk with no old/context lines is inserted at EOF. Prefer this over copying a long final-line anchor or generating helper scripts just to preserve anchor bytes. "
-                "Every file-content line in an update hunk must start with a space for context, `+` for an added line, or `-` for a removed line. "
-                "A literal file-content line beginning with `***` must still carry its diff prefix, for example `+*** literal content` when inserting it. "
-                "Example: `*** Begin Patch\n*** Update File: src/foo.rs\n@@ fn calculate()\n     let old = 1;\n-    return old;\n+    return old + 1;\n*** End Patch`. "
-                "In that example, `fn calculate()` must be an actual line in `src/foo.rs`.";
+                "\n\nCodex apply_patch syntax: wrap every patch with `*** Begin Patch` and `*** End Patch`. "
+                "Valid file headers are `*** Add File: <path>`, `*** Delete File: <path>`, and `*** Update File: <path>`; never use `*** Create File:`. "
+                "In an update hunk, each body line starts with exactly one patch marker: a space for unchanged context, `-` for removed content, or `+` for added content. "
+                "Everything after that single marker is literal file content: `+value` adds `value`, while `+ value` adds a leading space. "
+                "For a simple replacement, prefer a plain diff hunk with surrounding context and no `@@`, for example: "
+                "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
+                "`@@ <context>` is optional and means: find the existing source line `<context>` and use it as an anchor for the following change. "
+                "The anchor line itself is not repeated in the hunk body; there is no closing `@@`. Never emit unified-diff range headers such as `@@ -10,4 +10,5 @@`. "
+                "Use bare `@@` only to start another chunk when no literal anchor is needed. "
+                "For Add File, prefix every intended file line with `+` immediately followed by its exact contents, for example: "
+                "`*** Begin Patch\n*** Add File: config/new-example.conf\n+enabled=true\n+timeout=30\n*** End Patch`. "
+                "`*** End Patch` is the patch terminator: never prefix it with `+` unless the file should literally contain a line `*** End Patch`. "
+                "A literal file-content line beginning with `***` must still carry its diff prefix, for example `+*** literal content`. "
+                "For a pure EOF append to an existing file, an Update File section containing only `+` lines with no context and no `@@` appends at EOF.";
         }
 
         out.push_back(json {

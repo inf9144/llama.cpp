@@ -461,6 +461,22 @@ int main() {
         "*** Add File: escaped.txt\n"
         "+quote: \"hello\" backslash: C:\\tmp\\x\n"
         "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Update File: literal-marker.txt\n"
+        "+*** End Patch\n"
+        "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Update File: eof.txt\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End of File\n"
+        "*** End Patch",
+        "*** Begin Patch\n"
+        "*** Environment ID: test-environment\n"
+        "*** Add File: literal-unicode-escape.txt\n"
+        "+literal \\u00e9\n"
+        "*** End Patch\n",
     };
     for (const std::string & input : valid_patch_inputs) {
         const bool peg_accepts = guarded_parser_accepts(input);
@@ -482,6 +498,9 @@ int main() {
         "*** Begin Patch\n*** End Patch",
         "*** Begin Patch\n*** Add File: a.txt\n+hello",
         "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\ntrailing",
+        "*** Begin Patch\n*** Create File: a.txt\n+hello\n*** End Patch",
+        "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n*** Update File: b.txt\n-old\n+new\n*** End Patch",
+        "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n<tool_call>\n*** End Patch",
     };
     for (const std::string & input : invalid_patch_inputs) {
         if (guarded_grammar_accepts(input)) {
@@ -489,6 +508,16 @@ int main() {
                       << json(input).dump() << "\n";
             return 1;
         }
+    }
+
+    // Exercise the lexical JSON-string layer directly. A Unicode escape that
+    // decodes to LF must not create a hidden patch-line boundary after grammar
+    // validation.
+    const std::string smuggled_newline_json =
+        R"("*** Begin Patch\n*** Add File: a.txt\n+hello\u000a*** End Patch\n*** End Patch")";
+    if (grammar_accepts(apply_patch_input_grammar, smuggled_newline_json)) {
+        std::cerr << "Responses apply_patch sampling grammar accepted an encoded newline smuggle\n";
+        return 1;
     }
 
     json generic_custom_tool_request = custom_tool_request;
@@ -533,6 +562,33 @@ int main() {
         json_wire_params.grammar.find("*** Begin Patch") == std::string::npos ||
         json_wire_params.grammar.find("*** End Patch") == std::string::npos) {
         std::cerr << "apply_patch framing constraint did not survive JSON tool-call mode\n";
+        return 1;
+    }
+
+    const std::string valid_json_patch_call =
+        "<tool_call>\n"
+        "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" +
+        json(valid_patch_inputs.front()).dump() +
+        "}}\n</tool_call>";
+    if (!grammar_accepts(json_wire_params.grammar, valid_json_patch_call)) {
+        std::cerr << "Qwen JSON sampling grammar rejected a valid apply_patch call\n";
+        return 1;
+    }
+
+    const std::string runaway_patch_input =
+        "*** Begin Patch\n"
+        "*** Add File: a.txt\n"
+        "+hello\n"
+        "*** End Patch\n"
+        "<tool_call>\n"
+        "*** End Patch";
+    const std::string runaway_json_patch_call =
+        "<tool_call>\n"
+        "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" +
+        json(runaway_patch_input).dump() +
+        "}}\n</tool_call>";
+    if (grammar_accepts(json_wire_params.grammar, runaway_json_patch_call)) {
+        std::cerr << "Qwen JSON sampling grammar accepted content after the first *** End Patch\n";
         return 1;
     }
 
@@ -588,15 +644,19 @@ int main() {
 
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
-    if (custom_tool_description.find("@@ -10,4 +10,5 @@") == std::string::npos ||
-        custom_tool_description.find("literal source line") == std::string::npos ||
-        custom_tool_description.find("there is no closing `@@`") == std::string::npos ||
-        custom_tool_description.find("@@ fn calculate()") == std::string::npos ||
-        custom_tool_description.find("must be an actual line") == std::string::npos ||
-        custom_tool_description.find("pure append") == std::string::npos ||
-        custom_tool_description.find("inserted at EOF") == std::string::npos ||
-        custom_tool_description.find("+*** literal content") == std::string::npos) {
-        std::cerr << "Responses apply_patch bridge did not expose Codex patch-format guidance\n";
+    if (custom_tool_description.find("never use `*** Create File:`") == std::string::npos ||
+        custom_tool_description.find("Everything after that single marker is literal file content") == std::string::npos ||
+        custom_tool_description.find("`+value` adds `value`") == std::string::npos ||
+        custom_tool_description.find("`+ value` adds a leading space") == std::string::npos ||
+        custom_tool_description.find("plain diff hunk with surrounding context") == std::string::npos ||
+        custom_tool_description.find("-mode=legacy\n+mode=current") == std::string::npos ||
+        custom_tool_description.find("anchor line itself is not repeated") == std::string::npos ||
+        custom_tool_description.find("@@ -10,4 +10,5 @@") == std::string::npos ||
+        custom_tool_description.find("+enabled=true\n+timeout=30") == std::string::npos ||
+        custom_tool_description.find("never prefix it with `+`") == std::string::npos ||
+        custom_tool_description.find("+*** literal content") == std::string::npos ||
+        custom_tool_description.find("pure EOF append") == std::string::npos) {
+        std::cerr << "Responses apply_patch bridge did not expose neutral Codex patch-format guidance\n";
         return 1;
     }
 
