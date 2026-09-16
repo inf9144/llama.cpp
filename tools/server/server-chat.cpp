@@ -141,10 +141,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             description +=
                 "\n\nCodex apply_patch syntax: wrap each patch with `*** Begin Patch` and `*** End Patch`. "
                 "Use `*** Add File: <path>` to create a file, `*** Delete File: <path>` to delete a file, and `*** Update File: <path>` to edit an existing file. "
-                "For Update File, prefix unchanged context lines with one space, removed lines with `-`, and added lines with `+`. "
-                "For a replacement, include unchanged context around the edited line, for example: "
+                "For Update File, each hunk line has exactly one patch marker: one space for unchanged neighboring context, `-` for existing content to remove, and `+` for new content to add. "
+                "For a replacement, the hunk MUST contain the existing content as one or more `-` lines and the replacement content as one or more `+` lines. Context lines are unchanged neighboring lines around that remove/add pair. For example: "
                 "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
-                "Everything after a patch marker is literal file content; for example, `+value` adds `value` and `+ value` adds a line beginning with one space. "
+                "After the single patch marker, the rest of each line is literal file content. "
                 "For Add File, prefix every intended file line with `+` immediately followed by its exact contents, for example: "
                 "`*** Begin Patch\n*** Add File: config/new-example.conf\n+enabled=true\n+timeout=30\n*** End Patch`. "
                 "For an intentional append at the end of an existing file, an Update File section may contain only added `+` lines. "

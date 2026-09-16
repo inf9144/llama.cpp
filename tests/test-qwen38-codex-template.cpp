@@ -647,11 +647,13 @@ int main() {
     if (custom_tool_description.find("model-facing tool-call encoding") == std::string::npos ||
         custom_tool_description.find("model-facing XML transport") != std::string::npos ||
         custom_tool_description.find("Use `*** Add File: <path>` to create a file") == std::string::npos ||
-        custom_tool_description.find("For Update File, prefix unchanged context lines with one space") == std::string::npos ||
-        custom_tool_description.find("For a replacement, include unchanged context around the edited line") == std::string::npos ||
+        custom_tool_description.find("each hunk line has exactly one patch marker") == std::string::npos ||
+        custom_tool_description.find("`-` for existing content to remove") == std::string::npos ||
+        custom_tool_description.find("the hunk MUST contain the existing content as one or more `-` lines") == std::string::npos ||
+        custom_tool_description.find("the replacement content as one or more `+` lines") == std::string::npos ||
+        custom_tool_description.find("Context lines are unchanged neighboring lines around that remove/add pair") == std::string::npos ||
         custom_tool_description.find(" environment=prod\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
-        custom_tool_description.find("Everything after a patch marker is literal file content") == std::string::npos ||
-        custom_tool_description.find("`+value` adds `value`") == std::string::npos ||
+        custom_tool_description.find("After the single patch marker, the rest of each line is literal file content") == std::string::npos ||
         custom_tool_description.find("+enabled=true\n+timeout=30") == std::string::npos ||
         custom_tool_description.find("intentional append at the end of an existing file") == std::string::npos ||
         custom_tool_description.find("+*** literal content") == std::string::npos ||
@@ -662,7 +664,7 @@ int main() {
         custom_tool_description.find("Write `@@ `") != std::string::npos ||
         custom_tool_description.find("@@ environment=prod") != std::string::npos ||
         custom_tool_description.find("@@ [server]") != std::string::npos) {
-        std::cerr << "Responses apply_patch bridge did not expose plain-context positive Codex patch-format guidance\n";
+        std::cerr << "Responses apply_patch bridge did not expose replacement-explicit positive Codex patch-format guidance\n";
         return 1;
     }
 
