@@ -1200,6 +1200,13 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     const bool json_string_args   = tmpl.source().find("llama.cpp:xml-string-args=json") != std::string::npos;
+    const std::string tool_call_format =
+        inputs.extra_context.is_object() &&
+        inputs.extra_context.contains("tool_call_format") &&
+        inputs.extra_context.at("tool_call_format").is_string()
+            ? inputs.extra_context.at("tool_call_format").get<std::string>()
+            : "auto";
+    const bool json_tool_calls = tool_call_format == "json";
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
@@ -1220,7 +1227,7 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
 
-    if (is_qwen3_coder) {
+    if (is_qwen3_coder && !json_tool_calls) {
         // Match complete <function=name> opener for Qwen3-Coder models that occasionally omit the
         // starting <tool_call>. The model may hallucinate a tool name, but it is preferable over
         // constraining on <function which may occur in valid content generation, e.g. #include <functional>
@@ -1247,6 +1254,44 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+            if (json_tool_calls) {
+                auto json_tool_choice = p.choice();
+                foreach_function(inputs.tools, [&](const json & tool) {
+                    const auto & function   = tool.at("function");
+                    const std::string name  = function.at("name");
+                    auto parameters = function.contains("parameters")
+                        ? function.at("parameters")
+                        : json::object();
+
+                    auto json_call = p.tool(
+                        p.tool_open(p.literal("{")) + p.space() +
+                        p.literal("\"name\"") + p.space() + p.literal(":") + p.space() +
+                        p.literal("\"") + p.tool_name(p.literal(name)) + p.literal("\"") +
+                        p.space() + p.literal(",") + p.space() +
+                        p.literal("\"arguments\"") + p.space() + p.literal(":") + p.space() +
+                        p.tool_args(p.schema(p.json(), "tool-" + name + "-schema", parameters)) +
+                        p.space() + p.tool_close(p.literal("}")));
+
+                    json_tool_choice |= p.rule("tool-" + name, json_call);
+                });
+
+                auto json_tool_call = p.rule(
+                    "json-tool-call",
+                    p.literal("<tool_call>\n") +
+                    json_tool_choice +
+                    p.literal("\n</tool_call>") +
+                    p.space());
+
+                const int min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+                const int max_calls = inputs.parallel_tool_calls ? -1 : 1;
+                auto tool_calls = p.trigger_rule(
+                    "tool-call-root",
+                    p.repeat(json_tool_call, min_calls, max_calls));
+
+                return generation_prompt +
+                       (reasoning << p.content(p.until("<tool_call>")) << tool_calls);
+            }
+
             auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
             auto arg_string = p.rule("xml-arg-string",
                 p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));

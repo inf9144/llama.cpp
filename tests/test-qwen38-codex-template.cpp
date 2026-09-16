@@ -502,6 +502,90 @@ int main() {
         return 1;
     }
 
+    // The Codex template can explicitly switch to JSON tool calls. The Qwen
+    // specialized parser must follow that wire format instead of continuing to
+    // expect <function>/<parameter> XML. This is especially important for shell
+    // commands containing strings that look like XML closing delimiters.
+    common_chat_tool exec_tool;
+    exec_tool.name = "exec_command";
+    exec_tool.description = "Run a shell command";
+    exec_tool.parameters =
+        R"({"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false})";
+
+    common_chat_templates_inputs json_wire_inputs;
+    json_wire_inputs.messages = { system, user };
+    json_wire_inputs.tools = { exec_tool, guarded_custom_tool };
+    json_wire_inputs.add_generation_prompt = true;
+    json_wire_inputs.enable_thinking = true;
+    json_wire_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    json_wire_inputs.parallel_tool_calls = true;
+    json_wire_inputs.chat_template_kwargs["tool_call_format"] = R"("json")";
+
+    const common_chat_params json_wire_params =
+        common_chat_templates_apply(tmpls.get(), json_wire_inputs);
+
+    if (json_wire_params.prompt.find(json_tool_instruction) == std::string::npos ||
+        json_wire_params.prompt.find(xml_tool_instruction) != std::string::npos) {
+        std::cerr << "Explicit JSON tool-call mode did not render matching Qwen instructions\n";
+        return 1;
+    }
+    if (json_wire_params.grammar.empty() ||
+        json_wire_params.grammar.find("*** Begin Patch") == std::string::npos ||
+        json_wire_params.grammar.find("*** End Patch") == std::string::npos) {
+        std::cerr << "apply_patch framing constraint did not survive JSON tool-call mode\n";
+        return 1;
+    }
+
+    common_chat_parser_params json_wire_parser_params(json_wire_params);
+    json_wire_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    json_wire_parser_params.parser.load(json_wire_params.parser);
+
+    const std::string json_exec_command =
+        "printf '%s\\n' '</parameter>' '</tool_call>'";
+    const std::string json_patch_input = valid_patch_inputs.front();
+    const std::string generated_json_tools =
+        "Using JSON tool calls.\n</think>\n\n"
+        "<tool_call>\n"
+        "{\"name\":\"exec_command\",\"arguments\":{\"cmd\":" +
+        json(json_exec_command).dump() +
+        "}}\n</tool_call>\n"
+        "<tool_call>\n"
+        "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" +
+        json(json_patch_input).dump() +
+        "}}\n</tool_call>";
+
+    const common_chat_msg parsed_json_tools =
+        common_chat_parse(generated_json_tools, false, json_wire_parser_params);
+    if (parsed_json_tools.tool_calls.size() != 2 ||
+        parsed_json_tools.tool_calls[0].name != "exec_command" ||
+        parsed_json_tools.tool_calls[1].name != "apply_patch") {
+        std::cerr << "Qwen JSON parser did not recover repeated tool-call wrappers\n";
+        return 1;
+    }
+
+    json parsed_exec_arguments;
+    json parsed_patch_arguments;
+    try {
+        parsed_exec_arguments = json::parse(parsed_json_tools.tool_calls[0].arguments);
+        parsed_patch_arguments = json::parse(parsed_json_tools.tool_calls[1].arguments);
+    } catch (const std::exception & e) {
+        std::cerr << "Qwen JSON parser produced invalid tool arguments: " << e.what() << "\n";
+        return 1;
+    }
+
+    if (!parsed_exec_arguments.contains("cmd") ||
+        !parsed_exec_arguments.at("cmd").is_string() ||
+        parsed_exec_arguments.at("cmd").get<std::string>() != json_exec_command) {
+        std::cerr << "Qwen JSON parser corrupted exec_command delimiter text\n";
+        return 1;
+    }
+    if (!parsed_patch_arguments.contains("input") ||
+        !parsed_patch_arguments.at("input").is_string() ||
+        parsed_patch_arguments.at("input").get<std::string>() != json_patch_input) {
+        std::cerr << "Qwen JSON parser corrupted apply_patch input\n";
+        return 1;
+    }
+
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
     if (custom_tool_description.find("@@ -10,4 +10,5 @@") == std::string::npos ||
