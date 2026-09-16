@@ -139,23 +139,20 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 R"(^\*\*\* Begin Patch\\n(?:(?:(?:\*\*\* (?:Environment ID: |Add File: |Delete File: |Update File: |Move to: )|@@ |[ +-])(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfrt]|u(?:[1-9a-fA-F][0-9a-fA-F]{3}|0[1-9a-fA-F][0-9a-fA-F]{2}|00[1-9a-fA-F][0-9a-fA-F]|000[0-9b-fB-F])))*|@@|\*\*\* End of File)\\n)+\*\*\* End Patch(?:\\n)?$)";
 
             description +=
-                "\n\nCodex apply_patch syntax: wrap every patch with `*** Begin Patch` and `*** End Patch`. "
-                "Valid file headers are `*** Add File: <path>`, `*** Delete File: <path>`, and `*** Update File: <path>`; never use `*** Create File:`. "
-                "An Add File patch and its resulting diff show each created file line with a leading `+`; those `+` markers describe that add operation only. Do not copy them into a later Update File operation. "
-                "In an update hunk, each body line starts with exactly one patch marker: a space for unchanged context, `-` for removed content, or `+` for added content. "
-                "Everything after that single marker is literal file content: `+value` adds `value`, while `+ value` adds a leading space. "
-                "To replace an existing line, the update MUST remove the old line with `-` and add the new line with `+`. "
-                "`+old` followed by `+new` adds two lines; it does NOT replace `old`. "
-                "For a simple replacement, prefer a plain diff hunk with surrounding context and no `@@`, for example: "
+                "\n\nCodex apply_patch syntax: wrap each patch with `*** Begin Patch` and `*** End Patch`. "
+                "Use `*** Add File: <path>` to create a file, `*** Delete File: <path>` to delete a file, and `*** Update File: <path>` to edit an existing file. "
+                "For Update File, write a diff hunk that describes the existing and desired content. Prefix unchanged surrounding lines with one space, removed lines with `-`, and added lines with `+`. "
+                "Everything after the marker is literal file content; for example, `+value` adds `value` and `+ value` adds a line beginning with one space. "
+                "For a replacement, include surrounding unchanged context and write the existing line with `-` followed by the replacement line with `+`, for example: "
                 "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
-                "`@@ <context>` is optional and means: find the existing source line `<context>` and use it as an anchor for the following change. "
-                "The anchor line itself is not repeated in the hunk body; there is no closing `@@`. Never emit unified-diff range headers such as `@@ -10,4 +10,5 @@`. "
-                "Use bare `@@` only to start another chunk when no literal anchor is needed. "
                 "For Add File, prefix every intended file line with `+` immediately followed by its exact contents, for example: "
                 "`*** Begin Patch\n*** Add File: config/new-example.conf\n+enabled=true\n+timeout=30\n*** End Patch`. "
-                "`*** End Patch` is the patch terminator: never prefix it with `+` unless the file should literally contain a line `*** End Patch`. "
-                "A literal file-content line beginning with `***` must still carry its diff prefix, for example `+*** literal content`. "
-                "An Update File section containing only `+` lines with no context and no `@@` is valid only for an intentional pure EOF append; never use a `+`-only update for a replacement or deletion.";
+                "`@@ <existing line text>` is an optional literal source-line anchor for an Update File hunk. Put the exact text of an existing line after `@@`, then write the change immediately below it. "
+                "The anchor line is identified by `@@` and is not repeated as a space-prefixed context line in the hunk body. For example, if the file contains `[server]` followed by `mode=legacy` and `retries=3`, use: "
+                "`*** Begin Patch\n*** Update File: config/example.conf\n@@ [server]\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
+                "For an intentional append at the end of an existing file, an Update File section may contain only added `+` lines. "
+                "`*** End Patch` terminates the patch. "
+                "A literal file-content line beginning with `***` still uses its diff prefix, for example `+*** literal content`.";
         }
 
         out.push_back(json {
