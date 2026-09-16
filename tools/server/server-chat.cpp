@@ -141,11 +141,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             description +=
                 "\n\nCodex apply_patch syntax: wrap each patch with `*** Begin Patch` and `*** End Patch`. "
                 "Use `*** Add File: <path>` to create a file, `*** Delete File: <path>` to delete a file, and `*** Update File: <path>` to edit an existing file. "
-                "For a focused replacement in an existing file, prefer a literal source-line anchor on an unchanged existing line immediately before the first line to edit. "
-                "Write `@@ ` followed by that line's exact text. The anchor line stays unchanged, is not repeated as a space-prefixed context line, and the hunk body starts with the following source line. "
-                "For example, if the file contains `environment=prod`, `mode=legacy`, and `retries=3`, use: "
-                "`*** Begin Patch\n*** Update File: config/example.conf\n@@ environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
-                "An Update File hunk may also use surrounding unchanged context lines. Prefix unchanged lines with one space, removed lines with `-`, and added lines with `+`, for example: "
+                "For Update File, prefix unchanged context lines with one space, removed lines with `-`, and added lines with `+`. "
+                "For a replacement, include unchanged context around the edited line, for example: "
                 "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
                 "Everything after a patch marker is literal file content; for example, `+value` adds `value` and `+ value` adds a line beginning with one space. "
                 "For Add File, prefix every intended file line with `+` immediately followed by its exact contents, for example: "
