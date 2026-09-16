@@ -647,21 +647,24 @@ int main() {
     if (custom_tool_description.find("model-facing tool-call encoding") == std::string::npos ||
         custom_tool_description.find("model-facing XML transport") != std::string::npos ||
         custom_tool_description.find("Use `*** Add File: <path>` to create a file") == std::string::npos ||
-        custom_tool_description.find("Prefix unchanged surrounding lines with one space") == std::string::npos ||
-        custom_tool_description.find("Everything after the marker is literal file content") == std::string::npos ||
+        custom_tool_description.find("prefer a literal source-line anchor on an unchanged existing line immediately before the first line to edit") == std::string::npos ||
+        custom_tool_description.find("Write `@@ ` followed by that line's exact text") == std::string::npos ||
+        custom_tool_description.find("The anchor line stays unchanged") == std::string::npos ||
+        custom_tool_description.find("hunk body starts with the following source line") == std::string::npos ||
+        custom_tool_description.find("@@ environment=prod\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
+        custom_tool_description.find("may also use surrounding unchanged context lines") == std::string::npos ||
+        custom_tool_description.find(" environment=prod\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
+        custom_tool_description.find("Everything after a patch marker is literal file content") == std::string::npos ||
         custom_tool_description.find("`+value` adds `value`") == std::string::npos ||
-        custom_tool_description.find("include surrounding unchanged context") == std::string::npos ||
-        custom_tool_description.find("-mode=legacy\n+mode=current") == std::string::npos ||
         custom_tool_description.find("+enabled=true\n+timeout=30") == std::string::npos ||
-        custom_tool_description.find("`@@ <existing line text>` is an optional literal source-line anchor") == std::string::npos ||
-        custom_tool_description.find("exact text of an existing line after `@@`") == std::string::npos ||
-        custom_tool_description.find("@@ [server]\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
         custom_tool_description.find("intentional append at the end of an existing file") == std::string::npos ||
         custom_tool_description.find("+*** literal content") == std::string::npos ||
         custom_tool_description.find("`+old` followed by `+new`") != std::string::npos ||
         custom_tool_description.find("@@ -10,4 +10,5 @@") != std::string::npos ||
-        custom_tool_description.find("`@@ <context>`") != std::string::npos) {
-        std::cerr << "Responses apply_patch bridge did not expose positive Codex patch-format guidance\n";
+        custom_tool_description.find("`@@ <context>`") != std::string::npos ||
+        custom_tool_description.find("`@@ <existing line text>`") != std::string::npos ||
+        custom_tool_description.find("@@ [server]") != std::string::npos) {
+        std::cerr << "Responses apply_patch bridge did not expose anchor-first positive Codex patch-format guidance\n";
         return 1;
     }
 
