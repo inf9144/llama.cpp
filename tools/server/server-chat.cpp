@@ -122,7 +122,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         if (!description.empty()) {
             description += "\n\n";
         }
-        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. Do not wrap it in another object. String arguments are JSON-encoded by the model-facing XML transport so embedded newlines, quotes, backslashes, and XML-like delimiter text remain data. The Responses API receives the decoded raw string.";
+        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. Do not wrap it in another object. String arguments are JSON-escaped in the model-facing tool-call encoding so embedded newlines, quotes, backslashes, and delimiter-like text remain data. The Responses API receives the decoded raw string.";
 
         json input_schema = {
             {"type", "string"},
@@ -141,8 +141,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             description +=
                 "\n\nCodex apply_patch syntax: wrap every patch with `*** Begin Patch` and `*** End Patch`. "
                 "Valid file headers are `*** Add File: <path>`, `*** Delete File: <path>`, and `*** Update File: <path>`; never use `*** Create File:`. "
+                "An Add File patch and its resulting diff show each created file line with a leading `+`; those `+` markers describe that add operation only. Do not copy them into a later Update File operation. "
                 "In an update hunk, each body line starts with exactly one patch marker: a space for unchanged context, `-` for removed content, or `+` for added content. "
                 "Everything after that single marker is literal file content: `+value` adds `value`, while `+ value` adds a leading space. "
+                "To replace an existing line, the update MUST remove the old line with `-` and add the new line with `+`. "
+                "`+old` followed by `+new` adds two lines; it does NOT replace `old`. "
                 "For a simple replacement, prefer a plain diff hunk with surrounding context and no `@@`, for example: "
                 "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
                 "`@@ <context>` is optional and means: find the existing source line `<context>` and use it as an anchor for the following change. "
@@ -152,7 +155,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 "`*** Begin Patch\n*** Add File: config/new-example.conf\n+enabled=true\n+timeout=30\n*** End Patch`. "
                 "`*** End Patch` is the patch terminator: never prefix it with `+` unless the file should literally contain a line `*** End Patch`. "
                 "A literal file-content line beginning with `***` must still carry its diff prefix, for example `+*** literal content`. "
-                "For a pure EOF append to an existing file, an Update File section containing only `+` lines with no context and no `@@` appends at EOF.";
+                "An Update File section containing only `+` lines with no context and no `@@` is valid only for an intentional pure EOF append; never use a `+`-only update for a replacement or deletion.";
         }
 
         out.push_back(json {

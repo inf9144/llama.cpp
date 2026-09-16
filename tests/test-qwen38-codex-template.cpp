@@ -644,10 +644,15 @@ int main() {
 
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
-    if (custom_tool_description.find("never use `*** Create File:`") == std::string::npos ||
+    if (custom_tool_description.find("model-facing tool-call encoding") == std::string::npos ||
+        custom_tool_description.find("model-facing XML transport") != std::string::npos ||
+        custom_tool_description.find("never use `*** Create File:`") == std::string::npos ||
+        custom_tool_description.find("Do not copy them into a later Update File operation") == std::string::npos ||
         custom_tool_description.find("Everything after that single marker is literal file content") == std::string::npos ||
         custom_tool_description.find("`+value` adds `value`") == std::string::npos ||
         custom_tool_description.find("`+ value` adds a leading space") == std::string::npos ||
+        custom_tool_description.find("MUST remove the old line with `-` and add the new line with `+`") == std::string::npos ||
+        custom_tool_description.find("adds two lines; it does NOT replace") == std::string::npos ||
         custom_tool_description.find("plain diff hunk with surrounding context") == std::string::npos ||
         custom_tool_description.find("-mode=legacy\n+mode=current") == std::string::npos ||
         custom_tool_description.find("anchor line itself is not repeated") == std::string::npos ||
@@ -655,7 +660,7 @@ int main() {
         custom_tool_description.find("+enabled=true\n+timeout=30") == std::string::npos ||
         custom_tool_description.find("never prefix it with `+`") == std::string::npos ||
         custom_tool_description.find("+*** literal content") == std::string::npos ||
-        custom_tool_description.find("pure EOF append") == std::string::npos) {
+        custom_tool_description.find("never use a `+`-only update for a replacement or deletion") == std::string::npos) {
         std::cerr << "Responses apply_patch bridge did not expose neutral Codex patch-format guidance\n";
         return 1;
     }
