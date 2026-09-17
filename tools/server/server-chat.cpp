@@ -94,6 +94,37 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         if (!function_tool.contains("name") || !function_tool.at("name").is_string()) {
             throw std::invalid_argument("Responses function tool requires string 'name'");
         }
+
+        if (function_tool.at("name").get<std::string>() == "exec_command") {
+            std::string description = json_value(function_tool, "description", std::string());
+            if (!description.empty()) {
+                description += "\n\n";
+            }
+            description +=
+                "Put the complete shell command, including all arguments, paths, redirections, and quoting, in `cmd`. "
+                "Use `write_stdin` only when exec_command returned a live numeric `session_id`.";
+            function_tool["description"] = description;
+
+            if (function_tool.contains("parameters") &&
+                function_tool.at("parameters").is_object() &&
+                function_tool.at("parameters").contains("properties") &&
+                function_tool.at("parameters").at("properties").is_object() &&
+                function_tool.at("parameters").at("properties").contains("cmd") &&
+                function_tool.at("parameters").at("properties").at("cmd").is_object()) {
+                json & cmd_schema = function_tool["parameters"]["properties"]["cmd"];
+                std::string cmd_description = json_value(cmd_schema, "description", std::string());
+                if (!cmd_description.empty()) {
+                    cmd_description += " ";
+                }
+                cmd_description +=
+                    "This must be the complete shell command as a single string, including all command arguments, "
+                    "paths, redirections, and quoting. For example, to read a file use `cat /tmp/example.txt`, "
+                    "not just `cat`. `cat` or `/bin/cat` without a file operand reads from stdin. "
+                    "`workdir` only selects the working directory and is not passed as a command argument.";
+                cmd_schema["description"] = cmd_description;
+            }
+        }
+
         function_tool.erase("type");
         function_tool.erase("defer_loading");
         function_tool.erase("output_schema");
