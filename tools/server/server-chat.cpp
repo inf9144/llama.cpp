@@ -95,54 +95,74 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             throw std::invalid_argument("Responses function tool requires string 'name'");
         }
 
-        if (function_tool.at("name").get<std::string>() == "exec_command") {
+        auto append_property_description = [&](const std::string & property_name, const std::string & extra) {
+            if (!function_tool.contains("parameters") ||
+                !function_tool.at("parameters").is_object() ||
+                !function_tool.at("parameters").contains("properties") ||
+                !function_tool.at("parameters").at("properties").is_object() ||
+                !function_tool.at("parameters").at("properties").contains(property_name) ||
+                !function_tool.at("parameters").at("properties").at(property_name).is_object()) {
+                return;
+            }
+
+            json & property_schema = function_tool["parameters"]["properties"][property_name];
+            std::string property_description = json_value(property_schema, "description", std::string());
+            if (!property_description.empty()) {
+                property_description += " ";
+            }
+            property_description += extra;
+            property_schema["description"] = property_description;
+        };
+
+        const std::string function_name = function_tool.at("name").get<std::string>();
+
+        if (function_name == "exec_command") {
             std::string description = json_value(function_tool, "description", std::string());
             if (!description.empty()) {
                 description += "\n\n";
             }
             description +=
-                "Put the complete shell command, including all arguments, paths, redirections, and quoting, in `cmd`. "
-                "Use `write_stdin` only when exec_command returned a live numeric `session_id`. "
-                "For ordinary commands, omit `justification`. Only set `justification` when also setting "
-                "`sandbox_permissions` to `require_escalated`.";
+                "Execute one shell command. `cmd` is the complete shell command line as one string. "
+                "There is no separate `args`, `argv`, or `arguments` field. "
+                "For ordinary commands, leave permission-related fields unset.";
             function_tool["description"] = description;
 
-            if (function_tool.contains("parameters") &&
-                function_tool.at("parameters").is_object() &&
-                function_tool.at("parameters").contains("properties") &&
-                function_tool.at("parameters").at("properties").is_object() &&
-                function_tool.at("parameters").at("properties").contains("cmd") &&
-                function_tool.at("parameters").at("properties").at("cmd").is_object()) {
-                json & cmd_schema = function_tool["parameters"]["properties"]["cmd"];
-                std::string cmd_description = json_value(cmd_schema, "description", std::string());
-                if (!cmd_description.empty()) {
-                    cmd_description += " ";
-                }
-                cmd_description +=
-                    "This must be the complete shell command as a single string, including all command arguments, "
-                    "paths, redirections, and quoting. For example, to read a file use `cat /tmp/example.txt`, "
-                    "not just `cat`. `cat` or `/bin/cat` without a file operand reads from stdin. "
-                    "`workdir` only selects the working directory and is not passed as a command argument.";
-                cmd_schema["description"] = cmd_description;
-            }
+            append_property_description(
+                "cmd",
+                "Complete shell command line as one string. Before emitting the tool call, make sure `cmd` itself "
+                "contains the executable and every argument, operand, path, redirection, and quote needed by the "
+                "intended shell command. There is no separate `args`, `argv`, or `arguments` field. "
+                "For example, to read `/tmp/example.txt`, use `cat /tmp/example.txt`.");
 
-            if (function_tool.contains("parameters") &&
-                function_tool.at("parameters").is_object() &&
-                function_tool.at("parameters").contains("properties") &&
-                function_tool.at("parameters").at("properties").is_object() &&
-                function_tool.at("parameters").at("properties").contains("justification") &&
-                function_tool.at("parameters").at("properties").at("justification").is_object()) {
-                json & justification_schema = function_tool["parameters"]["properties"]["justification"];
-                std::string justification_description =
-                    json_value(justification_schema, "description", std::string());
-                if (!justification_description.empty()) {
-                    justification_description += " ";
-                }
-                justification_description +=
-                    "Only set this field when `sandbox_permissions` is explicitly set to `require_escalated`. "
-                    "Otherwise omit `justification`.";
-                justification_schema["description"] = justification_description;
+            append_property_description(
+                "workdir",
+                "Selects the command's working directory only. All file operands and command arguments belong "
+                "inside `cmd`.");
+
+            append_property_description(
+                "sandbox_permissions",
+                "Leave unset for ordinary commands. Set `require_escalated` only when unsandboxed execution is "
+                "independently required and escalation is permitted by the current approval policy. When the "
+                "approval policy is `Never`, leave this field unset.");
+
+            append_property_description(
+                "justification",
+                "Approval explanation for an escalation that is already independently required and permitted. "
+                "Leave unset for ordinary commands.");
+        } else if (function_name == "write_stdin") {
+            std::string description = json_value(function_tool, "description", std::string());
+            if (!description.empty()) {
+                description += "\n\n";
             }
+            description +=
+                "Interact with an existing exec_command session that is still running. `session_id` must be the "
+                "live numeric session ID actually returned by that exec_command call.";
+            function_tool["description"] = description;
+
+            append_property_description(
+                "session_id",
+                "Live numeric session ID actually returned by the exec_command call whose running session you want "
+                "to interact with.");
         }
 
         function_tool.erase("type");
