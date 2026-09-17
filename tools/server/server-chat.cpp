@@ -102,7 +102,9 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             }
             description +=
                 "Put the complete shell command, including all arguments, paths, redirections, and quoting, in `cmd`. "
-                "Use `write_stdin` only when exec_command returned a live numeric `session_id`.";
+                "Use `write_stdin` only when exec_command returned a live numeric `session_id`. "
+                "For ordinary commands, omit `justification`. Only set `justification` when also setting "
+                "`sandbox_permissions` to `require_escalated`.";
             function_tool["description"] = description;
 
             if (function_tool.contains("parameters") &&
@@ -122,6 +124,24 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     "not just `cat`. `cat` or `/bin/cat` without a file operand reads from stdin. "
                     "`workdir` only selects the working directory and is not passed as a command argument.";
                 cmd_schema["description"] = cmd_description;
+            }
+
+            if (function_tool.contains("parameters") &&
+                function_tool.at("parameters").is_object() &&
+                function_tool.at("parameters").contains("properties") &&
+                function_tool.at("parameters").at("properties").is_object() &&
+                function_tool.at("parameters").at("properties").contains("justification") &&
+                function_tool.at("parameters").at("properties").at("justification").is_object()) {
+                json & justification_schema = function_tool["parameters"]["properties"]["justification"];
+                std::string justification_description =
+                    json_value(justification_schema, "description", std::string());
+                if (!justification_description.empty()) {
+                    justification_description += " ";
+                }
+                justification_description +=
+                    "Only set this field when `sandbox_permissions` is explicitly set to `require_escalated`. "
+                    "Otherwise omit `justification`.";
+                justification_schema["description"] = justification_description;
             }
         }
 
