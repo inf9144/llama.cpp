@@ -131,7 +131,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             append_property_description(
                 "justification",
                 "Leave unset for ordinary commands or when approval policy is `Never`. "
-                "Approval explanation for an escalation to the user.");
+                "`justification` requires an explicit `sandbox_permissions`!");
 
             append_property_description(
                 "cmd",
