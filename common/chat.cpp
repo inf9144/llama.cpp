@@ -1249,7 +1249,7 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
         inputs.extra_context.contains("tool_call_format") &&
         inputs.extra_context.at("tool_call_format").is_string()
             ? inputs.extra_context.at("tool_call_format").get<std::string>()
-            : "auto";
+            : "json";
     const bool json_tool_calls = tool_call_format == "json";
 
     if (inputs.has_continuation()) {
