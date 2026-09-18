@@ -72,6 +72,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
+    chatcmpl_body.erase("access_programs");
     std::vector<json> chatcmpl_messages;
     bool is_compaction_request = false;
     bool responses_tool_search = false;
@@ -129,8 +130,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
             append_property_description(
                 "cmd",
-                "Complete shell command including arguments as one json string. "
-                "For example, to read `/tmp/example.txt`, use `cat /tmp/example.txt`.");
+                "Complete shell command including arguments as one json string.");
 
         } else if (function_name == "write_stdin") {
             append_property_description(
