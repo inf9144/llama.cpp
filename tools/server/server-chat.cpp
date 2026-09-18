@@ -118,51 +118,19 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
         if (function_name == "exec_command") {
             std::string description = json_value(function_tool, "description", std::string());
-            if (!description.empty()) {
-                description += "\n\n";
+
+            if (description == "Runs a command in a PTY, returning output or a session ID for ongoing interaction.") {
+                function_tool["description"] = "Runs a command, returning output or a session ID for ongoing interaction.";
             }
-            description +=
-                "Execute one shell command. `cmd` is the complete shell command line as one string. "
-                "There is no separate `args`, `argv`, or `arguments` field. "
-                "For ordinary commands, leave permission-related fields unset.";
-            function_tool["description"] = description;
 
             append_property_description(
                 "cmd",
-                "Complete shell command line as one string. Before emitting the tool call, make sure `cmd` itself "
-                "contains the executable and every argument, operand, path, redirection, and quote needed by the "
-                "intended shell command. There is no separate `args`, `argv`, or `arguments` field. "
+                "Complete shell command line as one string. "
                 "For example, to read `/tmp/example.txt`, use `cat /tmp/example.txt`.");
-
-            append_property_description(
-                "workdir",
-                "Selects the command's working directory only. All file operands and command arguments belong "
-                "inside `cmd`.");
-
-            append_property_description(
-                "sandbox_permissions",
-                "Leave unset for ordinary commands. Set `require_escalated` only when unsandboxed execution is "
-                "independently required and escalation is permitted by the current approval policy. When the "
-                "approval policy is `Never`, leave this field unset.");
-
-            append_property_description(
-                "justification",
-                "Approval explanation for an escalation that is already independently required and permitted. "
-                "Leave unset for ordinary commands.");
         } else if (function_name == "write_stdin") {
-            std::string description = json_value(function_tool, "description", std::string());
-            if (!description.empty()) {
-                description += "\n\n";
-            }
-            description +=
-                "Interact with an existing exec_command session that is still running. `session_id` must be the "
-                "live numeric session ID actually returned by that exec_command call.";
-            function_tool["description"] = description;
-
             append_property_description(
                 "session_id",
-                "Live numeric session ID actually returned by the exec_command call whose running session you want "
-                "to interact with.");
+                "Live numeric session ID returned by the exec_command session to interact with.");
         }
 
         function_tool.erase("type");
@@ -185,22 +153,32 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         if (!custom_tool.contains("name") || !custom_tool.at("name").is_string()) {
             throw std::invalid_argument("Responses custom tool requires string 'name'");
         }
+
+        const std::string custom_name = custom_tool.at("name").get<std::string>();
         const std::string flat_name = server_chat_encode_namespace_tool_name(
-            tool_namespace, custom_tool.at("name").get<std::string>());
+            tool_namespace, custom_name);
+
         register_tool_kind(flat_name, true);
 
-        std::string description = json_value(custom_tool, "description", std::string());
-        if (!description.empty()) {
-            description += "\n\n";
-        }
-        description += "This is a Responses custom/freeform tool. When invoking it through this model interface, place the complete raw freeform payload in the single `input` string argument. Do not wrap it in another object. String arguments are JSON-escaped in the model-facing tool-call encoding so embedded newlines, quotes, backslashes, and delimiter-like text remain data. The Responses API receives the decoded raw string.";
+        std::string description;
 
         json input_schema = {
             {"type", "string"},
-            {"description", "Complete raw freeform input passed verbatim to the custom tool."},
+            {"description", "Complete custom-tool input."},
         };
 
-        if (custom_tool.at("name").get<std::string>() == "apply_patch") {
+        if (custom_name == "apply_patch") {
+            // Codex exposes apply_patch as a Responses custom/freeform tool, but this
+            // bridge presents it to the model as a function with one string argument.
+            // Describe only the model-facing interface here so the model does not see
+            // contradictory freeform-vs-function instructions.
+            description =
+                "The `apply_patch` tool edits files. "
+                "Pass the complete patch text as the single `input` string argument.";
+
+            input_schema["description"] =
+                "Complete apply_patch patch text.";
+
             // JSON-string tool arguments are grammar-constrained in their lexical encoded form.
             // Keep patch line boundaries structural. Body lines may be only known apply_patch
             // directives, @@ markers, or diff lines, so a naked *** End Patch cannot be consumed
@@ -210,17 +188,67 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 R"(^\*\*\* Begin Patch\\n(?:(?:(?:\*\*\* (?:Environment ID: |Add File: |Delete File: |Update File: |Move to: )|@@ |[ +-])(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfrt]|u(?:[1-9a-fA-F][0-9a-fA-F]{3}|0[1-9a-fA-F][0-9a-fA-F]{2}|00[1-9a-fA-F][0-9a-fA-F]|000[0-9b-fB-F])))*|@@|\*\*\* End of File)\\n)+\*\*\* End Patch(?:\\n)?$)";
 
             description +=
-                "\n\nCodex apply_patch syntax: wrap each patch with `*** Begin Patch` and `*** End Patch`. "
-                "Use `*** Add File: <path>` to create a file, `*** Delete File: <path>` to delete a file, and `*** Update File: <path>` to edit an existing file. "
-                "For Update File, each hunk line has exactly one patch marker: one space for unchanged neighboring context, `-` for existing content to remove, and `+` for new content to add. "
-                "For a replacement, the hunk MUST contain the existing content as one or more `-` lines and the replacement content as one or more `+` lines. Context lines are unchanged neighboring lines around that remove/add pair. For example: "
-                "`*** Begin Patch\n*** Update File: config/example.conf\n environment=prod\n-mode=legacy\n+mode=current\n retries=3\n*** End Patch`. "
-                "After the single patch marker, the rest of each line is literal file content. "
-                "For Add File, prefix every intended file line with `+` immediately followed by its exact contents, for example: "
-                "`*** Begin Patch\n*** Add File: config/new-example.conf\n+enabled=true\n+timeout=30\n*** End Patch`. "
-                "For an intentional append at the end of an existing file, an Update File section may contain only added `+` lines. "
-                "`*** End Patch` terminates the patch. "
-                "A literal file-content line beginning with `***` still uses its diff prefix, for example `+*** literal content`.";
+                "\n\nCodex apply_patch syntax: "
+                "Start each patch with `*** Begin Patch` and end it with `*** End Patch`. "
+                "A patch may contain one or more file operations. "
+
+                "When an environment ID is explicitly available, "
+                "`*** Environment ID: <id>` may appear immediately after `*** Begin Patch`. "
+
+                "Use `*** Add File: <path>` to create a file, "
+                "`*** Delete File: <path>` to delete a file, and "
+                "`*** Update File: <path>` to edit an existing file. "
+
+                "For Add File, prefix every intended file line with `+` immediately followed by "
+                "its exact contents, for example: "
+                "`*** Begin Patch\n"
+                "*** Add File: config/new-example.conf\n"
+                "+enabled=true\n"
+                "+timeout=30\n"
+                "*** End Patch`. "
+
+                "Delete File has no file-content body. "
+
+                "For Update File, an optional `*** Move to: <path>` line may appear immediately "
+                "after the `*** Update File: <path>` line, before any hunk content, to move or "
+                "rename the file. "
+
+                "Update hunks may use `@@` or `@@ <context>` markers to identify a location. "
+                "Each hunk content line has exactly one patch marker: one space for unchanged "
+                "neighboring context, `-` for existing content to remove, and `+` for new content "
+                "to add. "
+                "An unchanged blank file line is represented by a hunk line containing exactly "
+                "the single space context marker. "
+
+                "For a replacement, include the existing content as one or more `-` lines and "
+                "the replacement content as one or more `+` lines. Context lines are unchanged "
+                "neighboring lines around that remove/add pair. For example: "
+                "`*** Begin Patch\n"
+                "*** Update File: config/example.conf\n"
+                " environment=prod\n"
+                "-mode=legacy\n"
+                "+mode=current\n"
+                " retries=3\n"
+                "*** End Patch`. "
+
+                "`*** End of File` may appear after the final change line of an Update File "
+                "section to anchor that change at the end of the file. "
+
+                "After the single patch marker on a content line, the rest of that line is "
+                "literal file content. A literal file-content line beginning with `***` still "
+                "uses its diff prefix, for example `+*** literal content`.";
+        } else {
+            // Other Responses custom tools keep their original description, but are
+            // exposed to the model through this bridge as a function with one string
+            // argument.
+            description = json_value(custom_tool, "description", std::string());
+
+            if (!description.empty()) {
+                description += "\n\n";
+            }
+
+            description +=
+                "Pass the complete custom-tool payload as the single `input` string argument.";
         }
 
         out.push_back(json {
