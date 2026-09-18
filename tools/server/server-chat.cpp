@@ -123,6 +123,15 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 function_tool["description"] = "Runs a command, returning output or a session ID for ongoing interaction.";
             }
 
+            append_property_description(
+                "sandbox_permissions",
+                "Leave unset for ordinary commands or when approval policy is `Never`. "
+                "Set `require_escalated` only when unsandboxed execution is required and escalation is permitted.");
+
+            append_property_description(
+                "justification",
+                "Leave unset for ordinary commands or when approval policy is `Never`. "
+                "Approval explanation for an escalation to the user.");
 
             append_property_description(
                 "cmd",
