@@ -126,7 +126,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             append_property_description(
                 "sandbox_permissions",
                 "Leave unset for ordinary commands or when approval policy is `Never`. "
-                "Set `require_escalated` only when unsandboxed execution is required and escalation is permitted.");
+                "Set `require_escalated` only when unsandboxed execution and escalation is required. "
+                "Escalation requires an explicit `justification`!");
 
             append_property_description(
                 "justification",
