@@ -123,14 +123,16 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 function_tool["description"] = "Runs a command, returning output or a session ID for ongoing interaction.";
             }
 
+
             append_property_description(
                 "cmd",
-                "Complete shell command line as one string. "
+                "Complete shell command including arguments as one json string. "
                 "For example, to read `/tmp/example.txt`, use `cat /tmp/example.txt`.");
+
         } else if (function_name == "write_stdin") {
             append_property_description(
                 "session_id",
-                "Live numeric session ID returned by the exec_command session to interact with.");
+                "Session ID returned by exec_command to interact with.");
         }
 
         function_tool.erase("type");
@@ -168,16 +170,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         };
 
         if (custom_name == "apply_patch") {
-            // Codex exposes apply_patch as a Responses custom/freeform tool, but this
-            // bridge presents it to the model as a function with one string argument.
-            // Describe only the model-facing interface here so the model does not see
-            // contradictory freeform-vs-function instructions.
-            description =
-                "The `apply_patch` tool edits files. "
-                "Pass the complete patch text as the single `input` string argument.";
-
             input_schema["description"] =
-                "Complete apply_patch patch text.";
+                "Patch text";
 
             // JSON-string tool arguments are grammar-constrained in their lexical encoded form.
             // Keep patch line boundaries structural. Body lines may be only known apply_patch
@@ -187,56 +181,46 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             input_schema["pattern"] =
                 R"(^\*\*\* Begin Patch\\n(?:(?:(?:\*\*\* (?:Environment ID: |Add File: |Delete File: |Update File: |Move to: )|@@ |[ +-])(?:[^"\\\x7F\x00-\x1F]|\\(?:["\\bfrt]|u(?:[1-9a-fA-F][0-9a-fA-F]{3}|0[1-9a-fA-F][0-9a-fA-F]{2}|00[1-9a-fA-F][0-9a-fA-F]|000[0-9b-fB-F])))*|@@|\*\*\* End of File)\\n)+\*\*\* End Patch(?:\\n)?$)";
 
-            description +=
-                "\n\nCodex apply_patch syntax: "
-                "Start each patch with `*** Begin Patch` and end it with `*** End Patch`. "
-                "A patch may contain one or more file operations. "
-
-                "When an environment ID is explicitly available, "
-                "`*** Environment ID: <id>` may appear immediately after `*** Begin Patch`. "
-
-                "Use `*** Add File: <path>` to create a file, "
-                "`*** Delete File: <path>` to delete a file, and "
-                "`*** Update File: <path>` to edit an existing file. "
-
-                "For Add File, prefix every intended file line with `+` immediately followed by "
-                "its exact contents, for example: "
-                "`*** Begin Patch\n"
-                "*** Add File: config/new-example.conf\n"
-                "+enabled=true\n"
-                "+timeout=30\n"
-                "*** End Patch`. "
-
-                "Delete File has no file-content body. "
-
-                "For Update File, an optional `*** Move to: <path>` line may appear immediately "
-                "after the `*** Update File: <path>` line, before any hunk content, to move or "
-                "rename the file. "
-
-                "Update hunks may use `@@` or `@@ <context>` markers to identify a location. "
-                "Each hunk content line has exactly one patch marker: one space for unchanged "
-                "neighboring context, `-` for existing content to remove, and `+` for new content "
-                "to add. "
-                "An unchanged blank file line is represented by a hunk line containing exactly "
-                "the single space context marker. "
-
-                "For a replacement, include the existing content as one or more `-` lines and "
-                "the replacement content as one or more `+` lines. Context lines are unchanged "
-                "neighboring lines around that remove/add pair. For example: "
+            // Codex exposes apply_patch as a Responses custom/freeform tool, but this
+            // bridge presents it to the model as a function with one string argument.
+            // Describe only the model-facing interface here so the model does not see
+            // contradictory freeform-vs-function instructions.
+            description =
+                "The `apply_patch` tool edits files. Pass the patch as json `input` string argument.\n"
+                "\n"
+                "Structure:\n"
+                "*** Begin Patch\n"
+                "<one or more file operations>\n"
+                "*** End Patch\n"
+                "\n"
+                "Operations:\n"
+                "`*** Add File: <path>`: create a file; every following line is a `+` line with the file content.\n"
+                "`*** Delete File: <path>`: delete a file; no content lines.\n"
+                "`*** Update File: <path>`: edit a file with hunks; an optional `*** Move to: <newpath>` line directly after it renames the file.\n"
+                "`*** Environment ID: <id>`: only when an environment ID is explicitly available; first line after `*** Begin Patch`.\n"
+                "\n"
+                "Hunk lines (Update File): each line starts with exactly one marker:\n"
+                "` ` (a single space) for an unchanged context line, `-` for a line to remove, `+` for a line to add.\n"
+                "A blank context line is a line containing exactly one space.\n"
+                "Context lines must match the file exactly. If a patch fails, read the file and retry with its exact current content.\n"
+                "`*** End of File` may follow the final hunk to anchor it at the end of the file.\n"
+                "After the marker, the rest of the line is literal file content, including lines starting with `***` (e.g. `+*** literal content`).\n"
+                "\n"
+                "Example (replace one line):\n"
                 "`*** Begin Patch\n"
                 "*** Update File: config/example.conf\n"
                 " environment=prod\n"
                 "-mode=legacy\n"
                 "+mode=current\n"
                 " retries=3\n"
-                "*** End Patch`. "
-
-                "`*** End of File` may appear after the final change line of an Update File "
-                "section to anchor that change at the end of the file. "
-
-                "After the single patch marker on a content line, the rest of that line is "
-                "literal file content. A literal file-content line beginning with `***` still "
-                "uses its diff prefix, for example `+*** literal content`.";
+                "*** End Patch`\n"
+                "\n"
+                "Example (create a file):\n"
+                "`*** Begin Patch\n"
+                "*** Add File: config/new-example.conf\n"
+                "+enabled=true\n"
+                "+timeout=30\n"
+                "*** End Patch`";
         } else {
             // Other Responses custom tools keep their original description, but are
             // exposed to the model through this bridge as a function with one string
@@ -248,7 +232,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             }
 
             description +=
-                "Pass the complete custom-tool payload as the single `input` string argument.";
+                "Pass the payload as json `input` string argument.";
         }
 
         out.push_back(json {
