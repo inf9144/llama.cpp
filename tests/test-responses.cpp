@@ -1,3 +1,4 @@
+#include "server-chat.h"
 #include "server-task.h"
 
 #include <iostream>
@@ -47,6 +48,44 @@ static std::string streamed_message_phase(const json & events) {
 }
 
 int main() {
+    // Codex sends automatic thread-title requests as Responses structured
+    // output. The bridge must preserve the schema for llama.cpp's grammar.
+    const json title_schema = {
+        {"type", "object"},
+        {"properties", {
+            {"title", {
+                {"type", "string"},
+                {"minLength", 1},
+                {"maxLength", 36},
+            }},
+        }},
+        {"required", json::array({"title"})},
+        {"additionalProperties", false},
+    };
+
+    const json title_request = {
+        {"input", "Generate a short thread title"},
+        {"text", {
+            {"format", {
+                {"type", "json_schema"},
+                {"name", "codex_output_schema"},
+                {"strict", true},
+                {"schema", title_schema},
+            }},
+        }},
+    };
+
+    const json converted_title =
+        server_chat_convert_responses_to_chatcmpl(title_request);
+
+    if (!converted_title.contains("json_schema") ||
+        converted_title.at("json_schema") != title_schema ||
+        converted_title.contains("text") ||
+        converted_title.at("messages").at(0).at("role") != "user") {
+        std::cerr << "Responses thread-title JSON schema was not converted correctly\n";
+        return 1;
+    }
+
     auto final_result = make_response_result("Done.");
     if (response_message_phase(final_result.to_json_oaicompat_resp()) != "final_answer") {
         std::cerr << "Responses message without tool calls was not final_answer\n";

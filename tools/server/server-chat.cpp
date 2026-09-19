@@ -195,6 +195,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             description =
                 "The `apply_patch` tool edits files. Pass the patch as json `input` string argument.\n"
                 "\n"
+                "Relative paths are resolved against the session working directory, not against any directory a shell command may have cd'd into. Prefer absolute paths when operating in subdirectories.\n"
+                "\n"
                 "Structure:\n"
                 "*** Begin Patch\n"
                 "<one or more file operations>\n"
@@ -759,6 +761,31 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             chatcmpl_body["reasoning_effort"] = reasoning.at("effort");
         }
         chatcmpl_body.erase("reasoning");
+    }
+
+    // Responses structured output (text.format) -> llama.cpp JSON schema.
+    // Codex uses this for hidden requests such as automatic thread titles.
+    if (response_body.contains("text")) {
+        const json & text = response_body.at("text");
+
+        if (text.is_object() &&
+            text.contains("format") &&
+            text.at("format").is_object()) {
+
+            const json & format = text.at("format");
+
+            if (json_value(format, "type", std::string()) == "json_schema") {
+                if (!format.contains("schema") || !format.at("schema").is_object()) {
+                    throw std::invalid_argument(
+                        "Responses text.format json_schema requires an object 'schema'");
+                }
+
+                chatcmpl_body["json_schema"] = format.at("schema");
+            }
+        }
+
+        // Responses text controls are not Chat Completions request fields.
+        chatcmpl_body.erase("text");
     }
 
     return chatcmpl_body;
