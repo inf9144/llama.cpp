@@ -1,5 +1,6 @@
-{%- set template_version = "qwen3.8-codex-safe-v1" %}
+{%- set template_version = "qwen-based-codex-safe-v1" %}
 {#- llama.cpp:xml-string-args=json -#}
+{#- llama.cpp:tool-call-format=json -#}
 {#- -------------------------------------------------------------------------
     Whitespace contract: every tag opener in this file carries a leading minus,
     so it strips the whitespace and newlines that precede it. All emitted text
@@ -16,12 +17,12 @@
     Configuration
     ------------------------------------------------------------------------- -#}
 {%- set _requested_tool_format =
-    tool_call_format if tool_call_format is defined else 'auto'
+    tool_call_format if tool_call_format is defined else 'json'
 %}
 {%- if _requested_tool_format not in ('auto', 'xml', 'json') %}
     {{- raise_exception(
         'Unexpected tool_call_format ' ~ _requested_tool_format ~
-        '. Supported values are auto (default), xml, and json.'
+        '. Supported values are auto, xml, and json (default).'
     ) }}
 {%- endif %}
 {%- set add_vision_id = add_vision_id if add_vision_id is defined else false %}
@@ -127,11 +128,12 @@
 {%- if auto_disable_thinking_with_tools and _has_tools %}
     {%- set _thinking_enabled = false %}
 {%- endif %}
-{#- Normalize common client effort names onto four Qwen-facing modes.
-    `medium` intentionally adds no steering and is the model-native baseline.
-    `high` is a focused, bounded reasoning mode for agentic workloads. -#}
+{#- Normalize common client effort names onto four model-facing modes.
+    `medium` is intentionally neutral: Model keeps its native thinking
+    behavior without extra depth steering. Higher modes should increase care,
+    not encourage open-ended deliberation. -#}
 {%- set _effort_raw =
-    reasoning_effort if reasoning_effort is defined else 'high'
+    reasoning_effort if reasoning_effort is defined else 'medium'
 %}
 {%- if _effort_raw == 'none' or _effort_raw == 'off' %}
     {%- set _reasoning_effort = 'none' %}
@@ -156,18 +158,24 @@
 {%- if _thinking_enabled %}
     {%- if _reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions =
-            'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.'
+            'Reasoning effort is set to xhigh. Use deep but convergent reasoning. Thoroughly verify important assumptions, edge cases, and risky or irreversible decisions, and compare plausible alternatives when they could materially change the result. Do not repeatedly reconsider settled points. For tool-driven work, prefer observation over speculation: call the appropriate tool as soon as it can resolve an uncertainty more reliably than further analysis. After each tool result, update the plan from the new evidence. Conclude reasoning once the remaining uncertainty no longer justifies more analysis.'
         %}
     {%- elif _reasoning_effort == 'high' %}
         {%- set reasoning_instructions =
-            'Reasoning effort is set to high. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.'
+            'Reasoning effort is set to high. Use adaptive, focused reasoning: spend substantial effort only where complexity, uncertainty, or consequences require it. Follow the critical reasoning path and verify important assumptions, but do not explore low-value alternatives, repeat settled points, or keep analyzing after the next useful action is clear. For tool-driven work, call the appropriate tool promptly instead of simulating or over-analyzing what the tool can determine directly. After tool results, update the plan from the evidence. Conclude reasoning once sufficient evidence supports the next action or a correct answer.'
         %}
     {%- elif _reasoning_effort == 'low' %}
         {%- set reasoning_instructions =
-            'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.'
+            'Reasoning effort is set to low. Keep thinking brief and focused. Resolve uncertainty with the appropriate tool when available, move directly to the next useful action, and conclude without unnecessary elaboration.'
         %}
     {%- endif %}
 {%- endif %}
+{#- Agentic convergence/terseness steering. This is deliberately independent of
+    reasoning effort: medium remains model-native in depth, while all modes are
+    discouraged from narrating or re-solving work that tools can settle directly. -#}
+{%- set agentic_instructions =
+    'Work directly and economically. Do not restate the task, narrate obvious steps, or repeat conclusions that are already established. Prefer evidence from the available tools over speculation. When a tool-driven task has a clear next useful action, perform that action promptly rather than continuing analysis. After a tool result, incorporate the new evidence and continue from it instead of re-deriving settled reasoning. Stop when the task is complete or when further work would not materially improve the result.'
+%}
 {#- -------------------------------------------------------------------------
     Content rendering
     ------------------------------------------------------------------------- -#}
@@ -298,6 +306,7 @@
     {%- if reasoning_instructions %}
         {{- reasoning_instructions ~ '\n\n' }}
     {%- endif %}
+    {{- agentic_instructions ~ '\n\n' }}
     {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
     {%- for tool in tools %}
         {{- '\n' }}
@@ -305,9 +314,9 @@
     {%- endfor %}
     {{- '\n</tools>' }}
     {%- if _tool_format == 'json' %}
-        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n{"name": "example_function_name", "arguments": {"example_parameter_1": "value_1", "example_parameter_2": "This is the value for the second parameter"}}\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: a single JSON object with "name" and "arguments" keys must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n{"name": "example_function_name", "arguments": {"example_parameter_1": "value_1", "example_parameter_2": "This is the value for the second parameter"}}\n</tool_call>\n\n<IMPORTANT>\n- Function calls MUST follow the specified format: a single JSON object with "name" and "arguments" keys must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- Once a function call is the next useful action, emit it promptly after reasoning instead of continuing to analyze alternatives that the function can resolve\n- Avoid assistant-visible preambles before a function call unless they materially help the user; NEVER add natural-language text after the function call\n</IMPORTANT>' }}
     {%- else %}
-        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"value_1"\n</parameter>\n<parameter=example_parameter_2>\n"This is the value for the second parameter\\nthat can span\\nmultiple lines"\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- String parameter values MUST use JSON string syntax inside the XML parameter, including surrounding double quotes and JSON escapes such as \\n for embedded newlines\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+        {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\n"value_1"\n</parameter>\n<parameter=example_parameter_2>\n"This is the value for the second parameter\\nthat can span\\nmultiple lines"\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- String parameter values MUST use JSON string syntax inside the XML parameter, including surrounding double quotes and JSON escapes such as \\n for embedded newlines\n- Once a function call is the next useful action, emit it promptly after reasoning instead of continuing to analyze alternatives that the function can resolve\n- Avoid assistant-visible preambles before a function call unless they materially help the user; NEVER add natural-language text after the function call\n</IMPORTANT>' }}
     {%- endif %}
     {%- if _system_content %}
         {{- '\n\n' ~ _system_content }}
@@ -602,6 +611,7 @@
         ~ 'The previous conversation may be discarded after this response, so preserve everything needed to continue without reading it again. '
         ~ 'Do not call or use tools. You may reason internally, but the final answer must contain only the handoff summary. '
         ~ 'Preserve the user\'s current goal and requested outcome; current progress and important decisions; important facts learned from files, tool outputs, research, or tests; exact technical details, measurements, paths, commands, identifiers, configuration values, errors, and observed behavior when relevant; constraints, assumptions, accepted limitations, and user preferences; unresolved problems, hypotheses, rejected approaches, and clear next steps. '
+        ~ 'For deferred tools that remain relevant to unfinished work, preserve enough identifying information, such as the tool name or capability, to allow the tool to be rediscovered after compaction. Do not assume that dynamically exposed tool schemas remain available after compaction. '
         ~ 'Do not merely repeat the last assistant message, last question, or proposed next action. Summarize the whole relevant history. '
         ~ 'For a non-trivial technical conversation, produce a structured multi-section Markdown handoff with enough detail to resume the work accurately. Begin immediately with the handoff summary.'
     ) %}

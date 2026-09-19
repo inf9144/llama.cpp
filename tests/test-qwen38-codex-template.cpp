@@ -82,7 +82,7 @@ static bool grammar_accepts(const std::string & grammar_str, const std::string &
 }
 
 int main() {
-    const std::string template_path = "models/templates/llama-cpp-qwen3.8-codex.jinja";
+    const std::string template_path = "models/templates/llama-cpp-qwen-based-codex.jinja";
     auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, read_file(template_path)));
 
     const auto caps = common_chat_templates_get_caps(tmpls.get());
@@ -177,16 +177,16 @@ int main() {
         return 1;
     }
 
-    const std::string xml_tool_instruction = "<function=example_function_name>\n<parameter=example_parameter_1>";
-    if (before_prefix.find(xml_tool_instruction) == std::string::npos) {
-        std::cerr << "Codex template did not default to the Qwen3-Coder XML tool-call format\n";
+    const std::string json_tool_instruction =
+        "{\"name\": \"example_function_name\", \"arguments\":";
+    if (before_prefix.find(json_tool_instruction) == std::string::npos) {
+        std::cerr << "Codex template did not default to the JSON tool-call format\n";
         return 1;
     }
 
-    const std::string json_tool_instruction =
-        "{\"name\": \"example_function_name\", \"arguments\":";
-    if (before_prefix.find(json_tool_instruction) != std::string::npos) {
-        std::cerr << "Codex template mixed JSON tool-call instructions with the XML Qwen3-Coder parser\n";
+    const std::string xml_tool_instruction = "<function=example_function_name>\n<parameter=example_parameter_1>";
+    if (before_prefix.find(xml_tool_instruction) != std::string::npos) {
+        std::cerr << "Codex template mixed XML tool-call instructions with the JSON parser\n";
         return 1;
     }
 
@@ -198,9 +198,9 @@ int main() {
     }
 
     const std::string rendered_command =
-        "<parameter=command>\n" + encoded_shell_command + "\n</parameter>";
+        "{\"name\": \"shell_command\", \"arguments\": {\"command\": " + encoded_shell_command;
     if (before.prompt.find(rendered_command) == std::string::npos) {
-        std::cerr << "Historical string arguments were not JSON-escaped inside XML parameters\n";
+        std::cerr << "Historical string arguments were not JSON-escaped in the JSON tool-call rendering\n";
         return 1;
     }
 
@@ -214,10 +214,8 @@ int main() {
     const std::string generated =
         "Inspecting the requested file.\n</think>\n\n"
         "<tool_call>\n"
-        "<function=shell_command>\n"
-        "<parameter=command>\n" + encoded_shell_command + "\n</parameter>\n"
-        "</function>\n"
-        "</tool_call>";
+        "{\"name\":\"shell_command\",\"arguments\":{\"command\":" + encoded_shell_command +
+        "}}\n</tool_call>";
 
     const common_chat_msg parsed = common_chat_parse(generated, false, parser_params);
     if (parsed.tool_calls.size() != 1 || parsed.tool_calls[0].name != "shell_command") {
@@ -279,10 +277,8 @@ int main() {
     const std::string generated_custom =
         "Preparing a literal delimiter patch.\n</think>\n\n"
         "<tool_call>\n"
-        "<function=apply_patch>\n"
-        "<parameter=input>\n" + encoded_custom_input + "\n</parameter>\n"
-        "</function>\n"
-        "</tool_call>";
+        "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" + encoded_custom_input +
+        "}}\n</tool_call>";
 
     const common_chat_msg parsed_custom = common_chat_parse(generated_custom, false, custom_parser_params);
     if (parsed_custom.tool_calls.size() != 1 || parsed_custom.tool_calls[0].name != "apply_patch") {
@@ -328,25 +324,25 @@ int main() {
         assistant_done,
     };
     const common_chat_params historical_custom = common_chat_templates_apply(tmpls.get(), custom_inputs);
-    const std::string historical_marker = "<function=apply_patch>\n<parameter=input>\n";
+    const std::string historical_marker = "{\"name\": \"apply_patch\", \"arguments\": {\"input\": ";
     const size_t historical_begin = historical_custom.prompt.find(historical_marker);
     if (historical_begin == std::string::npos) {
-        std::cerr << "Historical custom/freeform replay did not render an input parameter\n";
+        std::cerr << "Historical custom/freeform replay did not render an input argument\n";
         return 1;
     }
     const size_t historical_value_begin = historical_begin + historical_marker.size();
-    const size_t historical_end = historical_custom.prompt.find("\n</parameter>", historical_value_begin);
+    const size_t historical_end = historical_custom.prompt.find("\"}}\n</tool_call>", historical_value_begin);
     if (historical_end == std::string::npos) {
-        std::cerr << "Historical custom/freeform replay did not close the input parameter\n";
+        std::cerr << "Historical custom/freeform replay did not close the input argument\n";
         return 1;
     }
 
     json historical_value;
     try {
         historical_value = json::parse(
-            historical_custom.prompt.substr(historical_value_begin, historical_end - historical_value_begin));
+            historical_custom.prompt.substr(historical_value_begin, historical_end - historical_value_begin + 1));
     } catch (const std::exception & e) {
-        std::cerr << "Historical custom/freeform input leaked through XML framing: " << e.what() << "\n";
+        std::cerr << "Historical custom/freeform input leaked through JSON framing: " << e.what() << "\n";
         return 1;
     }
 
@@ -424,10 +420,8 @@ int main() {
         const std::string generated_guarded =
             "Testing guarded patch framing.\n</think>\n\n"
             "<tool_call>\n"
-            "<function=apply_patch>\n"
-            "<parameter=input>\n" + json(input).dump() + "\n</parameter>\n"
-            "</function>\n"
-            "</tool_call>";
+            "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" + json(input).dump() +
+            "}}\n</tool_call>";
 
         try {
             const common_chat_msg parsed_guarded =
@@ -644,19 +638,26 @@ int main() {
 
     const std::string custom_tool_description =
         converted_custom_tool.at("tools")[0]["function"].value("description", std::string());
-    if (custom_tool_description.find("model-facing tool-call encoding") == std::string::npos ||
-        custom_tool_description.find("model-facing XML transport") != std::string::npos ||
-        custom_tool_description.find("Use `*** Add File: <path>` to create a file") == std::string::npos ||
-        custom_tool_description.find("each hunk line has exactly one patch marker") == std::string::npos ||
-        custom_tool_description.find("`-` for existing content to remove") == std::string::npos ||
-        custom_tool_description.find("the hunk MUST contain the existing content as one or more `-` lines") == std::string::npos ||
-        custom_tool_description.find("the replacement content as one or more `+` lines") == std::string::npos ||
-        custom_tool_description.find("Context lines are unchanged neighboring lines around that remove/add pair") == std::string::npos ||
+    if (custom_tool_description.find("The `apply_patch` tool edits files. Pass the patch as json `input` string argument.") == std::string::npos ||
+        custom_tool_description.find("Structure:") == std::string::npos ||
+        custom_tool_description.find("*** Begin Patch\n<one or more file operations>\n*** End Patch") == std::string::npos ||
+        custom_tool_description.find("`*** Add File: <path>`: create a file; every following line is a `+` line with the file content.") == std::string::npos ||
+        custom_tool_description.find("`*** Delete File: <path>`: delete a file; no content lines.") == std::string::npos ||
+        custom_tool_description.find("`*** Update File: <path>`: edit a file with hunks; an optional `*** Move to: <newpath>` line directly after it renames the file.") == std::string::npos ||
+        custom_tool_description.find("`*** Environment ID: <id>`: only when an environment ID is explicitly available; first line after `*** Begin Patch`.") == std::string::npos ||
+        custom_tool_description.find("Hunk lines (Update File): each line starts with exactly one marker:") == std::string::npos ||
+        custom_tool_description.find("` ` (a single space) for an unchanged context line, `-` for a line to remove, `+` for a line to add.") == std::string::npos ||
+        custom_tool_description.find("A blank context line is a line containing exactly one space.") == std::string::npos ||
+        custom_tool_description.find("Context lines must match the file exactly. If a patch fails, read the file and retry with its exact current content.") == std::string::npos ||
+        custom_tool_description.find("`*** End of File` may follow the final hunk to anchor it at the end of the file.") == std::string::npos ||
+        custom_tool_description.find("After the marker, the rest of the line is literal file content, including lines starting with `***` (e.g. `+*** literal content`).") == std::string::npos ||
+        custom_tool_description.find("Example (replace one line):") == std::string::npos ||
         custom_tool_description.find(" environment=prod\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
-        custom_tool_description.find("After the single patch marker, the rest of each line is literal file content") == std::string::npos ||
+        custom_tool_description.find("Example (create a file):") == std::string::npos ||
         custom_tool_description.find("+enabled=true\n+timeout=30") == std::string::npos ||
-        custom_tool_description.find("intentional append at the end of an existing file") == std::string::npos ||
-        custom_tool_description.find("+*** literal content") == std::string::npos ||
+        custom_tool_description.find("model-facing XML transport") != std::string::npos ||
+        custom_tool_description.find("the hunk MUST contain the existing content") != std::string::npos ||
+        custom_tool_description.find("intentional append at the end of an existing file") != std::string::npos ||
         custom_tool_description.find("`+old` followed by `+new`") != std::string::npos ||
         custom_tool_description.find("@@ -10,4 +10,5 @@") != std::string::npos ||
         custom_tool_description.find("`@@ <context>`") != std::string::npos ||
@@ -664,7 +665,7 @@ int main() {
         custom_tool_description.find("Write `@@ `") != std::string::npos ||
         custom_tool_description.find("@@ environment=prod") != std::string::npos ||
         custom_tool_description.find("@@ [server]") != std::string::npos) {
-        std::cerr << "Responses apply_patch bridge did not expose replacement-explicit positive Codex patch-format guidance\n";
+        std::cerr << "Responses apply_patch bridge did not expose the Codex patch-format guidance\n";
         return 1;
     }
 
@@ -901,9 +902,7 @@ int main() {
     const std::string generated_deferred =
         "Using the discovered calendar tool.\n</think>\n\n"
         "<tool_call>\n"
-        "<function=mcp__calendar.create_event>\n"
-        "<parameter=title>\n\"Lunch\"\n</parameter>\n"
-        "</function>\n"
+        "{\"name\":\"mcp__calendar.create_event\",\"arguments\":{\"title\":\"Lunch\"}}\n"
         "</tool_call>";
     const auto parsed_deferred = common_chat_parse(generated_deferred, false, deferred_parser);
     if (parsed_deferred.tool_calls.size() != 1 ||
@@ -986,15 +985,15 @@ int main() {
         return 1;
     }
 
-    // Qwen3.8 reasoning-effort compatibility. Medium is the model-native
-    // unsteered baseline; high is the bounded anti-overthinking mode used by
-    // default for this Codex-oriented template.
+    // Qwen-based Codex reasoning-effort compatibility. Medium is the model-native
+    // unsteered baseline and the template default; higher modes steer toward
+    // focused, convergent reasoning for agentic workloads.
     const std::string low_reasoning_instruction =
-        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+        "Reasoning effort is set to low. Keep thinking brief and focused. Resolve uncertainty with the appropriate tool when available, move directly to the next useful action, and conclude without unnecessary elaboration.";
     const std::string high_reasoning_instruction =
-        "Reasoning effort is set to high. Think through the task carefully and verify the key points needed for a correct answer. Stay focused, avoid exploring low-value alternatives or repeating settled points, and conclude once the important uncertainties are resolved.";
+        "Reasoning effort is set to high. Use adaptive, focused reasoning: spend substantial effort only where complexity, uncertainty, or consequences require it. Follow the critical reasoning path and verify important assumptions, but do not explore low-value alternatives, repeat settled points, or keep analyzing after the next useful action is clear. For tool-driven work, call the appropriate tool promptly instead of simulating or over-analyzing what the tool can determine directly. After tool results, update the plan from the evidence. Conclude reasoning once sufficient evidence supports the next action or a correct answer.";
     const std::string xhigh_reasoning_instruction =
-        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+        "Reasoning effort is set to xhigh. Use deep but convergent reasoning. Thoroughly verify important assumptions, edge cases, and risky or irreversible decisions, and compare plausible alternatives when they could materially change the result. Do not repeatedly reconsider settled points. For tool-driven work, prefer observation over speculation: call the appropriate tool as soon as it can resolve an uncertainty more reliably than further analysis. After each tool result, update the plan from the new evidence. Conclude reasoning once the remaining uncertainty no longer justifies more analysis.";
 
     auto render_reasoning = [&](const std::vector<common_chat_msg> & messages,
                                 const std::string & effort,
@@ -1014,10 +1013,8 @@ int main() {
 
     const std::vector<common_chat_msg> simple_reasoning_messages = { system, user };
     const auto default_reasoning = render_reasoning(simple_reasoning_messages, "", true, true);
-    if (default_reasoning.prompt.find(high_reasoning_instruction) == std::string::npos ||
-        default_reasoning.prompt.find(low_reasoning_instruction) != std::string::npos ||
-        default_reasoning.prompt.find(xhigh_reasoning_instruction) != std::string::npos) {
-        std::cerr << "Qwen3.8 default reasoning effort was not the focused high mode\n";
+    if (default_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+        std::cerr << "Qwen-based Codex default reasoning effort was not the unsteered medium mode\n";
         return 1;
     }
     if (!ends_with(default_reasoning.prompt, "<|im_start|>assistant\n<think>\n")) {

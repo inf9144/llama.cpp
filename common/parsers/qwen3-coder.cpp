@@ -85,12 +85,16 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     const bool json_string_args   = tmpl.source().find("llama.cpp:xml-string-args=json") != std::string::npos;
+    // Tool-call wire format: explicit extra_context wins, then the template's
+    // own declaration (llama.cpp:tool-call-format=json), then the XML default.
     const std::string tool_call_format =
         inputs.extra_context.is_object() &&
         inputs.extra_context.contains("tool_call_format") &&
         inputs.extra_context.at("tool_call_format").is_string()
             ? inputs.extra_context.at("tool_call_format").get<std::string>()
-            : "json";
+            : tmpl.source().find("llama.cpp:tool-call-format=json") != std::string::npos
+                ? "json"
+                : "auto";
     const bool json_tool_calls = tool_call_format == "json";
 
     if (inputs.has_continuation()) {
