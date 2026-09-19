@@ -650,6 +650,9 @@ int main() {
         custom_tool_description.find("A blank context line is a line containing exactly one space.") == std::string::npos ||
         custom_tool_description.find("Context lines must match the file exactly. If a patch fails, read the file and retry with its exact current content.") == std::string::npos ||
         custom_tool_description.find("`*** End of File` may follow the final hunk to anchor it at the end of the file.") == std::string::npos ||
+        custom_tool_description.find("`@@` starts a new hunk within the same file, so non-contiguous changes can be made in one operation.") == std::string::npos ||
+        custom_tool_description.find("`@@ <context>` anchors the hunk: the file must contain a line matching `<context>`, and the hunk lines are matched somewhere after it, with other lines allowed in between.") == std::string::npos ||
+        custom_tool_description.find("A plain context line (leading space) instead requires the whole hunk to match contiguously.") == std::string::npos ||
         custom_tool_description.find("After the marker, the rest of the line is literal file content, including lines starting with `***` (e.g. `+*** literal content`).") == std::string::npos ||
         custom_tool_description.find("Example (replace one line):") == std::string::npos ||
         custom_tool_description.find(" environment=prod\n-mode=legacy\n+mode=current\n retries=3") == std::string::npos ||
@@ -660,7 +663,6 @@ int main() {
         custom_tool_description.find("intentional append at the end of an existing file") != std::string::npos ||
         custom_tool_description.find("`+old` followed by `+new`") != std::string::npos ||
         custom_tool_description.find("@@ -10,4 +10,5 @@") != std::string::npos ||
-        custom_tool_description.find("`@@ <context>`") != std::string::npos ||
         custom_tool_description.find("`@@ <existing line text>`") != std::string::npos ||
         custom_tool_description.find("Write `@@ `") != std::string::npos ||
         custom_tool_description.find("@@ environment=prod") != std::string::npos ||
