@@ -28,24 +28,33 @@ json server_task_build_response_function_call(const common_chat_tool_call & tool
     std::string tool_namespace;
     std::string tool_name;
 
-    // The Codex tool router rejects a `justification` field unless the call also
-    // requests unsandboxed execution, but the model occasionally emits it for plain
-    // sandboxed commands. Normalize it away here so the client never sees the
-    // rejected combination. This is a no-op for any client that validates correctly.
+    if (server_chat_decode_namespace_tool_name(tool_call.name, tool_namespace, tool_name)) {
+        // namespaced tool
+    } else {
+        tool_name = tool_call.name;
+    }
+
+    // The Codex tool router rejects a `justification` field on exec_command unless
+    // the call also requests unsandboxed execution, but the model occasionally emits
+    // it for plain sandboxed commands. Normalize it away here so the client never
+    // sees the rejected combination. This is a no-op for any client that validates
+    // correctly, and only applies to the exec_command tool itself.
     std::string arguments = tool_call.arguments;
-    try {
-        json args = json::parse(arguments);
-        if (args.is_object() && args.contains("justification")) {
-            const bool escalated = args.contains("sandbox_permissions") &&
-                args.at("sandbox_permissions").is_string() &&
-                args.at("sandbox_permissions").get<std::string>() == "require_escalated";
-            if (!escalated) {
-                args.erase("justification");
-                arguments = args.dump();
+    if (tool_name == "exec_command" && tool_namespace.empty()) {
+        try {
+            json args = json::parse(arguments);
+            if (args.is_object() && args.contains("justification")) {
+                const bool escalated = args.contains("sandbox_permissions") &&
+                    args.at("sandbox_permissions").is_string() &&
+                    args.at("sandbox_permissions").get<std::string>() == "require_escalated";
+                if (!escalated) {
+                    args.erase("justification");
+                    arguments = args.dump();
+                }
             }
+        } catch (const std::exception &) {
+            // Non-JSON arguments are passed through untouched.
         }
-    } catch (const std::exception &) {
-        // Non-JSON arguments are passed through untouched.
     }
 
     json output_item = {
@@ -56,7 +65,7 @@ json server_task_build_response_function_call(const common_chat_tool_call & tool
         {"call_id",   "call_" + tool_call.id},
     };
 
-    if (server_chat_decode_namespace_tool_name(tool_call.name, tool_namespace, tool_name)) {
+    if (!tool_namespace.empty()) {
         output_item["name"] = tool_name;
         output_item["namespace"] = tool_namespace;
     } else {

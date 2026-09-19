@@ -86,9 +86,10 @@ int main() {
         return 1;
     }
 
-    // The Codex tool router rejects `justification` unless the call also requests
-    // unsandboxed execution. The Responses egress must normalize that combination
-    // away before the client sees the function_call item.
+    // The Codex tool router rejects `justification` on exec_command unless the call
+    // also requests unsandboxed execution. The Responses egress must normalize that
+    // combination away before the client sees the function_call item, and only for
+    // the exec_command tool itself.
     auto build_function_call = [](const std::string & name, const std::string & arguments) {
         common_chat_tool_call tool_call;
         tool_call.name      = name;
@@ -98,31 +99,40 @@ int main() {
     };
 
     const json stray_justification = build_function_call(
-        "shell",
+        "exec_command",
         "{\"command\":\"cat /tmp/x\",\"justification\":\"read the file\"}");
     if (!stray_justification.at("arguments").is_string() ||
         json::parse(stray_justification.at("arguments")).contains("justification")) {
-        std::cerr << "Responses egress did not drop a stray justification field\n";
+        std::cerr << "Responses egress did not drop a stray exec_command justification\n";
         return 1;
     }
 
     const json escalated_justification = build_function_call(
-        "shell",
+        "exec_command",
         "{\"command\":\"rm -rf /tmp/x\",\"justification\":\"delete the file\",\"sandbox_permissions\":\"require_escalated\"}");
     if (!json::parse(escalated_justification.at("arguments")).contains("justification")) {
         std::cerr << "Responses egress dropped a justification that belongs to an escalated call\n";
         return 1;
     }
 
-    const json plain_arguments = build_function_call("shell", "{\"command\":\"ls\"}");
+    const json plain_arguments = build_function_call("exec_command", "{\"command\":\"ls\"}");
     if (plain_arguments.at("arguments") != "{\"command\":\"ls\"}") {
         std::cerr << "Responses egress modified arguments without a justification field\n";
         return 1;
     }
 
-    const json non_json_arguments = build_function_call("shell", "not-json");
+    const json non_json_arguments = build_function_call("exec_command", "not-json");
     if (non_json_arguments.at("arguments") != "not-json") {
         std::cerr << "Responses egress corrupted non-JSON arguments\n";
+        return 1;
+    }
+
+    // Other tools must pass through untouched, even with the same field combination.
+    const json other_tool_justification = build_function_call(
+        "apply_patch",
+        "{\"input\":\"*** Begin Patch\",\"justification\":\"edit the file\"}");
+    if (!json::parse(other_tool_justification.at("arguments")).contains("justification")) {
+        std::cerr << "Responses egress normalized a justification on a non-exec_command tool\n";
         return 1;
     }
 
