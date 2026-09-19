@@ -24,15 +24,35 @@ static json server_task_build_response_compaction(const std::string & summary) {
     };
 }
 
-static json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
+json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status) {
     std::string tool_namespace;
     std::string tool_name;
+
+    // The Codex tool router rejects a `justification` field unless the call also
+    // requests unsandboxed execution, but the model occasionally emits it for plain
+    // sandboxed commands. Normalize it away here so the client never sees the
+    // rejected combination. This is a no-op for any client that validates correctly.
+    std::string arguments = tool_call.arguments;
+    try {
+        json args = json::parse(arguments);
+        if (args.is_object() && args.contains("justification")) {
+            const bool escalated = args.contains("sandbox_permissions") &&
+                args.at("sandbox_permissions").is_string() &&
+                args.at("sandbox_permissions").get<std::string>() == "require_escalated";
+            if (!escalated) {
+                args.erase("justification");
+                arguments = args.dump();
+            }
+        }
+    } catch (const std::exception &) {
+        // Non-JSON arguments are passed through untouched.
+    }
 
     json output_item = {
         {"id",        "fc_" + tool_call.id},
         {"type",      "function_call"},
         {"status",    status},
-        {"arguments", tool_call.arguments},
+        {"arguments", arguments},
         {"call_id",   "call_" + tool_call.id},
     };
 

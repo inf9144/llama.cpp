@@ -12,6 +12,10 @@
 #include "server-common.h"
 
 
+// Builds a Responses function_call output item. Exposed for unit testing the
+// argument normalization (e.g. dropping a stray `justification` field).
+json server_task_build_response_function_call(const common_chat_tool_call & tool_call, const std::string & status);
+
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,

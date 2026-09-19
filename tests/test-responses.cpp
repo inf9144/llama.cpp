@@ -86,6 +86,46 @@ int main() {
         return 1;
     }
 
+    // The Codex tool router rejects `justification` unless the call also requests
+    // unsandboxed execution. The Responses egress must normalize that combination
+    // away before the client sees the function_call item.
+    auto build_function_call = [](const std::string & name, const std::string & arguments) {
+        common_chat_tool_call tool_call;
+        tool_call.name      = name;
+        tool_call.arguments = arguments;
+        tool_call.id        = "test";
+        return server_task_build_response_function_call(tool_call, "completed");
+    };
+
+    const json stray_justification = build_function_call(
+        "shell",
+        "{\"command\":\"cat /tmp/x\",\"justification\":\"read the file\"}");
+    if (!stray_justification.at("arguments").is_string() ||
+        json::parse(stray_justification.at("arguments")).contains("justification")) {
+        std::cerr << "Responses egress did not drop a stray justification field\n";
+        return 1;
+    }
+
+    const json escalated_justification = build_function_call(
+        "shell",
+        "{\"command\":\"rm -rf /tmp/x\",\"justification\":\"delete the file\",\"sandbox_permissions\":\"require_escalated\"}");
+    if (!json::parse(escalated_justification.at("arguments")).contains("justification")) {
+        std::cerr << "Responses egress dropped a justification that belongs to an escalated call\n";
+        return 1;
+    }
+
+    const json plain_arguments = build_function_call("shell", "{\"command\":\"ls\"}");
+    if (plain_arguments.at("arguments") != "{\"command\":\"ls\"}") {
+        std::cerr << "Responses egress modified arguments without a justification field\n";
+        return 1;
+    }
+
+    const json non_json_arguments = build_function_call("shell", "not-json");
+    if (non_json_arguments.at("arguments") != "not-json") {
+        std::cerr << "Responses egress corrupted non-JSON arguments\n";
+        return 1;
+    }
+
     auto final_result = make_response_result("Done.");
     if (response_message_phase(final_result.to_json_oaicompat_resp()) != "final_answer") {
         std::cerr << "Responses message without tool calls was not final_answer\n";
