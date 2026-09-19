@@ -73,6 +73,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     chatcmpl_body.erase("access_programs");
+
+    //Qwen has problems generating those
+    chatcmpl_body["parallel_tool_calls"] = false;
+
     std::vector<json> chatcmpl_messages;
     bool is_compaction_request = false;
     bool responses_tool_search = false;
