@@ -212,6 +212,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 "` ` (a single space) for an unchanged context line, `-` for a line to remove, `+` for a line to add.\n"
                 "A blank context line is a line containing exactly one space.\n"
                 "Context lines must match the file exactly. If a patch fails, read the file and retry with its exact current content.\n"
+                "`@@` starts a new hunk within the same file, so non-contiguous changes can be made in one operation.\n"
                 "`*** End of File` may follow the final hunk to anchor it at the end of the file.\n"
                 "After the marker, the rest of the line is literal file content, including lines starting with `***` (e.g. `+*** literal content`).\n"
                 "\n"
