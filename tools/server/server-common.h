@@ -471,6 +471,13 @@ struct server_metrics {
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
 
+    // SSD prompt cache stats
+    uint64_t n_ssd_hits      = 0; // SSD entries restored into a slot
+    uint64_t n_ssd_misses    = 0; // SSD lookups that found no usable entry
+    uint64_t n_ssd_evictions = 0; // SSD entries evicted by the size limit
+    uint64_t ssd_size        = 0; // SSD cache total size in bytes
+    uint64_t ssd_n_entries   = 0; // SSD cache number of entries
+
     uint64_t n_tokens_max = 0;
 
     uint64_t n_decode     = 0;

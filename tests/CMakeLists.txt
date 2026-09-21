@@ -150,6 +150,9 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
+llama_build_and_test(test-prompt-cache-ssd.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-prompt-cache-ssd.cpp)
+target_include_directories(test-prompt-cache-ssd PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+target_link_libraries(test-prompt-cache-ssd PRIVATE server-context mtmd)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

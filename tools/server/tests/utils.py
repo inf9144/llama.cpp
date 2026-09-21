@@ -114,6 +114,8 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     no_cache_idle_slots: bool = False
+    cache_ssd_dir: str | None = None
+    cache_ssd_size: int | None = None
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
@@ -280,6 +282,10 @@ class ServerProcess:
             server_args.extend(["--cache-ram", self.cache_ram])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
+        if self.cache_ssd_dir is not None:
+            server_args.extend(["--cache-ssd-dir", self.cache_ssd_dir])
+        if self.cache_ssd_size is not None:
+            server_args.extend(["--cache-ssd-size", self.cache_ssd_size])
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:

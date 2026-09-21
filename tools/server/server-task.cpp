@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-prompt-cache-ssd.h"
 
 #include <sstream>
 
@@ -1786,6 +1787,19 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
         },
+        {
+            "prompt_cache_ssd_hits_total",
+            "SSD prompt cache: entries restored into a slot",
+            (double) metrics.n_ssd_hits
+        }, {
+            "prompt_cache_ssd_misses_total",
+            "SSD prompt cache: lookups with no usable entry",
+            (double) metrics.n_ssd_misses
+        }, {
+            "prompt_cache_ssd_evictions_total",
+            "SSD prompt cache: entries evicted by the size limit",
+            (double) metrics.n_ssd_evictions
+        },
     };
 
     const std::vector<metric_item> gauges = {
@@ -1809,6 +1823,15 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        },
+        {
+            "prompt_cache_ssd_size_bytes",
+            "SSD prompt cache: total size in bytes",
+            (double) metrics.ssd_size
+        }, {
+            "prompt_cache_ssd_entries",
+            "SSD prompt cache: number of entries",
+            (double) metrics.ssd_n_entries
         },
     };
 
@@ -1964,6 +1987,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            if (ssd) {
+                ssd->save(*it);
+            }
             it = states.erase(it);
         } else {
             ++it;
@@ -1976,6 +2002,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            if (ssd) {
+                ssd->save(states.front());
+            }
             states.pop_front();
         }
     }
@@ -2014,80 +2043,134 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    // baseline: the prompt already in the active slot
+    const int lcp_base = static_cast<int>(prompt.tokens.get_common_prefix(tokens_new));
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    // the new prompt extends the current prompt: the slot can be reused as-is
+    const bool is_continuation = (lcp_base == static_cast<int>(prompt.tokens.size()));
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-
-    auto it_best = states.end();
-
-    // find the most similar cached prompt, that would also preserve the most context
+    // best RAM candidate by common prefix length
+    int lcp_ram = -1;
+    auto it_ram_best = states.end();
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        const int lcp_cur = static_cast<int>(it->prompt.tokens.get_common_prefix(tokens_new));
+        const float f_keep_cur = static_cast<float>(lcp_cur) / static_cast<float>(it->prompt.tokens.size());
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-
-            it_best = it;
+        if (lcp_cur > lcp_ram) {
+            lcp_ram = lcp_cur;
+            it_ram_best = it;
         }
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    // best SSD candidate by common prefix length, using only the in-RAM token index
+    int lcp_ssd = -1;
+    const server_prompt_cache_ssd::entry * it_ssd_best = nullptr;
+    if (ssd) {
+        it_ssd_best = ssd->find_best(tokens_new, lcp_ssd);
+    }
 
-        {
-            auto & data = it_best->data.main;
+    SRV_TRC(" - prompt selection: base lcp = %d, ram lcp = %d, ssd lcp = %d\n", lcp_base, lcp_ram, lcp_ssd);
 
+    // the active slot is the best candidate
+    if (lcp_base >= lcp_ram && lcp_base >= lcp_ssd) {
+        if (is_continuation) {
+            // new prompt extends the current prompt: keep the slot, no snapshot
+            return true;
+        }
+
+        // the current prompt is being replaced: save it for later restore
+        save_state(prompt, ctx_tgt, ctx_dft, id_slot);
+        return true;
+    }
+
+    // a better RAM/SSD candidate exists: save the current state, then restore
+    save_state(prompt, ctx_tgt, ctx_dft, id_slot);
+
+    // re-evaluate after the save, it may have evicted entries to SSD
+    lcp_ram = -1;
+    it_ram_best = states.end();
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const int lcp_cur = static_cast<int>(it->prompt.tokens.get_common_prefix(tokens_new));
+        const float f_keep_cur = static_cast<float>(lcp_cur) / static_cast<float>(it->prompt.tokens.size());
+        if (f_keep_cur < 0.25f) {
+            continue;
+        }
+        if (lcp_cur > lcp_ram) {
+            lcp_ram = lcp_cur;
+            it_ram_best = it;
+        }
+    }
+    lcp_ssd = -1;
+    it_ssd_best = nullptr;
+    if (ssd) {
+        it_ssd_best = ssd->find_best(tokens_new, lcp_ssd);
+    }
+
+    // pick the candidate that reuses the most tokens
+    if (lcp_ssd > lcp_ram) {
+        SRV_INF(" - restoring prompt from SSD cache, lcp = %d\n", lcp_ssd);
+        return ssd->load(*it_ssd_best, prompt, ctx_tgt, ctx_dft, id_slot);
+    }
+
+    SRV_TRC(" - restoring prompt from RAM cache, lcp = %d\n", lcp_ram);
+
+    auto & best = *it_ram_best;
+
+    {
+        auto & data = best.data.main;
+        const size_t size = data.size();
+        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        if (n != size) {
+            SRV_ERR("failed to restore state with size %zu\n", size);
+            return false;
+        }
+        data.clear();
+        data.shrink_to_fit();
+    }
+
+    {
+        auto & data = best.data.drft;
+        if (!data.empty()) {
+            GGML_ASSERT(ctx_dft);
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
+                SRV_WRN("failed to restore state with size %zu\n", size);
                 return false;
             }
-
             data.clear();
             data.shrink_to_fit();
         }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
     }
 
+    prompt = std::move(best.prompt);
+    states.erase(it_ram_best);
+
     return true;
+}
+
+void server_prompt_cache::save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (prompt.tokens.size() == 0) {
+        return;
+    }
+
+    const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    auto * cur = alloc(prompt, cur_size_tgt, cur_size_dft);
+    if (cur == nullptr) {
+        return;
+    }
+
+    llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (ctx_dft) {
+        llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    }
 }
 
 void server_prompt_cache::update() {
@@ -2095,6 +2178,9 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (ssd) {
+                ssd->save(states.front());
+            }
             states.pop_front();
         }
     }
@@ -2110,6 +2196,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (ssd) {
+                ssd->save(states.front());
+            }
             states.pop_front();
         }
     }

@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prompt-cache-ssd.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -913,6 +914,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_prompt_cache_ssd> prompt_cache_ssd;
 
     server_metrics metrics;
 
@@ -951,6 +953,45 @@ private:
         mctx = nullptr;
     }
 
+    // save active slots and RAM cache states to the SSD cache on controlled shutdown
+    void save_prompt_cache_to_ssd() {
+        if (!prompt_cache_ssd) {
+            return;
+        }
+
+        SRV_INF("%s", "saving prompt cache to SSD on shutdown\n");
+
+        // save each slot's current state
+        for (auto & slot : slots) {
+            if (slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+
+            const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+            server_prompt_cache_state state;
+            state.prompt = slot.prompt.clone();
+            state.data.main.resize(size_tgt);
+            state.data.drft.resize(size_dft);
+            llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (ctx_dft) {
+                llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+
+            prompt_cache_ssd->save(state);
+        }
+
+        // save each RAM cache state
+        if (prompt_cache) {
+            for (auto & state : prompt_cache->states) {
+                prompt_cache_ssd->save(state);
+            }
+        }
+
+        SRV_INF("ssd cache: shutdown save done, %zu entries, %.3f MiB\n",
+                prompt_cache_ssd->n_entries(), prompt_cache_ssd->size() / (1024.0 * 1024.0));
+    }
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1356,7 +1397,37 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // create the SSD cache if configured
+            if (!params_base.cache_ssd_dir.empty()) {
+                server_prompt_cache_ssd_fingerprint fp;
+                fp.n_layer       = llama_model_n_layer(model_tgt);
+                fp.n_embd        = llama_model_n_embd(model_tgt);
+                fp.n_head        = llama_model_n_head(model_tgt);
+                fp.n_head_kv     = llama_model_n_head_kv(model_tgt);
+                fp.n_ctx_train   = llama_model_n_ctx_train(model_tgt);
+                fp.n_swa         = llama_model_n_swa(model_tgt);
+                fp.n_layer_nextn = llama_model_n_layer_nextn(model_tgt);
+                fp.ftype         = static_cast<int32_t>(llama_model_ftype(model_tgt));
+                fp.n_params      = llama_model_n_params(model_tgt);
+                fp.model_size    = llama_model_size(model_tgt);
+                fp.n_ctx         = n_ctx_slot();
+                fp.flash_attn    = static_cast<int32_t>(params_base.flash_attn_type);
+                fp.kv_unified    = params_base.kv_unified ? 1 : 0;
+
+                std::error_code ec;
+                fp.file_size = std::filesystem::file_size(params_base.model.path, ec);
+                if (!ec) {
+                    const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
+                    fp.file_mtime = std::chrono::duration_cast<std::chrono::seconds>(mtime.time_since_epoch()).count();
+                }
+
+                const size_t ssd_limit = params_base.cache_ssd_size_mib > 0 ?
+                    1024ull*1024ull*static_cast<size_t>(params_base.cache_ssd_size_mib) : 0;
+                prompt_cache_ssd = std::make_unique<server_prompt_cache_ssd>(params_base.cache_ssd_dir, ssd_limit);
+                prompt_cache_ssd->init(fp);
+            }
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, prompt_cache_ssd.get());
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1554,6 +1625,7 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                update_cache = true;
             }
         }
 
@@ -1643,8 +1715,6 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2508,6 +2578,15 @@ private:
                         }
                     }
                     SRV_DBG("n_processing_slots = %d\n", n_processing_slots);
+
+                    // copy the SSD cache stats into the metrics
+                    if (prompt_cache_ssd) {
+                        metrics.n_ssd_hits      = prompt_cache_ssd->n_hits();
+                        metrics.n_ssd_misses    = prompt_cache_ssd->n_misses();
+                        metrics.n_ssd_evictions = prompt_cache_ssd->n_evictions();
+                        metrics.ssd_size        = prompt_cache_ssd->size();
+                        metrics.ssd_n_entries   = prompt_cache_ssd->n_entries();
+                    }
 
                     auto res = std::make_unique<server_task_result_metrics>();
                     res->id                  = task.id;
@@ -4164,6 +4243,9 @@ bool server_context::load_model(common_params & params) {
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+
+    // save the prompt cache to SSD while the contexts are still available
+    impl->save_prompt_cache_to_ssd();
 }
 
 void server_context::terminate() {

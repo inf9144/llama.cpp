@@ -165,6 +165,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-ssd-dir PATH` | directory for the persistent SSD tier of the prompt cache (default: empty, disabled). Evicted RAM states and the active slots on shutdown are written here and survive restarts. Requires `--cache-ram` to be enabled. | 
+| `--cache-ssd-size N` | maximum size of the SSD tier in MiB (default: 0, no limit). Eviction is LRU. | 
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -2079,6 +2081,80 @@ Note that the following endpoints are exempt from being considered as incoming t
 - `GET /props`
 - `GET /models`
 - `GET /metrics`
+
+## Persistent SSD prompt cache tier
+
+The RAM prompt cache (see `--cache-ram`) can be extended with a persistent second tier on disk. States that are evicted from the RAM cache, as well as the active slots on a controlled shutdown, are written to a directory on SSD and survive server restarts. This is useful when several long-running agents (for example a multi-agent coding setup) each hold a large context and the RAM cache regularly evicts states that are needed again later, so that a full prefill can be avoided on restore.
+
+The SSD tier is disabled by default. When it is not configured, the server behavior is unchanged. It requires `--cache-ram` to be enabled.
+
+### Parameters
+
+- `--cache-ssd-dir PATH`: directory for the SSD tier. Created if it does not exist.
+- `--cache-ssd-size N`: maximum size of the SSD tier in MiB (default: 0, no limit). Eviction is LRU.
+
+### How it works
+
+- **Joint prefix selection.** For every request the server compares the longest common prefix (LCP) of the new prompt against three candidates: the prompt already in the selected slot (the baseline), the best RAM cache entry, and the best SSD entry. The SSD candidate is evaluated from an in-RAM token index only, so no file is read just to check suitability. The candidate with the highest LCP wins. A growing prompt on the same slot is a continuation and is reused as-is, so no snapshot is taken on a normal follow-up turn. A snapshot of the current slot state is taken only when that state is about to be replaced (for example an agent switch), so it can be restored later.
+- **Restore without a redundant RAM copy.** When a SSD entry wins, its state is loaded directly into the active slot. The SSD copy is kept as a recovery point until a newer state replaces it; the normal RAM eviction flow handles the RAM tier separately.
+- **Compatibility fingerprint.** Each entry stores a fingerprint of the loaded model and the relevant KV/context configuration (model dimensions, `ftype`, parameter and file size, file modification time, per-slot context size, flash attention and unified KV settings) plus the state format version. An entry whose fingerprint does not match the currently loaded model is not offered as a candidate, but it is kept on disk so that switching back to that model reuses its cache again. Corrupt or truncated files are removed.
+- **Atomic writes.** Each entry is written to a `.tmp` file, verified, and then renamed into place. A trailing total-size field guards against truncated writes, so a previous valid snapshot is preserved until its successor is fully published. Leftover `.tmp` files are cleaned up on startup.
+
+### Observing hits, misses, and eviction
+
+Log lines (enable `--verbose` for the trace-level selection details):
+
+| Event | Log line |
+| ----- | -------- |
+| SSD tier initialized at startup | `ssd cache: N entries, X MiB (limit: ...) in 'dir'` |
+| SSD hit (state restored from disk) | `restoring prompt from SSD cache, lcp = N` |
+| RAM hit (state restored from RAM) | `restoring prompt from RAM cache, lcp = N` |
+| SSD LRU eviction | `ssd cache: size limit reached, evicting 'key' (X MiB)` |
+| Shutdown flush | `saving prompt cache to SSD on shutdown` then `ssd cache: shutdown save done, N entries, X MiB` |
+| Corrupt entry removed | `ssd cache: removing corrupt entry 'key'` |
+
+The trace-level line `prompt selection: base lcp = B, ram lcp = R, ssd lcp = S` shows the three candidates that were compared for a request.
+
+Prometheus metrics (see `GET /metrics`):
+
+- `llamacpp:prompt_cache_ssd_hits_total`: number of SSD restores.
+- `llamacpp:prompt_cache_ssd_misses_total`: number of requests with no SSD candidate.
+- `llamacpp:prompt_cache_ssd_evictions_total`: number of SSD LRU evictions.
+- `llamacpp:prompt_cache_ssd_size_bytes`: current size of the SSD tier.
+- `llamacpp:prompt_cache_ssd_entries`: current number of SSD entries.
+
+A SSD hit is confirmed when `prompt_cache_ssd_hits_total` increases and the response `timings.prompt_n` is much smaller than the full prompt length (the reused prefix is not re-prefilled).
+
+### Acceptance test for a large multi-agent setup
+
+The following is a practical acceptance test for a real large-model, multi-agent setup (for example a Qwen model with MTP draft state and hybrid checkpoints, several agents each holding a context of roughly 200k tokens). It is a reproducible smoke test to confirm that a SSD hit and the avoided prefill actually happen; it is not a full verification of the model setup.
+
+1. Start the server with the SSD tier enabled, for example:
+
+   ```sh
+   llama-server \
+     -m /path/to/model.gguf \
+     --cache-ram 32768 \
+     --cache-ssd-dir /path/to/ssd-cache \
+     --cache-ssd-size 65536 \
+     --verbose
+   ```
+
+2. Run the multi-agent workload so that at least one agent's context is evicted from the RAM cache (for example by running more agents than fit in `--cache-ram`).
+
+3. Re-send a prompt for an evicted agent. Confirm a SSD hit:
+   - the log shows `restoring prompt from SSD cache, lcp = N` with `N` close to the agent's context length, and
+   - `llamacpp:prompt_cache_ssd_hits_total` increases by one, and
+   - the response `timings.prompt_n` is small (only the new tokens are prefilled) instead of the full context length.
+
+4. Stop the server cleanly (for example `SIGTERM`). Confirm the shutdown flush:
+   - the log shows `saving prompt cache to SSD on shutdown` and `ssd cache: shutdown save done, N entries, X MiB`.
+
+5. Restart the server with the same `--cache-ssd-dir`. Confirm the tier is restored:
+   - the log shows `ssd cache: N entries, X MiB (limit: ...) in 'dir'` at startup, and
+   - re-sending an agent's prompt produces a SSD hit as in step 3.
+
+6. To confirm that an incompatible model does not pollute the cache, restart with a different model of the same architecture. The entries for the previous model are kept on disk but are not offered as candidates (no `restoring prompt from SSD cache` line for them). Switching back to the original model reuses its entries again.
 
 ## More examples
 
