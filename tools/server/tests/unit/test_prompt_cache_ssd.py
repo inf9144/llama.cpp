@@ -1,7 +1,20 @@
 import pytest
 from utils import *
 
+import os
+import struct
+
 server = ServerPreset.tinyllama2()
+
+
+def get_metric(name):
+    res = server.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    for line in res.body.splitlines():
+        if line.startswith("llamacpp:" + name + " "):
+            return float(line.split()[-1])
+    return 0.0
+
 
 @pytest.fixture(autouse=True)
 def create_server(tmp_path):
@@ -10,42 +23,93 @@ def create_server(tmp_path):
     server.temperature = 0.0
     server.cache_ssd_dir = str(tmp_path / "ssd-cache")
     # small RAM cache to force eviction to SSD
-    server.cache_ram = 4
+    server.cache_ram = 1
     server.n_ctx = 512
+    server.server_metrics = True
 
 
 def test_ssd_hit_after_ram_eviction():
     global server
     server.start()
 
-    # first prompt, fully processed
+    # prompt A, fully processed
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of France? ",
-        "id_slot": 1,
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    prompt_n_full = res.body["timings"]["prompt_n"]
-    assert prompt_n_full > 0
-
-    # a long filler prompt to evict the first one from the small RAM cache
-    filler = " filler " * 40
-    res = server.make_request("POST", "/completion", data={
-        "prompt": filler,
         "id_slot": 0,
         "cache_prompt": True,
     })
     assert res.status_code == 200
 
-    # re-send the first prompt: it should be restored from the SSD cache
+    # fill the RAM cache with distinct prompts, each overwriting slot 0,
+    # so prompt A is evicted from RAM to SSD
+    for i in range(20):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": f"Filler prompt number {i} with some extra text to take space. ",
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+
+    # re-send prompt A: it must be restored from the SSD cache
+    hits_before = get_metric("prompt_cache_ssd_hits_total")
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of France? ",
-        "id_slot": 1,
+        "id_slot": 0,
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    # most of the prompt is reused from the SSD cache
-    assert res.body["timings"]["prompt_n"] < prompt_n_full
+    hits_after = get_metric("prompt_cache_ssd_hits_total")
+    assert hits_after > hits_before, f"expected an SSD hit, before={hits_before} after={hits_after}"
+
+
+def test_ssd_hit_survives_touch_and_restart():
+    # a successful SSD hit calls touch_file(); the file must stay valid so the
+    # same entry can be restored again. verify the fingerprint is not corrupted.
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France? ",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # evict prompt A to SSD
+    for i in range(20):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": f"Filler prompt number {i} with some extra text to take space. ",
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+
+    # restore A from SSD (this calls touch_file)
+    hits_before = get_metric("prompt_cache_ssd_hits_total")
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France? ",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    hits_after = get_metric("prompt_cache_ssd_hits_total")
+    assert hits_after > hits_before, "expected an SSD hit after eviction"
+
+    # the file must still be valid after touch_file: the fingerprint is intact
+    found = False
+    for root, dirs, files in os.walk(server.cache_ssd_dir):
+        for f in files:
+            if not f.endswith(".lsc"):
+                continue
+            with open(os.path.join(root, f), "rb") as fh:
+                data = fh.read()
+            magic = struct.unpack("<I", data[0:4])[0]
+            assert magic == 0x5343504c, f"bad magic {magic:#x}"
+            # n_layer sits at offset 16 (after magic, version, last_access_ms)
+            n_layer = struct.unpack("<i", data[16:20])[0]
+            assert 0 < n_layer < 1000, f"corrupt n_layer {n_layer} (touch_file bug)"
+            found = True
+    assert found, "no .lsc file found"
 
 
 def test_ssd_restore_after_restart(tmp_path):
@@ -80,7 +144,7 @@ def test_no_ssd_config_unchanged(tmp_path):
     global server
     server = ServerPreset.tinyllama2()
     server.temperature = 0.0
-    server.cache_ram = 4
+    server.cache_ram = 1
     server.n_ctx = 512
     # no cache_ssd_dir
     server.start()

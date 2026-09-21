@@ -2111,6 +2111,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         it_ssd_best = ssd->find_best(tokens_new, lcp_ssd);
     }
 
+    // the save may have evicted the only candidate (to a full SSD, or a failed write):
+    // keep the active slot as the fallback and let the normal prefill path run
+    if (lcp_ram < 0 && lcp_ssd < 0) {
+        SRV_WRN("%s", " - no cache candidate left after saving the slot, keeping the active slot\n");
+        return true;
+    }
+
     // pick the candidate that reuses the most tokens
     if (lcp_ssd > lcp_ram) {
         SRV_INF(" - restoring prompt from SSD cache, lcp = %d\n", lcp_ssd);

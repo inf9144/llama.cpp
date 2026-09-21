@@ -10,7 +10,7 @@
 // binds an SSD snapshot to a specific model + KV/context configuration
 // a snapshot is only a candidate when this matches the loaded model exactly
 struct server_prompt_cache_ssd_fingerprint {
-    // model identity
+    // target model identity
     int32_t n_layer       = 0;
     int32_t n_embd        = 0;
     int32_t n_head        = 0;
@@ -24,10 +24,26 @@ struct server_prompt_cache_ssd_fingerprint {
     uint64_t file_size    = 0;
     int64_t  file_mtime   = 0;
 
+    // draft model identity, all zero when absent (e.g. MTP uses the target model)
+    int32_t  dft_present   = 0;
+    int32_t  dft_n_layer   = 0;
+    int32_t  dft_n_embd    = 0;
+    int32_t  dft_n_head    = 0;
+    int32_t  dft_n_head_kv = 0;
+    int32_t  dft_ftype     = 0;
+    uint64_t dft_n_params  = 0;
+    uint64_t dft_model_size = 0;
+    uint64_t dft_file_size = 0;
+    int64_t  dft_file_mtime = 0;
+
     // KV / context parameters that affect the state layout
     int32_t n_ctx        = 0;
     int32_t flash_attn   = 0;
     int32_t kv_unified   = 0;
+    int32_t rope_type    = 0;
+    int32_t cache_type_k = 0;
+    int32_t cache_type_v = 0;
+    float   rope_freq_scale = 0.0f;
 
     bool operator==(const server_prompt_cache_ssd_fingerprint & o) const {
         return n_layer == o.n_layer && n_embd == o.n_embd && n_head == o.n_head &&
@@ -35,7 +51,14 @@ struct server_prompt_cache_ssd_fingerprint {
                n_layer_nextn == o.n_layer_nextn && ftype == o.ftype &&
                n_params == o.n_params && model_size == o.model_size &&
                file_size == o.file_size && file_mtime == o.file_mtime &&
-               n_ctx == o.n_ctx && flash_attn == o.flash_attn && kv_unified == o.kv_unified;
+               dft_present == o.dft_present && dft_n_layer == o.dft_n_layer &&
+               dft_n_embd == o.dft_n_embd && dft_n_head == o.dft_n_head &&
+               dft_n_head_kv == o.dft_n_head_kv && dft_ftype == o.dft_ftype &&
+               dft_n_params == o.dft_n_params && dft_model_size == o.dft_model_size &&
+               dft_file_size == o.dft_file_size && dft_file_mtime == o.dft_file_mtime &&
+               n_ctx == o.n_ctx && flash_attn == o.flash_attn && kv_unified == o.kv_unified &&
+               rope_type == o.rope_type && cache_type_k == o.cache_type_k &&
+               cache_type_v == o.cache_type_v && rope_freq_scale == o.rope_freq_scale;
     }
     bool operator!=(const server_prompt_cache_ssd_fingerprint & o) const { return !(*this == o); }
 };
@@ -84,6 +107,12 @@ struct server_prompt_cache_ssd {
     uint64_t n_misses() const    { return n_misses_; }
     uint64_t n_evictions() const { return n_evictions_; }
 
+    // stable hash of the fingerprint, used as the per-model subdirectory name
+    uint64_t fp_hash() const;
+
+    // the subdirectory that holds the snapshots of the current model
+    std::string model_dir() const;
+
 private:
     std::string dir;
     size_t limit_size = 0;
@@ -100,6 +129,9 @@ private:
     uint64_t n_evictions_ = 0;
 
     static std::string make_key(const server_tokens & tokens);
+
+    // path of a snapshot file inside the model subdirectory
+    std::string entry_path(const std::string & key) const;
 
     bool save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms) const;
     bool read_header(const std::string & path, entry & e, server_prompt_cache_ssd_fingerprint & fp_out) const;

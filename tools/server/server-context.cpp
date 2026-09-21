@@ -1413,12 +1413,34 @@ private:
                 fp.n_ctx         = n_ctx_slot();
                 fp.flash_attn    = static_cast<int32_t>(params_base.flash_attn_type);
                 fp.kv_unified    = params_base.kv_unified ? 1 : 0;
+                fp.rope_type     = static_cast<int32_t>(llama_model_rope_type(model_tgt));
+                fp.rope_freq_scale = llama_model_rope_freq_scale_train(model_tgt);
+                fp.cache_type_k  = static_cast<int32_t>(params_base.cache_type_k);
+                fp.cache_type_v  = static_cast<int32_t>(params_base.cache_type_v);
 
                 std::error_code ec;
                 fp.file_size = std::filesystem::file_size(params_base.model.path, ec);
                 if (!ec) {
                     const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
                     fp.file_mtime = std::chrono::duration_cast<std::chrono::seconds>(mtime.time_since_epoch()).count();
+                }
+
+                // bind the draft model identity, so a state saved with a different
+                // draft (or none) is not offered as a candidate
+                if (model_dft) {
+                    fp.dft_present   = 1;
+                    fp.dft_n_layer   = llama_model_n_layer(model_dft);
+                    fp.dft_n_embd    = llama_model_n_embd(model_dft);
+                    fp.dft_n_head    = llama_model_n_head(model_dft);
+                    fp.dft_n_head_kv = llama_model_n_head_kv(model_dft);
+                    fp.dft_ftype     = static_cast<int32_t>(llama_model_ftype(model_dft));
+                    fp.dft_n_params  = llama_model_n_params(model_dft);
+                    fp.dft_model_size = llama_model_size(model_dft);
+                    fp.dft_file_size = std::filesystem::file_size(params_base.speculative.draft.mparams.path, ec);
+                    if (!ec) {
+                        const auto mtime = std::filesystem::last_write_time(params_base.speculative.draft.mparams.path, ec);
+                        fp.dft_file_mtime = std::chrono::duration_cast<std::chrono::seconds>(mtime.time_since_epoch()).count();
+                    }
                 }
 
                 const size_t ssd_limit = params_base.cache_ssd_size_mib > 0 ?

@@ -75,11 +75,12 @@ static void test_roundtrip(const std::string & dir) {
     CHECK(cache.n_entries() == 1, "n_entries == 1");
     CHECK(cache.size() > 0, "size > 0");
 
-    // verify the file exists
-    const auto files = std::filesystem::directory_iterator(dir);
+    // verify the file exists in the model subdirectory
+    const std::string mdir = cache.model_dir();
+    const auto files = std::filesystem::directory_iterator(mdir);
     int n_files = 0;
     for (const auto & p : files) {
-        if (p.is_regular_file() && p.path().filename().string().find(".lsc") != std::string::npos) {
+        if (p.is_regular_file() && string_ends_with(p.path().filename().string(), ".lsc")) {
             n_files++;
         }
     }
@@ -91,10 +92,6 @@ static void test_roundtrip(const std::string & dir) {
     CHECK(e != nullptr, "find_best finds the entry");
     CHECK(lcp == 8, "lcp == 8");
 
-    // verify the state can be read back
-    server_prompt prompt;
-    server_prompt_data data;
-    const std::string path = dir + "/" + e->key + ".lsc";
     // use a fresh cache to read the state (simulates a restart)
     server_prompt_cache_ssd cache2(dir, 0);
     CHECK(cache2.init(fp), "init2");
@@ -140,8 +137,8 @@ static void test_fingerprint_mismatch(const std::string & dir) {
 
     // the file should still be on disk (kept for when we switch back)
     int n_files = 0;
-    for (const auto & p : std::filesystem::directory_iterator(dir)) {
-        if (p.is_regular_file() && p.path().filename().string().find(".lsc") != std::string::npos) {
+    for (const auto & p : std::filesystem::recursive_directory_iterator(dir)) {
+        if (p.is_regular_file() && string_ends_with(p.path().filename().string(), ".lsc")) {
             n_files++;
         }
     }
@@ -159,8 +156,10 @@ static void test_corrupt(const std::string & dir) {
     server_prompt_cache_ssd cache(dir, 0);
     CHECK(cache.init(fp), "init");
 
+    const std::string mdir = cache.model_dir();
+
     // create a corrupt file (bad magic)
-    const std::string corrupt_path = dir + "/deadbeefdeadbeefdeadbeefdeadbeef.lsc";
+    const std::string corrupt_path = mdir + "/deadbeefdeadbeefdeadbeefdeadbeef.lsc";
     {
         std::ofstream f(corrupt_path, std::ios::binary);
         f.write("garbage", 7);
@@ -178,21 +177,20 @@ static void test_corrupt(const std::string & dir) {
 
     // find the .lsc file
     std::string valid_path;
-    for (const auto & p : std::filesystem::directory_iterator(dir)) {
-        if (p.is_regular_file() && p.path().filename().string().find(".lsc") != std::string::npos) {
+    for (const auto & p : std::filesystem::directory_iterator(mdir)) {
+        if (p.is_regular_file() && string_ends_with(p.path().filename().string(), ".lsc")) {
             valid_path = p.path().string();
             break;
         }
     }
     CHECK(!valid_path.empty(), "found .lsc file");
 
-    // truncate the file
-    const auto file_size = std::filesystem::file_size(valid_path);
+    // read the full content first, then write only half (truncating the body)
     {
-        std::ofstream f(valid_path, std::ios::binary | std::ios::trunc);
         std::ifstream in(valid_path, std::ios::binary);
-        std::vector<char> data(file_size);
-        in.read(data.data(), data.size());
+        std::vector<char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        std::ofstream f(valid_path, std::ios::binary | std::ios::trunc);
         f.write(data.data(), data.size() / 2);  // write only half
     }
 
@@ -205,16 +203,21 @@ static void test_corrupt(const std::string & dir) {
 // test temp file cleanup
 static void test_tmp_cleanup(const std::string & dir) {
     const auto fp = make_fp();
+    server_prompt_cache_ssd cache(dir, 0);
+    CHECK(cache.init(fp), "init");
+
+    const std::string mdir = cache.model_dir();
 
     // create a temp file (simulates a crashed write)
-    const std::string tmp_path = dir + "/deadbeefdeadbeefdeadbeefdeadbeef.lsc.tmp";
+    const std::string tmp_path = mdir + "/deadbeefdeadbeefdeadbeefdeadbeef.lsc.tmp";
     {
         std::ofstream f(tmp_path, std::ios::binary);
         f.write("partial", 7);
     }
 
-    server_prompt_cache_ssd cache(dir, 0);
-    CHECK(cache.init(fp), "init");
+    // re-init, the tmp file should be removed
+    server_prompt_cache_ssd cache2(dir, 0);
+    CHECK(cache2.init(fp), "init2");
     CHECK(!std::filesystem::exists(tmp_path), "tmp file removed");
 }
 
