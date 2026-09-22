@@ -166,7 +166,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `--cache-ssd-dir PATH` | directory for the persistent SSD tier of the prompt cache (default: empty, disabled). Evicted RAM states and the active slots on shutdown are written here and survive restarts. Requires `--cache-ram` to be enabled. | 
-| `--cache-ssd-size N` | maximum size of the SSD tier in MiB (default: 0, no limit). Eviction is LRU. | 
+| `--cache-ssd-size N` | maximum size of the SSD tier in MiB per model (default: 0, no limit). Eviction is LRU. The limit applies to each model's subdirectory, so the total on disk can be larger when several models are cached. | 
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -2091,7 +2091,7 @@ The SSD tier is disabled by default. When it is not configured, the server behav
 ### Parameters
 
 - `--cache-ssd-dir PATH`: directory for the SSD tier. Created if it does not exist.
-- `--cache-ssd-size N`: maximum size of the SSD tier in MiB (default: 0, no limit). Eviction is LRU.
+- `--cache-ssd-size N`: maximum size of the SSD tier in MiB per model (default: 0, no limit). Eviction is LRU. The limit applies to each model's subdirectory, so the total on disk can be larger when several models are cached.
 
 ### How it works
 

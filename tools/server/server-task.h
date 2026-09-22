@@ -679,6 +679,9 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // true when the prompt is already fully contained in the RAM cache
+    bool is_in_cache(const server_prompt & prompt) const;
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     // save the current slot state into the RAM cache, called only when the slot is about to be replaced

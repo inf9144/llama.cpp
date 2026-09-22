@@ -15,6 +15,12 @@ constexpr uint32_t SSD_MAGIC   = 0x5343504c;  // "LPCS"
 constexpr uint32_t SSD_VERSION = 1;
 constexpr const char * SSD_EXT = ".lsc";
 constexpr const char * SSD_TMP_EXT = ".lsc.tmp";
+
+// persistent timestamp, the monotonic clock resets on reboot and would break the LRU order
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
 } // namespace
 
 server_prompt_cache_ssd::server_prompt_cache_ssd(std::string dir, size_t limit_size)
@@ -73,7 +79,11 @@ uint64_t server_prompt_cache_ssd::fp_hash() const {
     mix(&fp.rope_type,       sizeof(fp.rope_type));
     mix(&fp.cache_type_k,    sizeof(fp.cache_type_k));
     mix(&fp.cache_type_v,    sizeof(fp.cache_type_v));
+    mix(&fp.rope_freq_base,  sizeof(fp.rope_freq_base));
     mix(&fp.rope_freq_scale, sizeof(fp.rope_freq_scale));
+    mix(&fp.rope_scaling_type, sizeof(fp.rope_scaling_type));
+    mix(&fp.dft_cache_type_k, sizeof(fp.dft_cache_type_k));
+    mix(&fp.dft_cache_type_v, sizeof(fp.dft_cache_type_v));
     return hash;
 }
 
@@ -457,7 +467,7 @@ bool server_prompt_cache_ssd::save(const server_prompt_cache_state & state) {
 
     const std::string key  = make_key(state.prompt.tokens);
     const std::string path = entry_path(key);
-    const int64_t now = ggml_time_ms();
+    const int64_t now = now_ms();
 
     if (!save_file(path, state, now)) {
         return false;
@@ -553,7 +563,7 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
     prompt = std::move(prompt_loaded);
 
     // mark as most recently used
-    const int64_t now = ggml_time_ms();
+    const int64_t now = now_ms();
     touch_file(path, now);
     auto it = index.find(e.key);
     if (it != index.end()) {

@@ -2161,8 +2161,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+bool server_prompt_cache::is_in_cache(const server_prompt & prompt) const {
+    for (const auto & state : states) {
+        if (static_cast<int>(state.prompt.tokens.get_common_prefix(prompt.tokens)) == static_cast<int>(prompt.tokens.size())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_prompt_cache::save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     if (prompt.tokens.size() == 0) {
+        return;
+    }
+
+    // the prompt is already in the RAM cache, it reaches SSD on eviction
+    if (is_in_cache(prompt)) {
         return;
     }
 
@@ -2171,6 +2185,18 @@ void server_prompt_cache::save_state(const server_prompt & prompt, llama_context
 
     auto * cur = alloc(prompt, cur_size_tgt, cur_size_dft);
     if (cur == nullptr) {
+        // the state does not fit in the RAM tier: save it directly to SSD
+        if (ssd) {
+            server_prompt_cache_state state;
+            state.prompt = prompt.clone();
+            state.data.main.resize(cur_size_tgt);
+            state.data.drft.resize(cur_size_dft);
+            llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (ctx_dft) {
+                llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            }
+            ssd->save(state);
+        }
         return;
     }
 

@@ -1414,9 +1414,14 @@ private:
                 fp.flash_attn    = static_cast<int32_t>(params_base.flash_attn_type);
                 fp.kv_unified    = params_base.kv_unified ? 1 : 0;
                 fp.rope_type     = static_cast<int32_t>(llama_model_rope_type(model_tgt));
-                fp.rope_freq_scale = llama_model_rope_freq_scale_train(model_tgt);
                 fp.cache_type_k  = static_cast<int32_t>(params_base.cache_type_k);
                 fp.cache_type_v  = static_cast<int32_t>(params_base.cache_type_v);
+                // effective RoPE configuration, 0 = from model
+                fp.rope_freq_base  = params_base.rope_freq_base;
+                fp.rope_freq_scale = params_base.rope_freq_scale;
+                fp.rope_scaling_type = static_cast<int32_t>(params_base.rope_scaling_type);
+                fp.dft_cache_type_k = static_cast<int32_t>(params_base.speculative.draft.cache_type_k);
+                fp.dft_cache_type_v = static_cast<int32_t>(params_base.speculative.draft.cache_type_v);
 
                 std::error_code ec;
                 fp.file_size = std::filesystem::file_size(params_base.model.path, ec);

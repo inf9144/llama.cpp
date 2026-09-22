@@ -43,7 +43,13 @@ struct server_prompt_cache_ssd_fingerprint {
     int32_t rope_type    = 0;
     int32_t cache_type_k = 0;
     int32_t cache_type_v = 0;
+    // effective RoPE configuration (0 = from model), so a different --rope-scale is a different fingerprint
+    float   rope_freq_base  = 0.0f;
     float   rope_freq_scale = 0.0f;
+    int32_t rope_scaling_type = 0;
+    // draft KV cache data types
+    int32_t dft_cache_type_k = 0;
+    int32_t dft_cache_type_v = 0;
 
     bool operator==(const server_prompt_cache_ssd_fingerprint & o) const {
         return n_layer == o.n_layer && n_embd == o.n_embd && n_head == o.n_head &&
@@ -57,8 +63,10 @@ struct server_prompt_cache_ssd_fingerprint {
                dft_n_params == o.dft_n_params && dft_model_size == o.dft_model_size &&
                dft_file_size == o.dft_file_size && dft_file_mtime == o.dft_file_mtime &&
                n_ctx == o.n_ctx && flash_attn == o.flash_attn && kv_unified == o.kv_unified &&
-               rope_type == o.rope_type && cache_type_k == o.cache_type_k &&
-               cache_type_v == o.cache_type_v && rope_freq_scale == o.rope_freq_scale;
+               rope_type == o.rope_type && cache_type_k == o.cache_type_k && cache_type_v == o.cache_type_v &&
+               rope_freq_base == o.rope_freq_base && rope_freq_scale == o.rope_freq_scale &&
+               rope_scaling_type == o.rope_scaling_type &&
+               dft_cache_type_k == o.dft_cache_type_k && dft_cache_type_v == o.dft_cache_type_v;
     }
     bool operator!=(const server_prompt_cache_ssd_fingerprint & o) const { return !(*this == o); }
 };
