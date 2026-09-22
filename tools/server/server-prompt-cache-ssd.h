@@ -50,6 +50,17 @@ struct server_prompt_cache_ssd_fingerprint {
     // draft KV cache data types
     int32_t dft_cache_type_k = 0;
     int32_t dft_cache_type_v = 0;
+    // effective SWA configuration, --swa-full changes the context layout
+    int32_t swa_full = 0;
+    // YaRN overrides (-1/0 = from model), so a different --yarn-* is a different fingerprint
+    float   yarn_ext_factor  = 0.0f;
+    float   yarn_attn_factor = 0.0f;
+    float   yarn_beta_fast   = 0.0f;
+    float   yarn_beta_slow   = 0.0f;
+    int32_t yarn_orig_ctx    = 0;
+    // hash of the base LoRA adapters (path + scale), 0 when none, so a state saved
+    // with a different adapter set is not offered as a candidate
+    uint64_t lora_hash = 0;
 
     bool operator==(const server_prompt_cache_ssd_fingerprint & o) const {
         return n_layer == o.n_layer && n_embd == o.n_embd && n_head == o.n_head &&
@@ -66,7 +77,11 @@ struct server_prompt_cache_ssd_fingerprint {
                rope_type == o.rope_type && cache_type_k == o.cache_type_k && cache_type_v == o.cache_type_v &&
                rope_freq_base == o.rope_freq_base && rope_freq_scale == o.rope_freq_scale &&
                rope_scaling_type == o.rope_scaling_type &&
-               dft_cache_type_k == o.dft_cache_type_k && dft_cache_type_v == o.dft_cache_type_v;
+               dft_cache_type_k == o.dft_cache_type_k && dft_cache_type_v == o.dft_cache_type_v &&
+               swa_full == o.swa_full &&
+               yarn_ext_factor == o.yarn_ext_factor && yarn_attn_factor == o.yarn_attn_factor &&
+               yarn_beta_fast == o.yarn_beta_fast && yarn_beta_slow == o.yarn_beta_slow &&
+               yarn_orig_ctx == o.yarn_orig_ctx && lora_hash == o.lora_hash;
     }
     bool operator!=(const server_prompt_cache_ssd_fingerprint & o) const { return !(*this == o); }
 };

@@ -961,25 +961,29 @@ private:
 
         SRV_INF("%s", "saving prompt cache to SSD on shutdown\n");
 
-        // save each slot's current state
-        for (auto & slot : slots) {
-            if (slot.prompt.n_tokens() == 0) {
-                continue;
+        // save each slot's current state, the context must still be alive
+        // (when entering sleep the flush runs before destroy, on shutdown the
+        // slots were already saved when the server went to sleep)
+        if (ctx_tgt) {
+            for (auto & slot : slots) {
+                if (slot.prompt.n_tokens() == 0) {
+                    continue;
+                }
+
+                const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+                server_prompt_cache_state state;
+                state.prompt = slot.prompt.clone();
+                state.data.main.resize(size_tgt);
+                state.data.drft.resize(size_dft);
+                llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (ctx_dft) {
+                    llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                }
+
+                prompt_cache_ssd->save(state);
             }
-
-            const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-            server_prompt_cache_state state;
-            state.prompt = slot.prompt.clone();
-            state.data.main.resize(size_tgt);
-            state.data.drft.resize(size_dft);
-            llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            }
-
-            prompt_cache_ssd->save(state);
         }
 
         // save each RAM cache state
@@ -1000,6 +1004,9 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            // save the active states to SSD before the contexts are freed, so they
+            // survive the sleep and a shutdown while sleeping
+            save_prompt_cache_to_ssd();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1422,6 +1429,31 @@ private:
                 fp.rope_scaling_type = static_cast<int32_t>(params_base.rope_scaling_type);
                 fp.dft_cache_type_k = static_cast<int32_t>(params_base.speculative.draft.cache_type_k);
                 fp.dft_cache_type_v = static_cast<int32_t>(params_base.speculative.draft.cache_type_v);
+                // effective SWA configuration, --swa-full changes the context layout
+                fp.swa_full = params_base.swa_full ? 1 : 0;
+                // YaRN overrides, -1/0 = from model
+                fp.yarn_ext_factor  = params_base.yarn_ext_factor;
+                fp.yarn_attn_factor = params_base.yarn_attn_factor;
+                fp.yarn_beta_fast   = params_base.yarn_beta_fast;
+                fp.yarn_beta_slow   = params_base.yarn_beta_slow;
+                fp.yarn_orig_ctx    = params_base.yarn_orig_ctx;
+                // hash the base LoRA adapters (path + scale), so a state saved with a
+                // different adapter set is not offered as a candidate
+                if (!params_base.lora_adapters.empty()) {
+                    uint64_t lora_hash = 14695981039346656037ULL;  // FNV-1a offset basis
+                    auto lora_mix = [&](const void * data, size_t size) {
+                        const auto * bytes = reinterpret_cast<const uint8_t *>(data);
+                        for (size_t i = 0; i < size; ++i) {
+                            lora_hash ^= bytes[i];
+                            lora_hash *= 1099511628211ULL;  // FNV-1a prime
+                        }
+                    };
+                    for (const auto & adapter : params_base.lora_adapters) {
+                        lora_mix(adapter.path.data(), adapter.path.size());
+                        lora_mix(&adapter.scale, sizeof(adapter.scale));
+                    }
+                    fp.lora_hash = lora_hash;
+                }
 
                 std::error_code ec;
                 fp.file_size = std::filesystem::file_size(params_base.model.path, ec);

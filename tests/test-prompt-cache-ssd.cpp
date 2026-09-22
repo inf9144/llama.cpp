@@ -150,6 +150,37 @@ static void test_fingerprint_mismatch(const std::string & dir) {
     CHECK(cache3.n_entries() == 1, "entry visible again");
 }
 
+// test that LoRA and swa_full changes produce a different fingerprint
+static void test_fingerprint_lora_swa(const std::string & dir) {
+    const auto fp = make_fp();
+    server_prompt_cache_ssd cache(dir, 0);
+    CHECK(cache.init(fp), "init");
+
+    const std::vector<llama_token> toks = {1, 2, 3, 4, 5};
+    auto state = make_state(toks, 100, 0);
+    CHECK(cache.save(state), "save");
+    CHECK(cache.n_entries() == 1, "n_entries == 1");
+
+    // a different LoRA adapter set should not see the entry
+    auto fp_lora = fp;
+    fp_lora.lora_hash = 0xdeadbeefcafe1234ULL;
+    server_prompt_cache_ssd cache_lora(dir, 0);
+    CHECK(cache_lora.init(fp_lora), "init_lora");
+    CHECK(cache_lora.n_entries() == 0, "lora mismatch not indexed");
+
+    // a different swa_full setting should not see the entry
+    auto fp_swa = fp;
+    fp_swa.swa_full = 1;
+    server_prompt_cache_ssd cache_swa(dir, 0);
+    CHECK(cache_swa.init(fp_swa), "init_swa");
+    CHECK(cache_swa.n_entries() == 0, "swa_full mismatch not indexed");
+
+    // switching back to the original fingerprint should see the entry again
+    server_prompt_cache_ssd cache2(dir, 0);
+    CHECK(cache2.init(fp), "init2");
+    CHECK(cache2.n_entries() == 1, "entry visible again");
+}
+
 // test corrupt file handling
 static void test_corrupt(const std::string & dir) {
     const auto fp = make_fp();
@@ -244,6 +275,11 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir4);
     test_corrupt(dir4);
     std::filesystem::remove_all(dir4);
+
+    const std::string dir4b = make_temp_dir() + "-fp-lora-swa";
+    std::filesystem::create_directories(dir4b);
+    test_fingerprint_lora_swa(dir4b);
+    std::filesystem::remove_all(dir4b);
 
     const std::string dir5 = make_temp_dir() + "-tmp";
     std::filesystem::create_directories(dir5);

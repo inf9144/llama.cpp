@@ -3,6 +3,7 @@ from utils import *
 
 import os
 import struct
+import time
 
 server = ServerPreset.tinyllama2()
 
@@ -17,7 +18,7 @@ def get_metric(name):
 
 
 FP_OFFSET = 16   # after magic(4) + version(4) + last_access_ms(8)
-FP_SIZE = 168    # sizeof(server_prompt_cache_ssd_fingerprint)
+FP_SIZE = 200    # sizeof(server_prompt_cache_ssd_fingerprint)
 
 
 def read_fingerprints():
@@ -174,6 +175,50 @@ def test_ssd_restore_after_restart(tmp_path):
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] < prompt_n_full
+
+
+def test_ssd_flush_on_shutdown_while_sleeping(tmp_path):
+    # the active state must be saved to SSD when the server goes to sleep, so a
+    # shutdown while sleeping neither loses it nor crashes on a freed context
+    global server
+    server.sleep_idle_seconds = 1
+    server.start()
+
+    # process a prompt so there is an active state
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France? ",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # wait for the server to go to sleep (idle for 1 second)
+    start = time.time()
+    while time.time() - start < 10.0:
+        props = server.make_request("GET", "/props")
+        if props.status_code == 200 and props.body.get("is_sleeping"):
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError("server did not go to sleep")
+
+    # stop the server while it is sleeping
+    server.stop()
+
+    # restart the server with the same SSD directory
+    server.start()
+
+    # the state must be restored from SSD after the restart
+    hits_before = get_metric("prompt_cache_ssd_hits_total")
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France? ",
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    hits_after = get_metric("prompt_cache_ssd_hits_total")
+    assert hits_after > hits_before, \
+        f"expected an SSD hit after shutdown while sleeping, before={hits_before} after={hits_after}"
 
 
 def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):

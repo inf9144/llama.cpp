@@ -84,6 +84,13 @@ uint64_t server_prompt_cache_ssd::fp_hash() const {
     mix(&fp.rope_scaling_type, sizeof(fp.rope_scaling_type));
     mix(&fp.dft_cache_type_k, sizeof(fp.dft_cache_type_k));
     mix(&fp.dft_cache_type_v, sizeof(fp.dft_cache_type_v));
+    mix(&fp.swa_full,        sizeof(fp.swa_full));
+    mix(&fp.yarn_ext_factor, sizeof(fp.yarn_ext_factor));
+    mix(&fp.yarn_attn_factor, sizeof(fp.yarn_attn_factor));
+    mix(&fp.yarn_beta_fast,  sizeof(fp.yarn_beta_fast));
+    mix(&fp.yarn_beta_slow,  sizeof(fp.yarn_beta_slow));
+    mix(&fp.yarn_orig_ctx,   sizeof(fp.yarn_orig_ctx));
+    mix(&fp.lora_hash,       sizeof(fp.lora_hash));
     return hash;
 }
 
