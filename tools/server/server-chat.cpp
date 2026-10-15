@@ -658,14 +658,27 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     throw std::invalid_argument("item['content']['text'] is not a string");
                 }
 
+                const std::string & reasoning_text =
+                    item.at("content")[0].at("text").get_ref<const std::string &>();
+
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    if (!prev_msg.contains("reasoning_content")) {
+                        prev_msg["reasoning_content"] = reasoning_text;
+                    } else {
+                        // Consecutive reasoning-only Responses items belong to
+                        // the same assistant turn. Preserve every segment in order.
+                        auto & previous = prev_msg["reasoning_content"].get_ref<std::string &>();
+                        if (!previous.empty() && !reasoning_text.empty()) {
+                            previous += "\n\n";
+                        }
+                        previous += reasoning_text;
+                    }
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", reasoning_text},
                     });
                 }
             } else {
