@@ -162,6 +162,85 @@ int main() {
         return 1;
     }
 
+    // A reasoning-only EOS is a completed Responses request but not the end
+    // of the Codex agent turn. Verify both streaming and non-streaming egress.
+    auto check_end_turn = [](server_task_result_cmpl_final & result,
+                             bool expected_continuation,
+                             const std::string & case_name) {
+        const json response = result.to_json_oaicompat_resp();
+        const json events = result.to_json_oaicompat_resp_stream();
+        const json & streamed_response = events.back().at("data").at("response");
+
+        const bool nonstream_continue = response.value("end_turn", true) == false;
+        const bool stream_continue = streamed_response.value("end_turn", true) == false;
+        if (nonstream_continue != expected_continuation ||
+            stream_continue != expected_continuation) {
+            std::cerr << "Unexpected Codex end_turn for " << case_name
+                      << " (non-stream=" << nonstream_continue
+                      << ", stream=" << stream_continue << ")\n";
+            return false;
+        }
+
+        if (expected_continuation) {
+            if (response.at("status") != "completed" ||
+                streamed_response.at("status") != "completed" ||
+                response.at("output").size() != 1 ||
+                response.at("output")[0].value("type", std::string()) != "reasoning" ||
+                streamed_response.at("output").size() != 1 ||
+                streamed_response.at("output")[0].value("type", std::string()) != "reasoning") {
+                std::cerr << "Reasoning-only EOS lost its completed reasoning output\n";
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto reasoning_only = make_response_result("");
+    reasoning_only.stop = STOP_TYPE_EOS;
+    reasoning_only.oaicompat_msg.reasoning_content = "Need to keep working.";
+    if (!check_end_turn(reasoning_only, true, "reasoning-only EOS")) {
+        return 1;
+    }
+
+    auto answered = make_response_result("Done.");
+    answered.stop = STOP_TYPE_EOS;
+    answered.oaicompat_msg.reasoning_content = "Finished reasoning.";
+    if (!check_end_turn(answered, false, "answered EOS")) {
+        return 1;
+    }
+
+    auto tool_response = make_response_result("");
+    tool_response.stop = STOP_TYPE_EOS;
+    tool_response.oaicompat_msg.reasoning_content = "A tool is needed.";
+    tool_response.oaicompat_msg.tool_calls.push_back({
+        "shell_command", R"({"command":"pwd"})", "tool_2",
+    });
+    if (!check_end_turn(tool_response, false, "tool-call EOS")) {
+        return 1;
+    }
+
+    auto no_reasoning = make_response_result("");
+    no_reasoning.stop = STOP_TYPE_EOS;
+    if (!check_end_turn(no_reasoning, false, "empty EOS without reasoning")) {
+        return 1;
+    }
+
+    auto hit_limit = make_response_result("");
+    hit_limit.stop = STOP_TYPE_LIMIT;
+    hit_limit.oaicompat_msg.reasoning_content = "Thinking was interrupted.";
+    if (!check_end_turn(hit_limit, false, "reasoning-only limit")) {
+        return 1;
+    }
+
+    auto compaction = make_response_result("");
+    compaction.stop = STOP_TYPE_EOS;
+    compaction.generation_params.responses_compaction = true;
+    compaction.oaicompat_msg.reasoning_content = "Summarizing.";
+    compaction.oai_resp_compaction_content = "Current goal and progress.";
+    if (!check_end_turn(compaction, false, "compaction EOS")) {
+        return 1;
+    }
+
     server_task_result_cmpl_partial reasoning_chunk {};
     reasoning_chunk.is_updated = true;
     reasoning_chunk.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
