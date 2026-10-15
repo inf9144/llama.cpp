@@ -47,7 +47,160 @@ static std::string streamed_message_phase(const json & events) {
     return {};
 }
 
+// Codex replays every Responses output item in subsequent sampling requests.
+// Distinct reasoning-only responses must survive the Responses -> Chat bridge.
+static bool test_responses_reasoning_replay() {
+    auto reasoning_item = [](const std::string & text) {
+        return json {
+            {"type", "reasoning"},
+            {"summary", json::array()},
+            {"content", json::array({json {
+                {"type", "reasoning_text"},
+                {"text", text},
+            }})},
+        };
+    };
+    auto tool_call = [](const std::string & id) {
+        return json {
+            {"type", "function_call"},
+            {"call_id", id},
+            {"name", "exec_command"},
+            {"arguments", R"({"cmd":"pwd"})"},
+        };
+    };
+    auto tool_result = [](const std::string & id) {
+        return json {
+            {"type", "function_call_output"},
+            {"call_id", id},
+            {"output", "/work"},
+        };
+    };
+    auto start_input = []() {
+        return json::array({json {
+            {"role", "user"},
+            {"content", "Complete the task."},
+        }});
+    };
+    auto replay = [](const json & input) -> json {
+        return server_chat_convert_responses_to_chatcmpl(json {
+            {"input", input},
+        }).at("messages");
+    };
+    auto failed = [](const char * scenario) {
+        std::cerr << "Responses reasoning replay failed: " << scenario << "\n";
+        return false;
+    };
+
+    // 1. Reasoning A -> Reasoning B: neither block may be replaced.
+    auto input = start_input();
+    input.push_back(reasoning_item("Reasoning A"));
+    input.push_back(reasoning_item("Reasoning B"));
+    const json consecutive = replay(input);
+    if (consecutive.size() != 2 ||
+        consecutive[1].at("role") != "assistant" ||
+        consecutive[1].at("reasoning_content") != "Reasoning A\n\nReasoning B" ||
+        !consecutive[1].at("content").empty()) {
+        return failed("A -> B");
+    }
+
+    // 2. Reasoning A -> Reasoning B + Tool-Call: the call belongs to
+    // the same assistant message as both reasoning segments.
+    input.push_back(tool_call("call_b"));
+    const json with_tool = replay(input);
+    if (with_tool.size() != 2 ||
+        with_tool[1].at("reasoning_content") != "Reasoning A\n\nReasoning B" ||
+        with_tool[1].at("tool_calls").size() != 1 ||
+        with_tool[1].at("tool_calls")[0].at("id") != "call_b" ||
+        with_tool[1].at("tool_calls")[0].at("function").at("name") != "exec_command") {
+        return failed("A -> B + tool call");
+    }
+
+    // 3. A -> B + Call -> Result -> C + Call: a tool result creates
+    // a hard boundary. C must not be attached to A/B.
+    input.push_back(tool_result("call_b"));
+    input.push_back(reasoning_item("Reasoning C"));
+    input.push_back(tool_call("call_c"));
+    const json separated = replay(input);
+    if (separated.size() != 4 ||
+        separated[1].at("reasoning_content") != "Reasoning A\n\nReasoning B" ||
+        separated[1].at("tool_calls")[0].at("id") != "call_b" ||
+        separated[2].at("role") != "tool" ||
+        separated[2].at("tool_call_id") != "call_b" ||
+        separated[2].at("content") != "/work" ||
+        separated[3].at("role") != "assistant" ||
+        separated[3].at("reasoning_content") != "Reasoning C" ||
+        separated[3].at("tool_calls")[0].at("id") != "call_c") {
+        return failed("A -> B + tool -> tool result -> C + tool");
+    }
+
+    // 4. Long autonomous reasoning-only continuation chain: verify
+    // every block remains in order, with no intervening user messages.
+    json long_input = start_input();
+    std::string expected_reasoning;
+    for (int i = 0; i < 256; ++i) {
+        const std::string segment = "Reasoning segment " + std::to_string(i);
+        long_input.push_back(reasoning_item(segment));
+        if (!expected_reasoning.empty()) {
+            expected_reasoning += "\n\n";
+        }
+        expected_reasoning += segment;
+    }
+    long_input.push_back(tool_call("call_long"));
+    const json long_replay = replay(long_input);
+    if (long_replay.size() != 2 ||
+        long_replay[1].at("reasoning_content") != expected_reasoning ||
+        long_replay[1].at("tool_calls").size() != 1 ||
+        long_replay[1].at("tool_calls")[0].at("id") != "call_long") {
+        return failed("256 reasoning-only continuations");
+    }
+
+    // Existing assistant output text still merges with the reasoning.
+    json final_input = start_input();
+    final_input.push_back(reasoning_item("Reasoning A"));
+    final_input.push_back(reasoning_item("Reasoning B"));
+    final_input.push_back(json {
+        {"type", "message"},
+        {"role", "assistant"},
+        {"content", json::array({json {
+            {"type", "output_text"},
+            {"text", "Final answer."},
+        }})},
+    });
+    const json final_replay = replay(final_input);
+    if (final_replay.size() != 2 ||
+        final_replay[1].at("reasoning_content") != "Reasoning A\n\nReasoning B" ||
+        final_replay[1].at("content").size() != 1 ||
+        final_replay[1].at("content")[0].at("text") != "Final answer.") {
+        return failed("reasoning -> final answer");
+    }
+
+    // Existing compaction behavior also remains a message boundary.
+    json compact_input = start_input();
+    compact_input.push_back(reasoning_item("Reasoning before compaction"));
+    compact_input.push_back(json {
+        {"type", "compaction"},
+        {"encrypted_content", "llama.cpp.compaction.v1\nCheckpoint"},
+    });
+    compact_input.push_back(reasoning_item("Reasoning after compaction"));
+    compact_input.push_back(tool_call("call_after_compaction"));
+    const json compact_replay = replay(compact_input);
+    if (compact_replay.size() != 4 ||
+        compact_replay[1].at("reasoning_content") != "Reasoning before compaction" ||
+        compact_replay[2].at("role") != "user" ||
+        compact_replay[2].at("content") != "<context_compaction>\nCheckpoint\n</context_compaction>" ||
+        compact_replay[3].at("reasoning_content") != "Reasoning after compaction" ||
+        compact_replay[3].at("tool_calls")[0].at("id") != "call_after_compaction") {
+        return failed("reasoning and compaction boundary");
+    }
+
+    return true;
+}
+
 int main() {
+    if (!test_responses_reasoning_replay()) {
+        return 1;
+    }
+
     // Codex sends automatic thread-title requests as Responses structured
     // output. The bridge must preserve the schema for llama.cpp's grammar.
     const json title_schema = {
