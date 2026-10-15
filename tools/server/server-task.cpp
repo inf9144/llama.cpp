@@ -171,6 +171,18 @@ static std::string server_task_response_message_phase(const common_chat_msg & ms
     return msg.tool_calls.empty() ? "final_answer" : "commentary";
 }
 
+// Codex treats end_turn=false as a request to continue the same agent turn.
+// An EOS after reasoning alone is not a final answer or a tool invocation.
+static bool server_task_response_needs_continuation(
+        const server_task_result_cmpl_final & result,
+        const common_chat_msg & msg) {
+    return result.stop == STOP_TYPE_EOS &&
+           !result.generation_params.responses_compaction &&
+           !msg.reasoning_content.empty() &&
+           msg.content.empty() &&
+           msg.tool_calls.empty();
+}
+
 //
 // task_params
 //
@@ -757,6 +769,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         }},
     };
 
+    if (server_task_response_needs_continuation(*this, msg)) {
+        res["end_turn"] = false;
+    }
+
     return res;
 }
 
@@ -913,6 +929,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
+    }
+
+    if (server_task_response_needs_continuation(*this, oaicompat_msg)) {
+        server_sent_events.back().at("data").at("response")["end_turn"] = false;
     }
 
     return server_sent_events;
