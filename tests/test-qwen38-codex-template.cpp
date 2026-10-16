@@ -169,8 +169,8 @@ int main() {
         return 1;
     }
 
-    const std::string before_prefix = prefix_before_first_user(before.prompt);
-    const std::string after_prefix = prefix_before_first_user(after.prompt);
+    const std::string before_prefix = prefix_before_first_user(before.prompt.str());
+    const std::string after_prefix = prefix_before_first_user(after.prompt.str());
 
     if (before_prefix != after_prefix) {
         std::cerr << "Codex system/tools prefix changed after tool-call history removal\n";
@@ -192,14 +192,14 @@ int main() {
 
     const std::string rendered_user =
         "<|im_start|>user\n" + user_content + "<|im_end|>\n";
-    if (before.prompt.find(rendered_user) == std::string::npos) {
+    if (before.prompt.str().find(rendered_user) == std::string::npos) {
         std::cerr << "Literal XML delimiter text in a user message was not preserved byte-for-byte\n";
         return 1;
     }
 
     const std::string rendered_command =
         "{\"name\": \"shell_command\", \"arguments\": {\"command\": " + encoded_shell_command;
-    if (before.prompt.find(rendered_command) == std::string::npos) {
+    if (before.prompt.str().find(rendered_command) == std::string::npos) {
         std::cerr << "Historical string arguments were not JSON-escaped in the JSON tool-call rendering\n";
         return 1;
     }
@@ -208,8 +208,7 @@ int main() {
     // generates after the already-prefilled '<think>\n', so this string starts
     // with reasoning content and then closes the thinking block before the call.
     common_chat_parser_params parser_params(before);
-    parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    parser_params.parser.load(before.parser);
+    parser_params.parser = before.parser;
 
     const std::string generated =
         "Inspecting the requested file.\n</think>\n\n"
@@ -217,7 +216,7 @@ int main() {
         "{\"name\":\"shell_command\",\"arguments\":{\"command\":" + encoded_shell_command +
         "}}\n</tool_call>";
 
-    const common_chat_msg parsed = common_chat_parse(generated, false, parser_params);
+    const common_chat_msg parsed = common_chat_parse(common_chat_input(generated), false, parser_params);
     if (parsed.tool_calls.size() != 1 || parsed.tool_calls[0].name != "shell_command") {
         std::cerr << "Qwen3-Coder PEG parser did not recover the shell_command tool call\n";
         return 1;
@@ -271,8 +270,7 @@ int main() {
     }
 
     common_chat_parser_params custom_parser_params(custom_params);
-    custom_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    custom_parser_params.parser.load(custom_params.parser);
+    custom_parser_params.parser = custom_params.parser;
 
     const std::string generated_custom =
         "Preparing a literal delimiter patch.\n</think>\n\n"
@@ -280,7 +278,7 @@ int main() {
         "{\"name\":\"apply_patch\",\"arguments\":{\"input\":" + encoded_custom_input +
         "}}\n</tool_call>";
 
-    const common_chat_msg parsed_custom = common_chat_parse(generated_custom, false, custom_parser_params);
+    const common_chat_msg parsed_custom = common_chat_parse(common_chat_input(generated_custom), false, custom_parser_params);
     if (parsed_custom.tool_calls.size() != 1 || parsed_custom.tool_calls[0].name != "apply_patch") {
         std::cerr << "Qwen3-Coder PEG parser did not recover the custom/freeform tool call\n";
         return 1;
@@ -325,13 +323,13 @@ int main() {
     };
     const common_chat_params historical_custom = common_chat_templates_apply(tmpls.get(), custom_inputs);
     const std::string historical_marker = "{\"name\": \"apply_patch\", \"arguments\": {\"input\": ";
-    const size_t historical_begin = historical_custom.prompt.find(historical_marker);
+    const size_t historical_begin = historical_custom.prompt.str().find(historical_marker);
     if (historical_begin == std::string::npos) {
         std::cerr << "Historical custom/freeform replay did not render an input argument\n";
         return 1;
     }
     const size_t historical_value_begin = historical_begin + historical_marker.size();
-    const size_t historical_end = historical_custom.prompt.find("\"}}\n</tool_call>", historical_value_begin);
+    const size_t historical_end = historical_custom.prompt.str().find("\"}}\n</tool_call>", historical_value_begin);
     if (historical_end == std::string::npos) {
         std::cerr << "Historical custom/freeform replay did not close the input argument\n";
         return 1;
@@ -340,7 +338,7 @@ int main() {
     json historical_value;
     try {
         historical_value = json::parse(
-            historical_custom.prompt.substr(historical_value_begin, historical_end - historical_value_begin + 1));
+            historical_custom.prompt.str().substr(historical_value_begin, historical_end - historical_value_begin + 1));
     } catch (const std::exception & e) {
         std::cerr << "Historical custom/freeform input leaked through JSON framing: " << e.what() << "\n";
         return 1;
@@ -413,8 +411,7 @@ int main() {
     }
 
     common_chat_parser_params guarded_parser_params(guarded_params);
-    guarded_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    guarded_parser_params.parser.load(guarded_params.parser);
+    guarded_parser_params.parser = guarded_params.parser;
 
     auto guarded_parser_accepts = [&](const std::string & input) {
         const std::string generated_guarded =
@@ -425,7 +422,7 @@ int main() {
 
         try {
             const common_chat_msg parsed_guarded =
-                common_chat_parse(generated_guarded, false, guarded_parser_params);
+                common_chat_parse(common_chat_input(generated_guarded), false, guarded_parser_params);
             return parsed_guarded.tool_calls.size() == 1 &&
                    parsed_guarded.tool_calls[0].name == "apply_patch";
         } catch (const std::exception &) {
@@ -547,8 +544,8 @@ int main() {
     const common_chat_params json_wire_params =
         common_chat_templates_apply(tmpls.get(), json_wire_inputs);
 
-    if (json_wire_params.prompt.find(json_tool_instruction) == std::string::npos ||
-        json_wire_params.prompt.find(xml_tool_instruction) != std::string::npos) {
+    if (json_wire_params.prompt.str().find(json_tool_instruction) == std::string::npos ||
+        json_wire_params.prompt.str().find(xml_tool_instruction) != std::string::npos) {
         std::cerr << "Explicit JSON tool-call mode did not render matching Qwen instructions\n";
         return 1;
     }
@@ -587,8 +584,7 @@ int main() {
     }
 
     common_chat_parser_params json_wire_parser_params(json_wire_params);
-    json_wire_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    json_wire_parser_params.parser.load(json_wire_params.parser);
+    json_wire_parser_params.parser = json_wire_params.parser;
 
     const std::string json_exec_command =
         "printf '%s\\n' '</parameter>' '</tool_call>'";
@@ -605,7 +601,7 @@ int main() {
         "}}\n</tool_call>";
 
     const common_chat_msg parsed_json_tools =
-        common_chat_parse(generated_json_tools, false, json_wire_parser_params);
+        common_chat_parse(common_chat_input(generated_json_tools), false, json_wire_parser_params);
     if (parsed_json_tools.tool_calls.size() != 2 ||
         parsed_json_tools.tool_calls[0].name != "exec_command" ||
         parsed_json_tools.tool_calls[1].name != "apply_patch") {
@@ -888,25 +884,24 @@ int main() {
         std::cerr << "Deferred tool expansion changed the Qwen generation prefix\n";
         return 1;
     }
-    const std::string stable_prefix = prefix_before_first_user(stable_params.prompt);
+    const std::string stable_prefix = prefix_before_first_user(stable_params.prompt.str());
     if (stable_prefix.find("mcp__calendar.create_event") != std::string::npos) {
         std::cerr << "Deferred tool polluted the cache-stable Qwen system/tools prefix\n";
         return 1;
     }
-    if (stable_params.prompt.find("mcp__calendar.create_event") == std::string::npos) {
+    if (stable_params.prompt.str().find("mcp__calendar.create_event") == std::string::npos) {
         std::cerr << "Deferred tool was not visible in the chronological tool_search result\n";
         return 1;
     }
 
     common_chat_parser_params deferred_parser(expanded_parser_params);
-    deferred_parser.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    deferred_parser.parser.load(expanded_parser_params.parser);
+    deferred_parser.parser = expanded_parser_params.parser;
     const std::string generated_deferred =
         "Using the discovered calendar tool.\n</think>\n\n"
         "<tool_call>\n"
         "{\"name\":\"mcp__calendar.create_event\",\"arguments\":{\"title\":\"Lunch\"}}\n"
         "</tool_call>";
-    const auto parsed_deferred = common_chat_parse(generated_deferred, false, deferred_parser);
+    const auto parsed_deferred = common_chat_parse(common_chat_input(generated_deferred), false, deferred_parser);
     if (parsed_deferred.tool_calls.size() != 1 ||
         parsed_deferred.tool_calls[0].name != "mcp__calendar.create_event") {
         std::cerr << "Expanded parser did not accept the deferred MCP tool\n";
@@ -1015,52 +1010,52 @@ int main() {
 
     const std::vector<common_chat_msg> simple_reasoning_messages = { system, user };
     const auto default_reasoning = render_reasoning(simple_reasoning_messages, "", true, true);
-    if (default_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+    if (default_reasoning.prompt.str().find("Reasoning effort is set to ") != std::string::npos) {
         std::cerr << "Qwen-based Codex default reasoning effort was not the unsteered medium mode\n";
         return 1;
     }
-    if (!ends_with(default_reasoning.prompt, "<|im_start|>assistant\n<think>\n")) {
+    if (!ends_with(default_reasoning.prompt.str(), "<|im_start|>assistant\n<think>\n")) {
         std::cerr << "Thinking-enabled Qwen3.8 generation prompt did not leave <think> open\n";
         return 1;
     }
 
     const auto medium_reasoning = render_reasoning(simple_reasoning_messages, "medium", true, true);
-    if (medium_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+    if (medium_reasoning.prompt.str().find("Reasoning effort is set to ") != std::string::npos) {
         std::cerr << "Qwen3.8 medium reasoning effort unexpectedly injected steering\n";
         return 1;
     }
 
     const auto explicit_high = render_reasoning(simple_reasoning_messages, "high", true, true);
-    if (explicit_high.prompt.find(high_reasoning_instruction) == std::string::npos) {
+    if (explicit_high.prompt.str().find(high_reasoning_instruction) == std::string::npos) {
         std::cerr << "Qwen3.8 high reasoning effort lost bounded reasoning steering\n";
         return 1;
     }
 
     for (const std::string effort : {"low", "minimal"}) {
         const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
-        if (params.prompt.find(low_reasoning_instruction) == std::string::npos) {
+        if (params.prompt.str().find(low_reasoning_instruction) == std::string::npos) {
             std::cerr << "Qwen3.8 low/minimal reasoning alias did not use low steering\n";
             return 1;
         }
     }
     for (const std::string effort : {"xhigh", "max", "ultra"}) {
         const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
-        if (params.prompt.find(xhigh_reasoning_instruction) == std::string::npos) {
+        if (params.prompt.str().find(xhigh_reasoning_instruction) == std::string::npos) {
             std::cerr << "Qwen3.8 xhigh/max/ultra reasoning alias did not use xhigh steering\n";
             return 1;
         }
     }
     for (const std::string effort : {"none", "off"}) {
         const auto params = render_reasoning(simple_reasoning_messages, effort, true, true);
-        if (!ends_with(params.prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
-            params.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+        if (!ends_with(params.prompt.str(), "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
+            params.prompt.str().find("Reasoning effort is set to ") != std::string::npos) {
             std::cerr << "Qwen3.8 none/off reasoning alias did not disable thinking canonically\n";
             return 1;
         }
     }
     const auto disabled_reasoning = render_reasoning(simple_reasoning_messages, "high", false, true);
-    if (!ends_with(disabled_reasoning.prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
-        disabled_reasoning.prompt.find("Reasoning effort is set to ") != std::string::npos) {
+    if (!ends_with(disabled_reasoning.prompt.str(), "<|im_start|>assistant\n<think>\n\n</think>\n\n") ||
+        disabled_reasoning.prompt.str().find("Reasoning effort is set to ") != std::string::npos) {
         std::cerr << "Explicitly disabled Qwen3.8 thinking did not use the canonical closed block\n";
         return 1;
     }
@@ -1087,7 +1082,7 @@ int main() {
 
     const auto preserved_reasoned = render_reasoning(
         { system, user, historical_reasoned, later_user }, "medium", true, true);
-    if (preserved_reasoned.prompt.find(
+    if (preserved_reasoned.prompt.str().find(
             "<|im_start|>assistant\n<think>\nPrior reasoning.\n</think>\n\nPrior answer.<|im_end|>\n") == std::string::npos) {
         std::cerr << "Non-empty historical Qwen3.8 reasoning was not preserved\n";
         return 1;
@@ -1095,7 +1090,7 @@ int main() {
 
     const auto preserved_empty = render_reasoning(
         { system, user, historical_empty, later_user }, "medium", true, true);
-    if (preserved_empty.prompt.find(
+    if (preserved_empty.prompt.str().find(
             "<|im_start|>assistant\n<think>\n\n</think>\n\nNo hidden reasoning.<|im_end|>\n") == std::string::npos) {
         std::cerr << "Canonical empty historical Qwen3.8 thinking block was not preserved\n";
         return 1;
@@ -1103,10 +1098,10 @@ int main() {
 
     const auto stripped_history = render_reasoning(
         { system, user, historical_reasoned, later_user }, "medium", true, false);
-    if (stripped_history.prompt.find("Prior reasoning.") != std::string::npos ||
-        stripped_history.prompt.find(
+    if (stripped_history.prompt.str().find("Prior reasoning.") != std::string::npos ||
+        stripped_history.prompt.str().find(
             "<|im_start|>assistant\n<think>\n\n</think>\n\nPrior answer.") != std::string::npos ||
-        stripped_history.prompt.find(
+        stripped_history.prompt.str().find(
             "<|im_start|>assistant\nPrior answer.<|im_end|>\n") == std::string::npos) {
         std::cerr << "preserve_reasoning=false synthesized or retained old thinking history\n";
         return 1;
@@ -1122,7 +1117,7 @@ int main() {
     });
     const auto latest_preserved = render_reasoning(
         { system, user, latest_tool_reasoning }, "medium", true, false);
-    if (latest_preserved.prompt.find(
+    if (latest_preserved.prompt.str().find(
             "<|im_start|>assistant\n<think>\nLatest tool reasoning.\n</think>\n\n") == std::string::npos) {
         std::cerr << "Latest agent-loop reasoning was stripped despite preserve_reasoning=false\n";
         return 1;
