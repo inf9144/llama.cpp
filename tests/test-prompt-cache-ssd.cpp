@@ -231,6 +231,67 @@ static void test_corrupt(const std::string & dir) {
     CHECK(!std::filesystem::exists(valid_path), "truncated file removed");
 }
 
+// test that snapshots written by an older format version are invalidated, not reinterpreted
+static void test_version_mismatch(const std::string & dir) {
+    const auto fp = make_fp();
+    server_prompt_cache_ssd cache(dir, 0);
+    CHECK(cache.init(fp), "init");
+
+    const std::string mdir = cache.model_dir();
+
+    // write a file with a valid magic but an old format version (1 < current)
+    const std::string old_path = mdir + "/oldversionoldversionoldversion.lsc";
+    {
+        std::ofstream f(old_path, std::ios::binary);
+        const uint32_t magic   = 0x5343504c;  // SSD_MAGIC
+        const uint32_t version = 1;          // older than the current SSD_VERSION
+        f.write(reinterpret_cast<const char *>(&magic),   sizeof(magic));
+        f.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    }
+
+    // re-init, the old-version file must be removed, not indexed
+    server_prompt_cache_ssd cache2(dir, 0);
+    CHECK(cache2.init(fp), "init2");
+    CHECK(!std::filesystem::exists(old_path), "old-version file removed");
+    CHECK(cache2.n_entries() == 0, "old-version file not indexed");
+}
+
+// test the RAM tier behavior that triggers the SSD fallback in server_slot::prompt_save():
+// an oversized state makes alloc() fail without being reported as cached, and RAM
+// eviction saves the evicted entry to the SSD tier
+static void test_ram_limit_ssd_fallback(const std::string & dir) {
+    const auto fp = make_fp();
+    server_prompt_cache_ssd ssd(dir, 0);
+    CHECK(ssd.init(fp), "ssd init");
+
+    // 1 MiB RAM limit
+    server_prompt_cache ram(1, 0, &ssd);
+
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens({1, 2, 3, 4, 5}), false);
+
+    // a state larger than the RAM limit: alloc() must fail
+    const size_t size_too_big = 2 * 1024 * 1024;  // 2 MiB > 1 MiB limit
+    CHECK(ram.alloc(prompt, size_too_big, 0) == nullptr, "alloc fails for oversized state");
+    CHECK(!ram.is_in_cache(prompt), "oversized state not reported as cached");
+
+    // a state that fits: alloc() succeeds and the prompt becomes cached
+    const size_t size_half = 600 * 1024;  // 600 KiB
+    auto * st = ram.alloc(prompt, size_half, 0);
+    CHECK(st != nullptr, "alloc succeeds for fitting state");
+    CHECK(ram.is_in_cache(prompt), "state reported as cached");
+
+    // a second alloc for the same prompt: already cached, returns nullptr
+    CHECK(ram.alloc(prompt, size_half, 0) == nullptr, "second alloc returns nullptr (already cached)");
+
+    // a second, unrelated state: together they exceed the limit, so the first is evicted to SSD
+    server_prompt prompt2;
+    prompt2.tokens = server_tokens(llama_tokens({9, 8, 7, 6, 5}), false);
+    auto * st2 = ram.alloc(prompt2, size_half, 0);
+    CHECK(st2 != nullptr, "alloc succeeds for second state");
+    CHECK(ssd.n_entries() == 1, "evicted state saved to SSD");
+}
+
 // test temp file cleanup
 static void test_tmp_cleanup(const std::string & dir) {
     const auto fp = make_fp();
@@ -275,6 +336,16 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir4);
     test_corrupt(dir4);
     std::filesystem::remove_all(dir4);
+
+    const std::string dir4c = make_temp_dir() + "-version";
+    std::filesystem::create_directories(dir4c);
+    test_version_mismatch(dir4c);
+    std::filesystem::remove_all(dir4c);
+
+    const std::string dir4d = make_temp_dir() + "-ram-limit";
+    std::filesystem::create_directories(dir4d);
+    test_ram_limit_ssd_fallback(dir4d);
+    std::filesystem::remove_all(dir4d);
 
     const std::string dir4b = make_temp_dir() + "-fp-lora-swa";
     std::filesystem::create_directories(dir4b);

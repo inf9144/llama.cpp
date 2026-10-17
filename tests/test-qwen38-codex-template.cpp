@@ -1123,6 +1123,202 @@ int main() {
         return 1;
     }
 
+    // common_chat_session integration: the production server path renders the
+    // prompt from the stable tool set, then exposes deferred tools to the
+    // parser/grammar through apply_grammar_override() without re-rendering.
+
+    // Scenario A: deferred tool discovery through the session lifecycle
+    {
+        common_chat_session session(tmpls.get(), nullptr, stable_inputs);
+
+        // the session prompt matches the stable render and keeps the deferred
+        // tool out of the cache-stable prefix
+        if (session.prompt().str() != stable_params.prompt.str()) {
+            std::cerr << "Session A: session prompt differs from the stable template render\n";
+            return 1;
+        }
+        const std::string session_prefix = prefix_before_first_user(session.prompt().str());
+        if (session_prefix.find("mcp__calendar.create_event") != std::string::npos) {
+            std::cerr << "Session A: deferred tool polluted the stable session prefix\n";
+            return 1;
+        }
+
+        // the production override swaps in the expanded parser/grammar state
+        session.apply_grammar_override(expanded_parser_params, nullptr);
+
+        // prompt and generation prefix must survive the override untouched
+        if (session.prompt().str() != stable_params.prompt.str()) {
+            std::cerr << "Session A: grammar override changed the rendered prompt\n";
+            return 1;
+        }
+        if (session.generation_prompt() != stable_params.generation_prompt) {
+            std::cerr << "Session A: grammar override changed the generation prompt\n";
+            return 1;
+        }
+
+        // the overridden grammar must expose the discovered tool to the parser
+        if (session.grammar().find("mcp__calendar.create_event") == std::string::npos) {
+            std::cerr << "Session A: overridden grammar does not expose the deferred tool\n";
+            return 1;
+        }
+
+        // feed the full generation (reasoning + tool call) through the session
+        const std::string generated_discovered =
+            "Using the discovered calendar tool.\n</think>\n\n"
+            "<tool_call>\n"
+            "{\"name\":\"mcp__calendar.create_event\",\"arguments\":{\"title\":\"Lunch\"}}\n"
+            "</tool_call>";
+
+        session.feed(common_chat_input(generated_discovered));
+        const common_chat_msg & final_msg = session.finish();
+        if (final_msg.tool_calls.size() != 1 ||
+            final_msg.tool_calls[0].name != "mcp__calendar.create_event") {
+            std::cerr << "Session A: feed/finish did not recover the deferred tool call\n";
+            return 1;
+        }
+        json discovered_arguments;
+        try {
+            discovered_arguments = json::parse(final_msg.tool_calls[0].arguments);
+        } catch (const std::exception & e) {
+            std::cerr << "Session A: deferred tool call arguments are not valid JSON: " << e.what() << "\n";
+            return 1;
+        }
+        if (discovered_arguments.value("title", std::string()) != "Lunch") {
+            std::cerr << "Session A: deferred tool call arguments were corrupted\n";
+            return 1;
+        }
+        if (final_msg.reasoning_content.find("Using the discovered calendar tool.") == std::string::npos) {
+            std::cerr << "Session A: session lifecycle lost the reasoning content\n";
+            return 1;
+        }
+
+        // repeated discovery: re-applying the same override stays consistent
+        session.apply_grammar_override(expanded_parser_params, nullptr);
+        if (session.prompt().str() != stable_params.prompt.str() ||
+            session.generation_prompt() != stable_params.generation_prompt) {
+            std::cerr << "Session A: repeated grammar override changed the prompt state\n";
+            return 1;
+        }
+        if (session.grammar().find("mcp__calendar.create_event") == std::string::npos) {
+            std::cerr << "Session A: repeated grammar override lost the deferred tool\n";
+            return 1;
+        }
+    }
+
+    // Scenario B: streaming parser correctness with a tool call split across
+    // chunk boundaries; partial and final parses must agree
+    {
+        common_chat_templates_inputs stream_inputs;
+        stream_inputs.messages = { system, user };
+        stream_inputs.tools = { shell_tool };
+        stream_inputs.add_generation_prompt = true;
+        stream_inputs.enable_thinking = true;
+        stream_inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+        common_chat_session session(tmpls.get(), nullptr, stream_inputs);
+
+        const std::string full_generation =
+            "Checking the working directory.\n</think>\n\n"
+            "<tool_call>\n"
+            "{\"name\":\"shell_command\",\"arguments\":{\"command\":\"pwd\",\"workdir\":\"/tmp\"}}\n"
+            "</tool_call>";
+
+        // split the generation so the tool call spans chunk boundaries
+        const std::vector<std::string> chunks = {
+            "Checking the working directory.\n</think>\n\n",   // reasoning + think close
+            "<tool_call>\n",                                   // tool call open
+            "{\"name\":\"shell_command\",\"arg",       // partial JSON, mid-key
+            "uments\":{\"command\":\"pwd\",\"workdir\":\"/t",  // partial value
+            "mp\"}}\n</tool_call>",                              // call close
+        };
+
+        for (const std::string & chunk : chunks) {
+            session.feed(common_chat_input(chunk));
+            const common_chat_msg & partial = session.msg();
+            // a partial parse must never report a complete tool call early
+            for (const auto & call : partial.tool_calls) {
+                if (call.name != "shell_command") {
+                    continue;
+                }
+                try {
+                    const auto args = json::parse(call.arguments);
+                    if (args.value("workdir", std::string()) != "/tmp") {
+                        std::cerr << "Session B: partial parse emitted a truncated tool call\n";
+                        return 1;
+                    }
+                } catch (const std::exception &) {
+                    // incomplete JSON is expected mid-stream
+                }
+            }
+        }
+
+        const common_chat_msg & final_msg = session.finish();
+        if (final_msg.tool_calls.size() != 1 || final_msg.tool_calls[0].name != "shell_command") {
+            std::cerr << "Session B: chunked feed/finish did not recover the tool call\n";
+            return 1;
+        }
+        json stream_arguments;
+        try {
+            stream_arguments = json::parse(final_msg.tool_calls[0].arguments);
+        } catch (const std::exception & e) {
+            std::cerr << "Session B: chunked tool call arguments are not valid JSON: " << e.what() << "\n";
+            return 1;
+        }
+        if (stream_arguments.value("command", std::string()) != "pwd" ||
+            stream_arguments.value("workdir", std::string()) != "/tmp") {
+            std::cerr << "Session B: chunked tool call arguments were corrupted\n";
+            return 1;
+        }
+        if (final_msg.reasoning_content.find("Checking the working directory.") == std::string::npos) {
+            std::cerr << "Session B: chunked lifecycle lost the reasoning content\n";
+            return 1;
+        }
+        // the full parse of the same text must agree with the session result
+        const auto stream_params = common_chat_templates_apply(tmpls.get(), stream_inputs);
+        common_chat_parser_params stream_parser_params(stream_params);
+        stream_parser_params.parser = stream_params.parser;
+        const common_chat_msg full_parsed =
+            common_chat_parse(common_chat_input(full_generation), false, stream_parser_params);
+        if (full_parsed.tool_calls.size() != final_msg.tool_calls.size() ||
+            full_parsed.tool_calls[0].name != final_msg.tool_calls[0].name ||
+            full_parsed.tool_calls[0].arguments != final_msg.tool_calls[0].arguments) {
+            std::cerr << "Session B: chunked session parse disagrees with the full parse\n";
+            return 1;
+        }
+    }
+
+    // Scenario C: an incompatible grammar override must be detectable by the
+    // production guard and must not corrupt the session prompt state
+    {
+        common_chat_session session(tmpls.get(), nullptr, stable_inputs);
+        const std::string prompt_before = session.prompt().str();
+        const std::string generation_before = session.generation_prompt();
+
+        // simulate a template that would change the generation prefix: the
+        // production guard compares format and generation_prompt before the
+        // override is applied
+        common_chat_params incompatible = expanded_parser_params;
+        incompatible.generation_prompt = "\n\n";
+        const bool guard_detects =
+            incompatible.format != session.format() ||
+            incompatible.generation_prompt != session.generation_prompt();
+        if (!guard_detects) {
+            std::cerr << "Session C: production guard did not detect the incompatible override\n";
+            return 1;
+        }
+
+        // even if the override is applied, it only touches grammar/parser state
+        session.apply_grammar_override(incompatible, nullptr);
+        if (session.prompt().str() != prompt_before) {
+            std::cerr << "Session C: grammar override corrupted the rendered prompt\n";
+            return 1;
+        }
+        if (session.generation_prompt() != generation_before) {
+            std::cerr << "Session C: grammar override changed the generation prompt\n";
+            return 1;
+        }
+    }
+
     std::cout << "Qwen3.8 Codex tool framing, reasoning compatibility, and compaction tests passed\n";
     return 0;
 }

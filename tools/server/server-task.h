@@ -740,7 +740,8 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     // save the current slot state into the RAM cache, called only when the slot is about to be replaced
-    void save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // returns true when the state is now in the RAM tier or was written to the SSD tier
+    bool save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };

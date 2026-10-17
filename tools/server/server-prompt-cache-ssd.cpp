@@ -12,7 +12,10 @@
 
 namespace {
 constexpr uint32_t SSD_MAGIC   = 0x5343504c;  // "LPCS"
-constexpr uint32_t SSD_VERSION = 1;
+// bumped to 2 after the upstream merge: the serialized sequence-state layout is
+// not covered by the fingerprint, so snapshots written by the previous build are
+// invalidated instead of being silently reinterpreted
+constexpr uint32_t SSD_VERSION = 2;
 constexpr const char * SSD_EXT = ".lsc";
 constexpr const char * SSD_TMP_EXT = ".lsc.tmp";
 

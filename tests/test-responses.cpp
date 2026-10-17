@@ -1,7 +1,10 @@
 #include "server-chat.h"
 #include "server-task.h"
+#include "chat.h"
 
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 static server_task_result_cmpl_final make_response_result(const std::string & content) {
@@ -196,8 +199,280 @@ static bool test_responses_reasoning_replay() {
     return true;
 }
 
+// Integration: feed synthetic generation text through the production session
+// parser, then through the Responses finalization path. This proves the updated
+// session parser yields the expected end_turn result when the model ends after
+// reasoning only, without any model inference.
+static bool test_responses_reasoning_parser_integration() {
+    const std::string template_path = "models/templates/llama-cpp-qwen-based-codex.jinja";
+    std::ifstream file(template_path, std::ios::binary);
+    if (!file) {
+        std::cerr << "failed to open template: " << template_path << "\n";
+        return false;
+    }
+    const std::string template_text = std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, template_text));
+
+    common_chat_tool shell_tool;
+    shell_tool.name = "shell_command";
+    shell_tool.description = "Runs a shell command";
+    shell_tool.parameters = R"({"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"}},"required":["command"]})";
+
+    common_chat_msg system;
+    system.role = "system";
+    system.content = "Stable Codex instructions.";
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "Initial user request.";
+
+    // feed `generated` through the production session parser, then finalize it as a
+    // Responses result with the given stop type and compaction flag
+    struct gen_out {
+        json response;
+        json events;
+        common_chat_msg msg;
+    };
+    auto run_generation = [&](const std::string & generated, stop_type stop, bool compaction) -> gen_out {
+        common_chat_templates_inputs inputs;
+        inputs.messages = { system, user };
+        inputs.tools = { shell_tool };
+        inputs.add_generation_prompt = true;
+        inputs.enable_thinking = true;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+        common_chat_session session(tmpls.get(), nullptr, inputs);
+        session.feed(common_chat_input(generated));
+        const common_chat_msg & msg = session.finish();
+
+        server_task_result_cmpl_final result {};
+        result.oaicompat_model = "test-model";
+        result.oai_resp_id = "resp_test";
+        result.stop = stop;
+        result.generation_params.responses_compaction = compaction;
+        result.oai_resp_compaction_content = compaction ? "Current goal and progress." : "";
+        result.oaicompat_msg = msg;
+
+        return gen_out { result.to_json_oaicompat_resp(), result.to_json_oaicompat_resp_stream(), msg };
+    };
+
+    auto end_turn_false = [](const json & response, const json & events) {
+        const json & streamed = events.back().at("data").at("response");
+        return response.value("end_turn", true) == false &&
+               streamed.value("end_turn", true) == false;
+    };
+    auto end_turn_true = [](const json & response, const json & events) {
+        const json & streamed = events.back().at("data").at("response");
+        return response.value("end_turn", true) == true &&
+               streamed.value("end_turn", true) == true;
+    };
+
+    // 1. Reasoning-only followed by EOS: a completed request, but Codex must continue
+    {
+        auto r = run_generation("Need to keep working.\n</think>\n\n", STOP_TYPE_EOS, false);
+        if (!end_turn_false(r.response, r.events)) {
+            std::cerr << "Integration: reasoning-only EOS did not set end_turn=false\n";
+            return false;
+        }
+        if (r.msg.reasoning_content.find("Need to keep working.") == std::string::npos ||
+            !r.msg.content.empty() || !r.msg.tool_calls.empty()) {
+            std::cerr << "Integration: reasoning-only EOS parser produced unexpected content\n";
+            return false;
+        }
+        if (r.response.at("status") != "completed" ||
+            r.response.at("output").size() != 1 ||
+            r.response.at("output")[0].value("type", std::string()) != "reasoning") {
+            std::cerr << "Integration: reasoning-only EOS lost its completed reasoning output\n";
+            return false;
+        }
+    }
+
+    // 2. Reasoning followed by a final answer: normal completion
+    {
+        auto r = run_generation("Finished reasoning.\n\n</think>\n\nDone.\n\n", STOP_TYPE_EOS, false);
+        if (!end_turn_true(r.response, r.events)) {
+            std::cerr << "Integration: answered EOS set an unexpected end_turn\n";
+            return false;
+        }
+        if (r.msg.content.find("Done.") == std::string::npos || r.msg.reasoning_content.find("Finished reasoning.") == std::string::npos) {
+            std::cerr << "Integration: answered EOS parser corrupted reasoning/content\n";
+            return false;
+        }
+    }
+
+    // 3. Reasoning followed by a tool call: normal tool-call lifecycle
+    {
+        const std::string generated =
+            "A tool is needed.\n\n</think>\n\n"
+            "<tool_call>\n"
+            "{\"name\":\"shell_command\",\"arguments\":{\"command\":\"pwd\"}}\n"
+            "</tool_call>";
+        auto r = run_generation(generated, STOP_TYPE_EOS, false);
+        if (!end_turn_true(r.response, r.events)) {
+            std::cerr << "Integration: tool-call EOS set an unexpected end_turn\n";
+            return false;
+        }
+        if (r.msg.tool_calls.size() != 1 || r.msg.tool_calls[0].name != "shell_command") {
+            std::cerr << "Integration: tool-call EOS parser did not recover the tool call\n";
+            return false;
+        }
+        bool found_tool_item = false;
+        for (const auto & item : r.response.at("output")) {
+            if (item.value("type", std::string()) == "function_call" &&
+                item.value("name", std::string()) == "shell_command") {
+                found_tool_item = true;
+            }
+        }
+        if (!found_tool_item) {
+            std::cerr << "Integration: tool-call EOS lost the function_call output item\n";
+            return false;
+        }
+    }
+
+    // 4. Generation stopped by the token limit: no false continuation
+    {
+        auto r = run_generation("Thinking was interrupted.\n\n", STOP_TYPE_LIMIT, false);
+        if (!end_turn_true(r.response, r.events)) {
+            std::cerr << "Integration: reasoning-only LIMIT set end_turn=false\n";
+            return false;
+        }
+    }
+
+    // 5. Compaction response: no false continuation
+    {
+        auto r = run_generation("Summarizing.\n\n", STOP_TYPE_EOS, true);
+        if (!end_turn_true(r.response, r.events)) {
+            std::cerr << "Integration: compaction EOS set end_turn=false\n";
+            return false;
+        }
+    }
+
+    // 6. Multiple consecutive reasoning-only turns: each continues, reasoning in order
+    {
+        const std::vector<std::string> turns = { "Turn one reasoning.", "Turn two reasoning.", "Turn three reasoning." };
+        std::string seen_reasoning;
+        for (const auto & turn : turns) {
+            auto r = run_generation(turn + "\n</think>\n\n", STOP_TYPE_EOS, false);
+            if (!end_turn_false(r.response, r.events)) {
+                std::cerr << "Integration: consecutive reasoning-only turn did not set end_turn=false\n";
+                return false;
+            }
+            if (r.msg.reasoning_content.find(turn) == std::string::npos) {
+                std::cerr << "Integration: consecutive reasoning-only turn lost its reasoning\n";
+                return false;
+            }
+            if (!seen_reasoning.empty()) {
+                seen_reasoning += "\n\n";
+            }
+            seen_reasoning += turn;
+        }
+        // replay the three reasoning items through the bridge, they must stay in order
+        json input = json::array();
+        for (const auto & turn : turns) {
+            input.push_back(json {
+                {"type", "reasoning"},
+                {"summary", json::array()},
+                {"content", json::array({json {
+                    {"type", "reasoning_text"},
+                    {"text", turn},
+                }})},
+            });
+        }
+        const auto converted = server_chat_convert_responses_to_chatcmpl(json {
+            {"input", input},
+        });
+        if (!converted.contains("messages") ||
+            converted.at("messages").size() != 1 ||
+            converted.at("messages")[0].value("reasoning_content", std::string()) != seen_reasoning) {
+            std::cerr << "Integration: consecutive reasoning-only turns were not preserved in order\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// The non-incremental final streaming path emits response.output_item.done for a
+// tool_search_call without a preceding response.output_item.added. This matches the
+// long-standing upstream behavior for function_call (also done-only in this path),
+// which Codex consumes without issue. Pin the event sequence so any change is deliberate.
+static bool test_responses_tool_search_streaming_lifecycle() {
+    server_task_result_cmpl_final result {};
+    result.oaicompat_model = "test-model";
+    result.oai_resp_id = "resp_tool_search_stream";
+    result.generation_params.responses_tool_search = true;
+    result.oaicompat_msg.role = "assistant";
+    result.oaicompat_msg.tool_calls.push_back({
+        "tool_search",
+        R"({"query":"calendar"})",
+        "search_stream",
+    });
+
+    const json events = result.to_json_oaicompat_resp_stream();
+
+    bool found_done = false;
+    bool found_added = false;
+    std::string done_status;
+    for (const auto & event : events) {
+        const std::string name = event.value("event", std::string());
+        if (name != "response.output_item.done" && name != "response.output_item.added") {
+            continue;
+        }
+        if (!event.contains("data") || !event.at("data").contains("item")) {
+            continue;
+        }
+        const auto & item = event.at("data").at("item");
+        if (item.value("type", std::string()) != "tool_search_call") {
+            continue;
+        }
+        if (name == "response.output_item.done") {
+            found_done = true;
+            done_status = item.value("status", std::string());
+        } else {
+            found_added = true;
+        }
+    }
+
+    if (!found_done) {
+        std::cerr << "tool_search streaming: missing output_item.done for tool_search_call\n";
+        return false;
+    }
+    if (done_status != "completed") {
+        std::cerr << "tool_search streaming: tool_search_call done item not completed\n";
+        return false;
+    }
+    // the done-only sequence (no added) is the established upstream behavior for
+    // atomic tool items; assert it stays that way
+    if (found_added) {
+        std::cerr << "tool_search streaming: unexpected output_item.added for tool_search_call\n";
+        return false;
+    }
+
+    // the final response must carry the tool_search_call item
+    const json & final_response = events.back().at("data").at("response");
+    bool in_final = false;
+    for (const auto & item : final_response.at("output")) {
+        if (item.value("type", std::string()) == "tool_search_call") {
+            in_final = true;
+        }
+    }
+    if (!in_final) {
+        std::cerr << "tool_search streaming: final response lost the tool_search_call item\n";
+        return false;
+    }
+
+    return true;
+}
+
 int main() {
     if (!test_responses_reasoning_replay()) {
+        return 1;
+    }
+
+    if (!test_responses_reasoning_parser_integration()) {
+        return 1;
+    }
+
+    if (!test_responses_tool_search_streaming_lifecycle()) {
         return 1;
     }
 

@@ -2193,14 +2193,14 @@ bool server_prompt_cache::is_in_cache(const server_prompt & prompt) const {
     return false;
 }
 
-void server_prompt_cache::save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     if (prompt.tokens.size() == 0) {
-        return;
+        return false;
     }
 
     // the prompt is already in the RAM cache, it reaches SSD on eviction
     if (is_in_cache(prompt)) {
-        return;
+        return true;
     }
 
     const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2210,23 +2210,29 @@ void server_prompt_cache::save_state(const server_prompt & prompt, llama_context
     if (cur == nullptr) {
         // the state does not fit in the RAM tier: save it directly to SSD
         if (ssd) {
-            server_prompt_cache_state state;
-            state.prompt = prompt.clone();
-            state.data.main.resize(cur_size_tgt);
-            state.data.drft.resize(cur_size_dft);
-            llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (ctx_dft) {
-                llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            try {
+                server_prompt_cache_state state;
+                state.prompt = prompt.clone();
+                state.data.main.resize(cur_size_tgt);
+                state.data.drft.resize(cur_size_dft);
+                llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (ctx_dft) {
+                    llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+                }
+                return ssd->save(state);
+            } catch (const std::bad_alloc & e) {
+                SRV_ERR("failed to allocate memory for SSD prompt cache state: %s\n", e.what());
+                return false;
             }
-            ssd->save(state);
         }
-        return;
+        return false;
     }
 
     llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     if (ctx_dft) {
         llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     }
+    return true;
 }
 
 void server_prompt_cache::update() {
