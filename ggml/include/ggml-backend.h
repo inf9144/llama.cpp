@@ -378,6 +378,12 @@ extern "C" {
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
+    // Temporary diagnostics, enabled at scheduler creation by GGML_SCHED_TRACE_REALLOC (1: bounded, 2: graph fingerprints, 3: verbose).
+    GGML_API uint64_t ggml_backend_sched_get_realloc_trace_id(ggml_backend_sched_t sched); // zero when disabled
+    GGML_API void ggml_backend_sched_set_realloc_trace_context(ggml_backend_sched_t sched, uint64_t context_id, const char * role);
+    GGML_API void ggml_backend_sched_set_realloc_trace_batch(ggml_backend_sched_t sched, const char * phase,
+            uint32_t tokens, uint32_t outputs, uint32_t sequences, int32_t pos_first, int32_t pos_last, int32_t nextn_layer);
+
     //
     // Meta backend
     //

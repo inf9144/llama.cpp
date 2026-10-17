@@ -18,6 +18,13 @@
 //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
 #define AT_PRINTF(...)
 
+struct ggml_gallocr_trace {
+    struct ggml_gallocr_realloc_stats stats;
+    ggml_gallocr_buffer_alloc_callback callback;
+    void * user_data;
+    int64_t callback_us;
+};
+
 // ops that return true for this function must not use restrict pointers for their backend implementations
 bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
@@ -421,7 +428,8 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage,
+        struct ggml_gallocr_trace * trace, int buffer_id, const size_t * old_sizes, int old_chunks) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -429,7 +437,31 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        const int64_t t_alloc = trace ? ggml_time_us() : 0;
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        if (trace) {
+            const int64_t allocation_us = ggml_time_us() - t_alloc;
+            struct ggml_gallocr_realloc_stats * stats = &trace->stats;
+            const bool success = buf->chunks[n] != NULL;
+            const bool replacement = n < old_chunks;
+            const bool growth = success && chunk_size > old_sizes[n];
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            const enum ggml_backend_dev_type dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool gpu = dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            stats->buffer_allocations      += success;
+            stats->buffer_replacements     += success && replacement;
+            stats->buffer_growths          += growth;
+            stats->buffer_failures         += !success;
+            stats->gpu_buffer_allocations  += gpu && success;
+            stats->gpu_buffer_replacements += gpu && success && replacement;
+            stats->gpu_buffer_growths      += gpu && growth;
+            if (trace->callback) {
+                const int64_t t_callback = ggml_time_us();
+                trace->callback(buffer_id, n, replacement, old_sizes[n], chunk_size,
+                        success ? ggml_backend_buffer_get_size(buf->chunks[n]) : 0, success, allocation_us, trace->user_data);
+                trace->callback_us += ggml_time_us() - t_callback;
+            }
+        }
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;
@@ -493,7 +525,28 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    struct ggml_gallocr_trace * trace;
 };
+
+void ggml_gallocr_set_realloc_trace(ggml_gallocr_t galloc, bool enabled,
+        ggml_gallocr_buffer_alloc_callback callback, void * user_data) {
+    if (!enabled) {
+        free(galloc->trace);
+        galloc->trace = NULL;
+        return;
+    }
+    if (!galloc->trace) {
+        galloc->trace = calloc(1, sizeof(*galloc->trace));
+        GGML_ASSERT(galloc->trace);
+    }
+    galloc->trace->callback = callback;
+    galloc->trace->user_data = user_data;
+}
+
+const struct ggml_gallocr_realloc_stats * ggml_gallocr_get_realloc_stats(ggml_gallocr_t galloc) {
+    return galloc->trace ? &galloc->trace->stats : NULL;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -539,6 +592,8 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
     }
+
+    free(galloc->trace);
 
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers != NULL) {
@@ -824,6 +879,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    struct ggml_gallocr_trace * trace = galloc->trace;
+    const int64_t t_start = trace ? ggml_time_us() : 0;
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -901,6 +958,11 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    if (trace) {
+        trace->stats.reservations++;
+        trace->stats.planning_us += ggml_time_us() - t_start;
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -923,6 +985,16 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            size_t old_sizes[GGML_VBUFFER_MAX_CHUNKS];
+            int old_chunks = 0;
+            const int64_t t_buffer = trace ? ggml_time_us() : 0;
+            const int64_t callback_before = trace ? trace->callback_us : 0;
+            if (trace) {
+                for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                    old_sizes[c] = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+                    old_chunks += galloc->buffers[i] && galloc->buffers[i]->chunks[c] != NULL;
+                }
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
@@ -936,11 +1008,18 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE,
+                        trace, i, old_sizes, old_chunks);
                 if (galloc->buffers[i] == NULL) {
+                    if (trace) {
+                        trace->stats.buffer_us += ggml_time_us() - t_buffer - (trace->callback_us - callback_before);
+                    }
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
+            }
+            if (trace) {
+                trace->stats.buffer_us += ggml_time_us() - t_buffer - (trace->callback_us - callback_before);
             }
         }
     }
@@ -994,20 +1073,48 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
-static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc,
+        struct ggml_gallocr_realloc_stats * stats) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
         if (talloc->buffer_id < 0) {
+            if (stats) {
+                stats->reason = GGML_GALLOCR_REALLOC_MISSING_ALLOC;
+                stats->tensor = node;
+                stats->buffer_id = talloc->buffer_id;
+                stats->size_reserved = talloc->size_max;
+            }
             return false;
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return talloc->size_max >= node_size;
+    if (talloc->size_max < node_size) {
+        if (stats) {
+            stats->reason = GGML_GALLOCR_REALLOC_TENSOR_SIZE;
+            stats->tensor = node;
+            stats->buffer_id = talloc->buffer_id;
+            stats->size_reserved = talloc->size_max;
+            stats->size_required = node_size;
+        }
+        return false;
+    }
+    return true;
 }
 
-static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph, struct ggml_gallocr_realloc_stats * stats) {
+    if (stats) {
+        stats->reason = GGML_GALLOCR_REALLOC_NONE;
+        stats->tensor = NULL;
+        stats->node = stats->src = stats->buffer_id = -1;
+        stats->size_reserved = stats->size_required = 0;
+        stats->nodes_reserved = galloc->n_nodes;
+        stats->leafs_reserved = galloc->n_leafs;
+    }
     if (galloc->n_nodes != graph->n_nodes) {
+        if (stats) {
+            stats->reason = GGML_GALLOCR_REALLOC_NODES;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
@@ -1015,6 +1122,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     if (galloc->n_leafs != graph->n_leafs) {
+        if (stats) {
+            stats->reason = GGML_GALLOCR_REALLOC_LEAFS;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
@@ -1025,7 +1135,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
-        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst, stats)) {
+            if (stats) {
+                stats->node = i;
+            }
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -1037,7 +1150,11 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             if (src == NULL) {
                 continue;
             }
-            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j], stats)) {
+                if (stats) {
+                    stats->node = i;
+                    stats->src = j;
+                }
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
@@ -1049,8 +1166,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     return false;
 }
 
-bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+static bool ggml_gallocr_alloc_graph_with_trace(ggml_gallocr_t galloc, struct ggml_cgraph * graph, struct ggml_gallocr_trace * trace) {
+    int64_t t_start = trace ? ggml_time_us() : 0;
+    // Keep the same validity checks; a constant NULL observer lets the compiler remove diagnostic work from the normal scan.
+    const bool needs_realloc = trace ? ggml_gallocr_needs_realloc(galloc, graph, &trace->stats) : ggml_gallocr_needs_realloc(galloc, graph, NULL);
+    if (trace) {
+        trace->stats.validations++;
+        trace->stats.validation_us += ggml_time_us() - t_start;
+    }
+    if (needs_realloc) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1065,6 +1189,8 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             return false;
         }
     }
+
+    t_start = trace ? ggml_time_us() : 0;
 
     // reset buffers
     for (int i = 0; i < galloc->n_buffers; i++) {
@@ -1094,7 +1220,15 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
     }
 
+    if (trace) {
+        trace->stats.binding_us += ggml_time_us() - t_start;
+    }
+
     return true;
+}
+
+bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    return galloc->trace ? ggml_gallocr_alloc_graph_with_trace(galloc, graph, galloc->trace) : ggml_gallocr_alloc_graph_with_trace(galloc, graph, NULL);
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

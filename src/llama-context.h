@@ -392,6 +392,8 @@ private:
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
 
+    uint64_t sched_trace_context_id = 0;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

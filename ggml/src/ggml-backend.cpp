@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <inttypes.h>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -923,6 +926,27 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+static const char * sched_realloc_reasons[] = {
+    "none", "node_count", "leaf_count", "missing_alloc", "tensor_size", "backend_assignment", "allocation_failure",
+};
+
+struct ggml_backend_sched_trace {
+    int level = 0;
+    uint64_t id = 0, context_id = 0;
+    std::string role = "unassigned", phase = "unspecified";
+    uint32_t tokens = 0, outputs = 0, sequences = 0;
+    int32_t pos_first = -1, pos_last = -1, nextn_layer = 0;
+    int nodes = 0, leafs = 0, prev_nodes = 0, prev_leafs = 0, reserved_nodes = 0, reserved_leafs = 0;
+    uint64_t layout = 0, topology = 0, prev_layout = 0, prev_topology = 0, reserved_layout = 0, reserved_topology = 0;
+    bool have_graph = false, have_previous = false, have_reservation = false, in_realloc = false;
+    uint64_t calls = 0, events = 0, failed = 0, reasons[7] = {};
+    uint64_t buffer_details[GGML_SCHED_MAX_BACKENDS][2] = {};
+    uint64_t layout_changes = 0, topology_changes = 0;
+    int64_t path_us = 0, sync_us = 0, max_us = 0, observer_us = 0, last_summary_us = 0;
+    int64_t realloc_validation_us = 0, realloc_planning_us = 0, realloc_buffer_us = 0, realloc_binding_us = 0;
+    uint64_t realloc_buffer_allocs = 0, realloc_gpu_buffer_allocs = 0;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -986,7 +1010,196 @@ struct ggml_backend_sched {
     int prev_graph_size;
 
     int debug_realloc;
+
+    ggml_backend_sched_trace * trace;
 };
+
+// Quote tensor and device names without allowing a name to create another log record.
+static std::string ggml_sched_trace_quote(const char * value) {
+    std::string result = "\"";
+    for (const unsigned char * p = (const unsigned char *) value; *p; ++p) {
+        if (*p == '"' || *p == '\\') {
+            result += '\\';
+            result += (char) *p;
+        } else if (*p < 32 || *p >= 127) {
+            char escaped[7];
+            snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
+            result += escaped;
+        } else {
+            result += (char) *p;
+        }
+    }
+    return result + '"';
+}
+
+static void ggml_sched_trace_summary(ggml_backend_sched_t sched, const char * when) {
+    auto & d = *sched->trace;
+    const int64_t t_start = ggml_time_us();
+    const auto & a = *ggml_gallocr_get_realloc_stats(sched->galloc);
+    GGML_LOG_INFO("sched_realloc_diag: event=summary when=%s sched=%" PRIu64 " context=%" PRIu64 " role=%s calls=%" PRIu64 " reallocs=%" PRIu64 " failed=%" PRIu64
+            " reasons=[node_count:%" PRIu64 ",leaf_count:%" PRIu64 ",missing_alloc:%" PRIu64 ",tensor_size:%" PRIu64 ",backend_assignment:%" PRIu64 ",allocation_failure:%" PRIu64 "]"
+            " path_us=%" PRId64 " validation_us=%" PRId64 " sync_us=%" PRId64 " planning_us=%" PRId64 " buffer_us=%" PRId64 " binding_us=%" PRId64 " observer_us=%" PRId64 " max_event_us=%" PRId64
+            " reservations=%" PRIu64 " buffer_allocs=%" PRIu64 " buffer_replacements=%" PRIu64 " buffer_growths=%" PRIu64 " buffer_failures=%" PRIu64
+            " gpu_buffer_allocs=%" PRIu64 " gpu_buffer_replacements=%" PRIu64 " gpu_buffer_growths=%" PRIu64 " layout_changes=%" PRIu64 " topology_changes=%" PRIu64 "\n",
+            when, d.id, d.context_id, d.role.c_str(), d.calls, d.events, d.failed,
+            d.reasons[1], d.reasons[2], d.reasons[3], d.reasons[4], d.reasons[5], d.reasons[6],
+            d.path_us, a.validation_us, d.sync_us, a.planning_us, a.buffer_us, a.binding_us, d.observer_us, d.max_us,
+            a.reservations, a.buffer_allocations, a.buffer_replacements, a.buffer_growths, a.buffer_failures,
+            a.gpu_buffer_allocations, a.gpu_buffer_replacements, a.gpu_buffer_growths, d.layout_changes, d.topology_changes);
+    GGML_LOG_INFO("sched_realloc_diag: event=realloc_totals sched=%" PRIu64 " context=%" PRIu64
+            " validation_us=%" PRId64 " sync_us=%" PRId64 " planning_us=%" PRId64 " buffer_us=%" PRId64 " binding_us=%" PRId64
+            " buffer_allocs=%" PRIu64 " gpu_buffer_allocs=%" PRIu64 "\n",
+            d.id, d.context_id, d.realloc_validation_us, d.sync_us, d.realloc_planning_us, d.realloc_buffer_us, d.realloc_binding_us,
+            d.realloc_buffer_allocs, d.realloc_gpu_buffer_allocs);
+    d.last_summary_us = ggml_time_us();
+    d.observer_us += d.last_summary_us - t_start;
+}
+
+static void ggml_sched_trace_buffer(int buffer_id, int chunk, bool replacement, size_t old_size,
+        size_t requested_size, size_t actual_size, bool success, int64_t allocation_us, void * user_data) {
+    auto * sched = (ggml_backend_sched_t) user_data;
+    auto & d = *sched->trace;
+    const int64_t t_start = ggml_time_us();
+    if (d.buffer_details[buffer_id][d.in_realloc]++ < 3 || d.level >= 3 || !success) {
+        GGML_LOG_INFO("sched_realloc_diag: event=buffer sched=%" PRIu64 " context=%" PRIu64 " role=%s scope=%s buffer=%d chunk=%d backend=%s buft=%s replacement=%d old_bytes=%zu requested_bytes=%zu actual_bytes=%zu success=%d alloc_us=%" PRId64 "\n",
+                d.id, d.context_id, d.role.c_str(), d.in_realloc ? "realloc" : "explicit_reserve", buffer_id, chunk,
+                ggml_sched_trace_quote(ggml_backend_name(sched->backends[buffer_id])).c_str(),
+                ggml_sched_trace_quote(ggml_backend_buft_name(sched->bufts[buffer_id])).c_str(),
+                replacement, old_size, requested_size, actual_size, success, allocation_us);
+    }
+    d.observer_us += ggml_time_us() - t_start;
+}
+
+static uint64_t ggml_sched_trace_hash(uint64_t hash, uint64_t value) {
+    return (hash ^ value) * UINT64_C(1099511628211);
+}
+
+// Level 2 compares layouts and edges, not pointer identity or tensor contents.
+static void ggml_sched_trace_graph(ggml_backend_sched_t sched) {
+    auto & d = *sched->trace;
+    const int64_t t_start = ggml_time_us();
+    d.have_previous = d.have_graph;
+    d.prev_nodes = d.nodes;
+    d.prev_leafs = d.leafs;
+    d.prev_layout = d.layout;
+    d.prev_topology = d.topology;
+    d.nodes = sched->graph.n_nodes;
+    d.leafs = sched->graph.n_leafs;
+    d.have_graph = true;
+    if (d.level >= 2) {
+        std::unordered_map<const ggml_tensor *, int> ids;
+        for (int i = 0; i < d.nodes; ++i) {
+            ids[sched->graph.nodes[i]] = i;
+        }
+        for (int i = 0; i < d.leafs; ++i) {
+            // Pipeline copies can occur more than once; use the first occurrence.
+            ids.emplace(sched->graph.leafs[i], d.nodes + i);
+        }
+        const auto id = [&ids](const ggml_tensor * t) {
+            const auto it = ids.find(t);
+            return t == nullptr ? -1 : it == ids.end() ? -2 : it->second;
+        };
+        d.layout = d.topology = UINT64_C(14695981039346656037);
+        d.layout = ggml_sched_trace_hash(ggml_sched_trace_hash(d.layout, d.nodes), d.leafs);
+        d.topology = ggml_sched_trace_hash(ggml_sched_trace_hash(d.topology, d.nodes), d.leafs);
+        for (int i = 0; i < d.nodes + d.leafs; ++i) {
+            const ggml_tensor * t = i < d.nodes ? sched->graph.nodes[i] : sched->graph.leafs[i - d.nodes];
+            d.layout = ggml_sched_trace_hash(d.layout, t->type);
+            d.layout = ggml_sched_trace_hash(d.layout, t->flags);
+            d.layout = ggml_sched_trace_hash(d.layout, t->view_offs);
+            for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+                d.layout = ggml_sched_trace_hash(d.layout, t->ne[j]);
+                d.layout = ggml_sched_trace_hash(d.layout, t->nb[j]);
+            }
+            d.topology = ggml_sched_trace_hash(d.topology, t->op);
+            d.topology = ggml_sched_trace_hash(d.topology, id(t->view_src));
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                d.topology = ggml_sched_trace_hash(d.topology, id(t->src[j]));
+            }
+        }
+    }
+    d.observer_us += ggml_time_us() - t_start;
+}
+
+static void ggml_sched_trace_reserved(ggml_backend_sched_t sched) {
+    auto & d = *sched->trace;
+    d.have_reservation = true;
+    d.reserved_nodes = d.nodes;
+    d.reserved_leafs = d.leafs;
+    d.reserved_layout = d.layout;
+    d.reserved_topology = d.topology;
+}
+
+static void ggml_sched_trace_event(ggml_backend_sched_t sched, const ggml_gallocr_realloc_stats & failure,
+        const ggml_gallocr_realloc_stats & before, int reason, int backend_index, bool backend_leaf,
+        int backend_old, int backend_new, bool automatic, int64_t t_start, int64_t sync_us, bool success, const char * failure_stage = "none") {
+    auto & d = *sched->trace;
+    const auto & a = *ggml_gallocr_get_realloc_stats(sched->galloc);
+    const int64_t elapsed = ggml_time_us() - t_start;
+    const int64_t t_observer = ggml_time_us();
+    const int layout_changed = d.level >= 2 && d.have_previous ? d.layout != d.prev_layout : -1;
+    const int topology_changed = d.level >= 2 && d.have_previous ? d.topology != d.prev_topology : -1;
+    d.events++;
+    d.failed += !success;
+    d.path_us += elapsed;
+    d.sync_us += sync_us;
+    d.max_us = std::max(d.max_us, elapsed);
+    d.layout_changes += layout_changed == 1;
+    d.topology_changes += topology_changed == 1;
+    d.realloc_validation_us += a.validation_us - before.validation_us;
+    d.realloc_planning_us   += a.planning_us - before.planning_us;
+    d.realloc_buffer_us     += a.buffer_us - before.buffer_us;
+    d.realloc_binding_us    += a.binding_us - before.binding_us;
+    d.realloc_buffer_allocs += a.buffer_allocations - before.buffer_allocations;
+    d.realloc_gpu_buffer_allocs += a.gpu_buffer_allocations - before.gpu_buffer_allocations;
+    if (d.reasons[reason]++ < 3 || d.level >= 3 || !success) {
+        GGML_LOG_INFO("sched_realloc_diag: event=realloc sched=%" PRIu64 " context=%" PRIu64 " role=%s ordinal=%" PRIu64 " reason=%s success=%d failure_stage=%s automatic=%d phase=%s tokens=%u outputs=%u sequences=%u pos_first=%d pos_last=%d nextn_layer=%d"
+                " nodes=%d leafs=%d prev_nodes=%d prev_leafs=%d reserved_nodes=%d reserved_leafs=%d splits=%d copies=%d copy=%d graph_size=%d prev_graph_size=%d"
+                " backend_index=%d backend_leaf=%d backend_old=%d backend_new=%d layout_changed=%d topology_changed=%d reserved_layout_changed=%d reserved_topology_changed=%d layout=%" PRIu64 " prev_layout=%" PRIu64 " reserved_layout=%" PRIu64 " topology=%" PRIu64 " prev_topology=%" PRIu64 " reserved_topology=%" PRIu64
+                " path_us=%" PRId64 " validation_us=%" PRId64 " sync_us=%" PRId64 " planning_us=%" PRId64 " buffer_us=%" PRId64 " binding_us=%" PRId64 " buffer_allocs=%" PRIu64 " gpu_buffer_allocs=%" PRIu64 "\n",
+                d.id, d.context_id, d.role.c_str(), d.events, sched_realloc_reasons[reason], success, failure_stage, automatic, d.phase.c_str(), d.tokens, d.outputs, d.sequences, d.pos_first, d.pos_last, d.nextn_layer,
+                d.nodes, d.leafs, d.prev_nodes, d.prev_leafs, d.reserved_nodes, d.reserved_leafs, sched->n_splits, sched->n_copies, sched->cur_copy, sched->graph_size, sched->prev_graph_size,
+                backend_index, backend_leaf, backend_old, backend_new, layout_changed, topology_changed,
+                d.level >= 2 && d.have_reservation ? (int) (d.layout != d.reserved_layout) : -1,
+                d.level >= 2 && d.have_reservation ? (int) (d.topology != d.reserved_topology) : -1,
+                d.layout, d.prev_layout, d.reserved_layout, d.topology, d.prev_topology, d.reserved_topology,
+                elapsed, a.validation_us - before.validation_us, sync_us, a.planning_us - before.planning_us, a.buffer_us - before.buffer_us, a.binding_us - before.binding_us,
+                a.buffer_allocations - before.buffer_allocations, a.gpu_buffer_allocations - before.gpu_buffer_allocations);
+        const ggml_tensor * t = reason == 5 ? (backend_leaf ? sched->graph.leafs[backend_index] : sched->graph.nodes[backend_index]) : failure.tensor;
+        if (t) {
+            int assigned = -1;
+            int leaf_index = -1;
+            for (int i = 0; i < sched->graph.n_leafs; ++i) {
+                if (sched->graph.leafs[i] == t) {
+                    assigned = sched->leaf_backend_ids[i];
+                    leaf_index = i;
+                    break;
+                }
+            }
+            for (int i = 0; assigned < 0 && i < sched->graph.n_nodes; ++i) {
+                if (sched->graph.nodes[i] == t) {
+                    assigned = sched->node_backend_ids[i];
+                }
+            }
+            // A missing previous allocation has no previous buffer type; report the current assignment separately.
+            const size_t required = reason == GGML_GALLOCR_REALLOC_TENSOR_SIZE ? failure.size_required :
+                assigned >= 0 ? ggml_backend_buft_get_alloc_size(sched->bufts[assigned], t) : 0;
+            GGML_LOG_INFO("sched_realloc_diag: event=tensor sched=%" PRIu64 " context=%" PRIu64 " ordinal=%" PRIu64 " node=%d leaf=%d src=%d name=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu]"
+                    " reserved_bytes=%zu required_bytes=%zu required_from_check=%d reserved_buffer=%d assigned_backend=%d backend=%s buft=%s\n",
+                    d.id, d.context_id, d.events, reason == 5 && !backend_leaf ? backend_index : failure.node, leaf_index, failure.src,
+                    ggml_sched_trace_quote(t->name).c_str(), ggml_op_name(t->op), ggml_type_name(t->type),
+                    t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3], failure.size_reserved, required,
+                    reason == GGML_GALLOCR_REALLOC_TENSOR_SIZE, failure.buffer_id, assigned,
+                    assigned >= 0 ? ggml_sched_trace_quote(ggml_backend_name(sched->backends[assigned])).c_str() : "\"unknown\"",
+                    assigned >= 0 ? ggml_sched_trace_quote(ggml_backend_buft_name(sched->bufts[assigned])).c_str() : "\"unknown\"");
+        }
+    }
+    d.in_realloc = false;
+    d.observer_us += ggml_time_us() - t_observer;
+    if (success) {
+        ggml_sched_trace_reserved(sched);
+    }
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1750,14 +1963,32 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    if (sched->trace) {
+        ggml_sched_trace_graph(sched);
+    }
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    auto * trace = sched->trace;
+    const int64_t t_start = trace ? ggml_time_us() : 0;
+    ggml_gallocr_realloc_stats before;
+    if (trace) {
+        before = *ggml_gallocr_get_realloc_stats(sched->galloc);
+        trace->calls++;
+        trace->in_realloc = true;
+    }
+    int backend_index = -1, backend_old = -1, backend_new = -1;
+    bool backend_leaf = false;
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            if (trace) {
+                backend_index = i;
+                backend_old = sched->prev_node_backend_ids[i];
+                backend_new = sched->node_backend_ids[i];
+            }
             break;
         }
     }
@@ -1766,6 +1997,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
                 sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
+                if (trace) {
+                    backend_index = i;
+                    backend_leaf = true;
+                    backend_old = sched->prev_leaf_backend_ids[i];
+                    backend_new = sched->leaf_backend_ids[i];
+                }
                 break;
             }
         }
@@ -1773,6 +2010,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        ggml_gallocr_realloc_stats failure;
+        int reason = 5; // backend assignment changed; the allocator check was short-circuited
+        if (trace) {
+            failure = *ggml_gallocr_get_realloc_stats(sched->galloc);
+            if (backend_ids_changed) {
+                failure.tensor = nullptr;
+                failure.node = failure.src = failure.buffer_id = -1;
+                failure.size_reserved = failure.size_required = 0;
+            } else {
+                reason = failure.reason ? (int) failure.reason : 6;
+            }
+            trace->in_realloc = true;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1790,6 +2040,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             const bool unexpected = !backend_ids_changed && !graph_size_changed;
 
             if (unexpected || sched->debug_realloc > 1) {
+                if (trace) {
+                    ggml_sched_trace_event(sched, failure, before, reason, backend_index, backend_leaf, backend_old, backend_new, false, t_start, 0, false, "debug_abort");
+                }
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
                         sched->graph_size, sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_realloc);
             }
@@ -1797,18 +2050,42 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        const int64_t t_sync = trace ? ggml_time_us() : 0;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        const int64_t sync_us = trace ? ggml_time_us() - t_sync : 0;
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            if (trace) {
+                ggml_sched_trace_event(sched, failure, before, reason, backend_index, backend_leaf, backend_old, backend_new, false, t_start, sync_us, false, "reserve");
+            }
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+            if (trace) {
+                ggml_sched_trace_event(sched, failure, before, reason, backend_index, backend_leaf, backend_old, backend_new, false, t_start, sync_us, false, "binding");
+            }
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+        if (trace) {
+            ggml_sched_trace_event(sched, failure, before, reason, backend_index, backend_leaf, backend_old, backend_new, false, t_start, sync_us, true);
+        }
+    } else if (trace) {
+        const auto & after = *ggml_gallocr_get_realloc_stats(sched->galloc);
+        // A single-buffer gallocr can reserve internally without reaching the scheduler's fallback.
+        if (after.reservations != before.reservations) {
+            ggml_sched_trace_event(sched, after, before, (int) after.reason, -1, false, -1, -1, true, t_start, 0, true);
+        }
+    }
+
+    if (trace && ggml_time_us() - trace->last_summary_us >= 5000000) {
+        ggml_sched_trace_summary(sched, "periodic");
+    }
+    if (trace) {
+        trace->in_realloc = false;
     }
 
     return true;
@@ -2013,6 +2290,28 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
+    const char * trace_env = getenv("GGML_SCHED_TRACE_REALLOC");
+    const int trace_level = trace_env ? atoi(trace_env) : 0;
+    if (trace_level > 0) {
+        ggml_time_init();
+        static std::atomic<uint64_t> next_trace_id{1};
+        sched->trace = new ggml_backend_sched_trace;
+        auto & d = *sched->trace;
+        d.level = trace_level;
+        d.id = d.context_id = next_trace_id.fetch_add(1, std::memory_order_relaxed);
+        d.last_summary_us = ggml_time_us();
+        ggml_gallocr_set_realloc_trace(sched->galloc, true, ggml_sched_trace_buffer, sched);
+        GGML_LOG_INFO("sched_realloc_diag: event=scheduler sched=%" PRIu64 " level=%d parallel=%d copies=%d backends=%d\n", d.id, d.level, parallel, sched->n_copies, n_backends);
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
+            GGML_LOG_INFO("sched_realloc_diag: event=device sched=%" PRIu64 " backend_id=%d backend=%s device=%s description=%s buft=%s device_type=%d\n",
+                    d.id, i, ggml_sched_trace_quote(ggml_backend_name(backends[i])).c_str(),
+                    dev ? ggml_sched_trace_quote(ggml_backend_dev_name(dev)).c_str() : "\"unknown\"",
+                    dev && dev->iface.get_description ? ggml_sched_trace_quote(ggml_backend_dev_description(dev)).c_str() : "\"unknown\"",
+                    ggml_sched_trace_quote(ggml_backend_buft_name(sched->bufts[i])).c_str(), dev ? (int) ggml_backend_dev_type(dev) : -1);
+        }
+    }
+
     ggml_backend_sched_reset(sched);
 
     return sched;
@@ -2021,6 +2320,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->trace) {
+        ggml_sched_trace_summary(sched, "final");
+        delete sched->trace;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2071,6 +2374,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    if (sched->trace) {
+        ggml_sched_trace_reserved(sched);
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2083,6 +2389,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+
+    if (sched->trace) {
+        ggml_sched_trace_reserved(sched);
     }
 
     ggml_backend_sched_reset(sched);
@@ -2159,6 +2469,33 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
     sched->callback_realloc_user_data = user_data;
+}
+
+uint64_t ggml_backend_sched_get_realloc_trace_id(ggml_backend_sched_t sched) {
+    return sched->trace ? sched->trace->id : 0;
+}
+
+void ggml_backend_sched_set_realloc_trace_context(ggml_backend_sched_t sched, uint64_t context_id, const char * role) {
+    if (sched->trace) {
+        auto & d = *sched->trace;
+        d.context_id = context_id;
+        d.role = role;
+        GGML_LOG_INFO("sched_realloc_diag: event=context sched=%" PRIu64 " context=%" PRIu64 " role=%s\n", d.id, d.context_id, d.role.c_str());
+    }
+}
+
+void ggml_backend_sched_set_realloc_trace_batch(ggml_backend_sched_t sched, const char * phase,
+        uint32_t tokens, uint32_t outputs, uint32_t sequences, int32_t pos_first, int32_t pos_last, int32_t nextn_layer) {
+    if (sched->trace) {
+        auto & d = *sched->trace;
+        d.phase = phase;
+        d.tokens = tokens;
+        d.outputs = outputs;
+        d.sequences = sequences;
+        d.pos_first = pos_first;
+        d.pos_last = pos_last;
+        d.nextn_layer = nextn_layer;
+    }
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

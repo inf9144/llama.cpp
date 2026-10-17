@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -24,6 +25,8 @@ struct dummy_backend_context {
 
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
+    bool fail_alloc = false;
+    uint64_t alloc_calls = 0;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -42,6 +45,10 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    ctx->alloc_calls++;
+    if (ctx->fail_alloc) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -114,6 +121,10 @@ static void dummy_backend_buffer_clear(ggml_backend_buffer_t /*buft*/, uint8_t /
 
 // ggml_backend_device interface
 
+static const char * dummy_backend_device_get_name(ggml_backend_dev_t /*dev*/) {
+    return "dummy_device";
+}
+
 static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t /*dev*/) {
     return GGML_BACKEND_DEVICE_TYPE_CPU;
 }
@@ -154,6 +165,7 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.context->buffer_interface.clear         = dummy_backend_buffer_clear;
 
     b.context->device.context             = b.context.get();
+    b.context->device.iface.get_name      = dummy_backend_device_get_name;
     b.context->device.iface.get_type      = dummy_backend_device_get_type;
     b.context->device.iface.supports_op   = dummy_backend_device_supports_op;
     b.context->device.iface.supports_buft = dummy_backend_device_supports_buft;
@@ -1106,7 +1118,223 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+static test_context_with_graph make_trace_graph(int64_t elements, int variant = 0, bool external = false) {
+    auto g = make_context();
+    ggml_tensor * x = make_input_1d(g.ctx, elements);
+    ggml_set_name(x, "trace_input");
+    if (external) {
+        x->data = alloc_base;
+    }
+    ggml_tensor * y = ggml_sum(g.ctx, x);
+    if (variant == 1) {
+        y = ggml_scale(g.ctx, y, 2.0f);
+    } else if (variant == 2) {
+        y = ggml_add(g.ctx, x, make_input_1d(g.ctx, elements));
+    } else if (variant == 3) {
+        y = ggml_mean(g.ctx, x);
+    } else if (variant == 4) {
+        y = ggml_dup(g.ctx, x);
+    }
+    ggml_set_name(y, "trace_output");
+    ggml_set_output(y);
+    ggml_build_forward_expand(g.graph, y);
+    return g;
+}
+
+static void test_realloc_trace_reasons() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = { &backend.buffer_type, &backend.buffer_type };
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 2));
+    GGML_ASSERT(ggml_gallocr_get_realloc_stats(galloc.get()) == nullptr);
+    ggml_gallocr_set_realloc_trace(galloc.get(), true, nullptr, nullptr);
+    auto reserved = make_trace_graph(16);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), reserved.graph));
+    const auto * stats = ggml_gallocr_get_realloc_stats(galloc.get());
+    GGML_ASSERT(stats->reservations == 1);
+    GGML_ASSERT(stats->buffer_allocations == backend.context->alloc_calls);
+    GGML_ASSERT(stats->gpu_buffer_allocations == 0);
+
+    auto grown = make_trace_graph(32);
+    GGML_ASSERT(grown.graph->n_nodes == reserved.graph->n_nodes && grown.graph->n_leafs == reserved.graph->n_leafs);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), grown.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_TENSOR_SIZE);
+    GGML_ASSERT(stats->tensor == grown.graph->leafs[0] && stats->node == 0 && stats->src == 0);
+    GGML_ASSERT(stats->size_reserved == 64 && stats->size_required == 128 && stats->buffer_id == 0);
+
+    auto more_nodes = make_trace_graph(16, 1);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), more_nodes.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_NODES && stats->tensor == nullptr);
+
+    auto more_leafs = make_trace_graph(16, 2);
+    GGML_ASSERT(more_leafs.graph->n_nodes == reserved.graph->n_nodes);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), more_leafs.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_LEAFS);
+
+    auto external = make_trace_graph(16, 0, true);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), external.graph));
+    auto internal = make_trace_graph(16);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), internal.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_MISSING_ALLOC);
+    GGML_ASSERT(stats->node == 0 && stats->src == 0 && stats->buffer_id == -1);
+
+    auto dst_small = make_trace_graph(16, 4);
+    auto dst_big = make_trace_graph(32, 4);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), dst_small.graph));
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), dst_big.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_TENSOR_SIZE && stats->node == 0 && stats->src == -1);
+
+    const auto calls_before = backend.context->alloc_calls;
+    auto same = make_trace_graph(16);
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), same.graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), same.graph));
+    GGML_ASSERT(stats->reason == GGML_GALLOCR_REALLOC_NONE);
+    GGML_ASSERT(backend.context->alloc_calls == calls_before); // new plan, existing backend buffer
+
+    dummy_backend gpu = dummy_backend_init(SIZE_MAX);
+    gpu.context->device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    ggml_gallocr_ptr gpu_alloc(ggml_gallocr_new(&gpu.buffer_type));
+    ggml_gallocr_set_realloc_trace(gpu_alloc.get(), true, nullptr, nullptr);
+    auto gpu_small = make_trace_graph(16);
+    auto gpu_big = make_trace_graph(32);
+    GGML_ASSERT(ggml_gallocr_reserve(gpu_alloc.get(), gpu_small.graph));
+    GGML_ASSERT(ggml_gallocr_reserve(gpu_alloc.get(), gpu_big.graph));
+    const auto * gpu_stats = ggml_gallocr_get_realloc_stats(gpu_alloc.get());
+    GGML_ASSERT(gpu_stats->gpu_buffer_allocations == 2 && gpu_stats->gpu_buffer_replacements == 1 && gpu_stats->gpu_buffer_growths == 2);
+    GGML_ASSERT(stats->gpu_buffer_allocations == 0);
+
+    ggml_gallocr_ptr failing(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_realloc_trace(failing.get(), true, nullptr, nullptr);
+    auto initial = make_trace_graph(16);
+    GGML_ASSERT(ggml_gallocr_reserve(failing.get(), initial.graph));
+    backend.context->fail_alloc = true;
+    auto too_big = make_trace_graph(1024);
+    GGML_ASSERT(!ggml_gallocr_reserve(failing.get(), too_big.graph));
+    GGML_ASSERT(ggml_gallocr_get_realloc_stats(failing.get())->buffer_failures == 1);
+    backend.context->fail_alloc = false;
+
+    ggml_gallocr_set_realloc_trace(galloc.get(), false, nullptr, nullptr);
+    GGML_ASSERT(ggml_gallocr_get_realloc_stats(galloc.get()) == nullptr);
+}
+
+static void trace_test_log(ggml_log_level /*level*/, const char * message, void * user_data) {
+    *(std::string *) user_data += message;
+}
+
+static void trace_test_env(const char * value) {
+#ifdef _WIN32
+    _putenv_s("GGML_SCHED_TRACE_REALLOC", value ? value : "");
+#else
+    if (value) {
+        setenv("GGML_SCHED_TRACE_REALLOC", value, 1);
+    } else {
+        unsetenv("GGML_SCHED_TRACE_REALLOC");
+    }
+#endif
+}
+
+static bool trace_test_line(const std::string & log, const std::vector<std::string> & fields) {
+    size_t pos = 0;
+    while (pos < log.size()) {
+        size_t end = log.find('\n', pos);
+        const std::string line = log.substr(pos, end == std::string::npos ? end : end - pos);
+        bool match = true;
+        for (const auto & field : fields) {
+            match &= line.find(field) != std::string::npos;
+        }
+        if (match) {
+            return true;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+static void test_scheduler_realloc_trace() {
+    const char * env = getenv("GGML_SCHED_TRACE_REALLOC");
+    const bool had_env = env != nullptr;
+    const std::string saved_env = env ? env : "";
+    for (int level : {0, 1, 2, 3}) {
+        trace_test_env(std::to_string(level).c_str());
+        std::string log;
+        ggml_log_set(trace_test_log, &log);
+        dummy_backend first = dummy_backend_init(SIZE_MAX);
+        dummy_backend second = dummy_backend_init(SIZE_MAX);
+        ggml_backend_t backends[] = { &first.context->backend, &second.context->backend };
+        ggml_backend_buffer_type_t bufts[] = { &first.buffer_type, &second.buffer_type };
+        ggml_backend_sched_ptr a(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        ggml_backend_sched_ptr b(ggml_backend_sched_new(backends, bufts, 2, 128, true, false));
+        const auto id_a = ggml_backend_sched_get_realloc_trace_id(a.get());
+        const auto id_b = ggml_backend_sched_get_realloc_trace_id(b.get());
+        GGML_ASSERT(level ? id_a && id_b && id_a != id_b : !id_a && !id_b);
+        ggml_backend_sched_set_realloc_trace_context(a.get(), 1001, "main");
+        ggml_backend_sched_set_realloc_trace_context(b.get(), 1002, "mtp_draft");
+        auto reserve_a = make_trace_graph(16);
+        auto reserve_b = make_trace_graph(16);
+        ggml_backend_sched_set_tensor_backend(a.get(), reserve_a.graph->nodes[0], backends[0]);
+        ggml_backend_sched_set_tensor_backend(a.get(), reserve_a.graph->leafs[0], backends[0]);
+        GGML_ASSERT(ggml_backend_sched_reserve(a.get(), reserve_a.graph));
+        GGML_ASSERT(ggml_backend_sched_reserve(b.get(), reserve_b.graph));
+
+        auto grow = make_trace_graph(32);
+        ggml_backend_sched_set_tensor_backend(a.get(), grow.graph->nodes[0], backends[0]);
+        ggml_backend_sched_set_tensor_backend(a.get(), grow.graph->leafs[0], backends[0]);
+        ggml_backend_sched_set_realloc_trace_batch(a.get(), "test_growth", 32, 0, 1, 1, 32, 0);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(a.get(), grow.graph));
+        auto stable = make_trace_graph(16);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(b.get(), stable.graph));
+
+        ggml_backend_sched_reset(a.get());
+        auto moved = make_trace_graph(32);
+        ggml_backend_sched_set_tensor_backend(a.get(), moved.graph->nodes[0], backends[1]);
+        ggml_backend_sched_set_tensor_backend(a.get(), moved.graph->leafs[0], backends[1]);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(a.get(), moved.graph));
+        for (int64_t elements : {64, 128, 256, 512}) {
+            ggml_backend_sched_reset(a.get());
+            auto changed = make_trace_graph(elements, 3);
+            ggml_backend_sched_set_tensor_backend(a.get(), changed.graph->nodes[0], backends[1]);
+            ggml_backend_sched_set_tensor_backend(a.get(), changed.graph->leafs[0], backends[1]);
+            GGML_ASSERT(ggml_backend_sched_alloc_graph(a.get(), changed.graph));
+        }
+        a.reset();
+        b.reset();
+        ggml_backend_sched_ptr automatic(ggml_backend_sched_new(backends, bufts, 1, 128, false, false));
+        ggml_backend_sched_set_realloc_trace_context(automatic.get(), 1003, "single_buffer");
+        auto auto_small = make_trace_graph(16);
+        auto auto_big = make_trace_graph(32);
+        GGML_ASSERT(ggml_backend_sched_reserve(automatic.get(), auto_small.graph));
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(automatic.get(), auto_big.graph));
+        automatic.reset();
+        ggml_log_set(nullptr, nullptr);
+        if (level) {
+            GGML_ASSERT(trace_test_line(log, {"event=realloc ", "context=1001 ", "reason=tensor_size ", "tokens=32 outputs=0"}));
+            GGML_ASSERT(trace_test_line(log, {"event=realloc ", "context=1001 ", "reason=backend_assignment "}));
+            GGML_ASSERT(trace_test_line(log, {"event=summary ", "when=final ", "context=1001 ", "reallocs=6 ", "tensor_size:5,backend_assignment:1"}));
+            GGML_ASSERT(trace_test_line(log, {"event=summary ", "when=final ", "context=1002 ", "reallocs=0 "}));
+            GGML_ASSERT(trace_test_line(log, {"event=realloc ", "context=1003 ", "automatic=1 ", "sync_us=0 "}));
+            GGML_ASSERT(trace_test_line(log, {"event=realloc ", level >= 2 ? "layout_changed=1" : "layout_changed=-1"}));
+            GGML_ASSERT(trace_test_line(log, {"event=tensor ", "name=\"trace_input\"", "reserved_bytes=64 required_bytes=128"}));
+            if (level >= 2) {
+                GGML_ASSERT(trace_test_line(log, {"event=realloc ", "layout_changed=1 topology_changed=1"}));
+            }
+            size_t details = 0;
+            for (size_t pos = log.find("reason=tensor_size "); pos != std::string::npos; pos = log.find("reason=tensor_size ", pos + 1)) {
+                const size_t start = log.rfind('\n', pos);
+                details += log.substr(start == std::string::npos ? 0 : start, pos - (start == std::string::npos ? 0 : start)).find("context=1001 ") != std::string::npos;
+            }
+            GGML_ASSERT(details == (level >= 3 ? 5 : 3));
+        } else {
+            GGML_ASSERT(log.find("sched_realloc_diag:") == std::string::npos);
+        }
+    }
+    trace_test_env(had_env ? saved_env.c_str() : nullptr);
+}
+
 int main() {
+    run("test_realloc_trace_reasons", test_realloc_trace_reasons);
+    run("test_scheduler_realloc_trace", test_scheduler_realloc_trace);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

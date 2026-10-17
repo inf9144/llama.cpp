@@ -73,6 +73,33 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// Temporary, opt-in scheduler diagnostics. These observe the allocator's existing decisions.
+enum ggml_gallocr_realloc_reason {
+    GGML_GALLOCR_REALLOC_NONE,
+    GGML_GALLOCR_REALLOC_NODES,
+    GGML_GALLOCR_REALLOC_LEAFS,
+    GGML_GALLOCR_REALLOC_MISSING_ALLOC,
+    GGML_GALLOCR_REALLOC_TENSOR_SIZE,
+};
+
+struct ggml_gallocr_realloc_stats {
+    enum ggml_gallocr_realloc_reason reason;
+    const struct ggml_tensor * tensor; // valid only while the last allocation attempt's graph is alive
+    int node, src, buffer_id;
+    int nodes_reserved, leafs_reserved;
+    size_t size_reserved, size_required;
+    uint64_t validations, reservations, buffer_allocations, buffer_replacements, buffer_growths, buffer_failures;
+    uint64_t gpu_buffer_allocations, gpu_buffer_replacements, gpu_buffer_growths;
+    int64_t validation_us, planning_us, buffer_us, binding_us;
+};
+
+// One call per backend buffer allocation attempt, including each chunk and failed attempts.
+typedef void (*ggml_gallocr_buffer_alloc_callback)(int buffer_id, int chunk, bool replacement,
+        size_t old_size, size_t requested_size, size_t actual_size, bool success, int64_t allocation_us, void * user_data);
+GGML_API void ggml_gallocr_set_realloc_trace(ggml_gallocr_t galloc, bool enabled,
+        ggml_gallocr_buffer_alloc_callback callback, void * user_data);
+GGML_API const struct ggml_gallocr_realloc_stats * ggml_gallocr_get_realloc_stats(ggml_gallocr_t galloc);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

@@ -710,6 +710,15 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    const uint64_t trace_id = ggml_backend_sched_get_realloc_trace_id(sched.get());
+    if (trace_id) {
+        if (!sched_trace_context_id) {
+            sched_trace_context_id = trace_id;
+        }
+        const char * role = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp_draft" : cparams.ctx_other ? "other_draft" : "main";
+        ggml_backend_sched_set_realloc_trace_context(sched.get(), sched_trace_context_id, role);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -1509,6 +1518,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (sched_trace_context_id) {
+        ggml_backend_sched_set_realloc_trace_batch(sched.get(), "process_ubatch", ubatch.n_tokens, n_outputs, ubatch.n_seqs_unq,
+                ubatch.pos && ubatch.n_tokens ? ubatch.pos[0] : -1,
+                ubatch.pos && ubatch.n_tokens ? ubatch.pos[ubatch.n_tokens - 1] : -1, cparams.nextn_layer_offset);
     }
 
     auto * res = get_gf_res_prev();
@@ -2626,6 +2641,10 @@ ggml_cgraph * llama_context::graph_reserve(
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+    }
+
+    if (sched_trace_context_id) {
+        ggml_backend_sched_set_realloc_trace_batch(sched.get(), "reserve", n_tokens, n_outputs, n_seqs, -1, -1, cparams.nextn_layer_offset);
     }
 
     ggml_backend_sched_reset(sched.get());
