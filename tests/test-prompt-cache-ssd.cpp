@@ -528,6 +528,47 @@ static void test_ram_limit_ssd_fallback(const std::string & dir) {
     CHECK(fitting.is_in_cache(state.prompt) && fitting.states.back().data.main == state.data.main, "normal RAM state bytes intact");
 }
 
+static void test_state_size_failure(const std::string & dir, bool fail_draft) {
+    server_prompt_cache_ssd ssd(dir, 0);
+    CHECK(ssd.init(make_fp()), "state size failure SSD init");
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens({1, 2, 3, 4, 5}), false);
+
+    struct state_source {
+        size_t size;
+        size_t size_calls = 0;
+        size_t data_calls = 0;
+    };
+
+    // These opaque handles are used only by the injected readers, never by llama.
+    for (const size_t limit : {size_t(1), size_t(1024*1024)}) {
+        state_source target = {fail_draft ? size_t(16) : size_t(0)};
+        state_source draft  = {fail_draft ? size_t(0) : size_t(16)};
+        server_prompt_cache ram(1, 0, &ssd);
+        ram.limit_size = limit;
+        ram.get_state_size = [](llama_context * ctx, llama_seq_id id, llama_state_seq_flags flags) -> size_t {
+            CHECK(id == TEST_SLOT_ID && flags == LLAMA_STATE_SEQ_FLAGS_NONE, "failed size read arguments");
+            auto & source = *reinterpret_cast<state_source *>(ctx);
+            ++source.size_calls;
+            return source.size;
+        };
+        ram.get_state_data = [](llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id, llama_state_seq_flags) -> size_t {
+            auto & source = *reinterpret_cast<state_source *>(ctx);
+            ++source.data_calls;
+            std::fill_n(dst, size, uint8_t(1));
+            return size;
+        };
+
+        CHECK(!ram.save_state(prompt, reinterpret_cast<llama_context *>(&target), reinterpret_cast<llama_context *>(&draft), TEST_SLOT_ID),
+              fail_draft ? "zero draft state size rejected" : "zero target state size rejected");
+        CHECK((fail_draft ? draft.size_calls : target.size_calls) == 1, "failing size reader was called");
+        CHECK(target.data_calls == 0 && draft.data_calls == 0, "size failure stops before state capture");
+        CHECK(ram.states.empty() && ram.size() == 0 && !ram.is_in_cache(prompt), "size failure creates no RAM entry");
+        CHECK(ssd.n_entries() == 0 && ssd.size() == 0 && ssd.n_evictions() == 0, "size failure creates no SSD entry");
+        CHECK(std::filesystem::is_empty(ssd.model_dir()), "size failure writes no snapshot files");
+    }
+}
+
 // test temp file cleanup
 static void test_tmp_cleanup(const std::string & dir) {
     const auto fp = make_fp();
@@ -592,6 +633,16 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir4e);
     test_ram_alloc_eviction(dir4e);
     std::filesystem::remove_all(dir4e);
+
+    const std::string dir4f = make_temp_dir() + "-target-size-failure";
+    std::filesystem::create_directories(dir4f);
+    test_state_size_failure(dir4f, /* fail_draft = */ false);
+    std::filesystem::remove_all(dir4f);
+
+    const std::string dir4g = make_temp_dir() + "-draft-size-failure";
+    std::filesystem::create_directories(dir4g);
+    test_state_size_failure(dir4g, /* fail_draft = */ true);
+    std::filesystem::remove_all(dir4g);
 
     const std::string dir4b = make_temp_dir() + "-fp-lora-swa";
     std::filesystem::create_directories(dir4b);

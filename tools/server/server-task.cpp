@@ -2206,6 +2206,11 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
     const size_t cur_size_tgt =           get_state_size(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t cur_size_dft = ctx_dft ? get_state_size(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
+    if (cur_size_tgt == 0 || (ctx_dft && cur_size_dft == 0)) {
+        SRV_ERR("%s", "failed to determine sequence state size\n");
+        return false;
+    }
+
     auto read_data = [&](server_prompt_data & data) {
         if (get_state_data(ctx_tgt, data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_tgt ||
                 (ctx_dft && get_state_data(ctx_dft, data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_dft)) {
