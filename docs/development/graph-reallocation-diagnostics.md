@@ -1,6 +1,6 @@
 # Compute graph reallocation diagnostics
 
-This branch only observes the existing scheduler and allocator. It does not change reservations, scheduling, speculative decoding, caches, synchronization, or precision.
+This branch combines the production fix from `fix/graph-reallocation-recovery` (`fd1e65ec405cbfbedec4ecb2d52c7ef235acfdff`) with opt-in diagnostics. The fix restores the worst-case text allocation plan after an incompatible graph transition using the existing scheduler and buffers. The additional instrumentation only observes allocation and recovery; it adds no synchronization. See [text allocation recovery](graph-allocation-recovery.md) for the implementation and GPU validation checklist. Merge the clean fix branch independently when production validation is complete.
 
 ## Run
 
@@ -25,13 +25,13 @@ Use the actual path of the startup script. No server argument needs to change.
 | Unset or `0` | No diagnostic objects, clocks, graph fingerprints, or diagnostic logging. |
 | `1` | Exact allocation rejection reason, stage timings, batch metadata, bounded details and aggregates. |
 | `2` | Also fingerprint every scheduled graph's tensor layouts and edges; compare against the previous scheduling and last reservation. |
-| `3` | Level 2 plus details for every reallocation and backend buffer allocation attempt. Use only for a short capture. |
+| `3` | Level 2 plus details for every reallocation, recovery and backend buffer allocation attempt. Use only for a short capture. |
 
 The variable is read once when a scheduler is created. Restart the server to change it. `GGML_SCHED_DEBUG_REALLOC` is a separate, existing abort-on-reallocation control; it is not needed for these diagnostics.
 
 ## Investigation
 
-The base is `codex-compat` at `ee25617c778fa1f88c002beba5b24ce9d75cfc90`. All four relevant upstream changes are ancestors:
+The original diagnostic commit was based on `codex-compat` at `ee25617c778fa1f88c002beba5b24ce9d75cfc90`; the recovery merge also includes `codex-compat` through `4bff787f7eb99c691ead79ea4730ae30761ddeac`. All four relevant upstream changes are ancestors:
 
 | PR | Commit | Relevant behavior |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ The scheduler separately re-reserves when the first changed backend assignment a
 
 `ggml_gallocr_reserve_n_impl()` rebuilds the memory plan, but only frees/allocates backend buffers if a buffer is missing or a required chunk grows. Replanning and backend allocation are therefore different events. Single-buffer allocators can replan internally and return success; those events are included with `automatic=1` even though they do not invoke the existing scheduler reallocation callback.
 
-The production cause is not established without the Qwen/MTP run. Plausible correlations to test include zero-output catch-up versus output-producing draft batches, variable target verification batch sizes, and growing attention/mask requirements after a smaller reservation. These are hypotheses, not conclusions.
+The production Qwen/MTP log identified loss of the initial worst-case text plan after switching to image embeddings and back. Runtime reservation replaces the stored tensor limits with those of the current batch. Alternating zero-output catch-up and single-output drafting then invalidate each other's `out_ids` and token-input capacities without growing the backend buffers. Model-free tests reproduce the oscillation and its removal after re-reservation. The complete attribution of later main-context size failures and the real GPU performance benefit still require measurement.
 
 ## Identity and graph metadata
 
@@ -81,6 +81,8 @@ Records include:
 - `event=tensor`: the first failed tensor's name/op/type/layout, node/leaf/source index, old allocation limit, current required size, previous allocation buffer ID and current assigned backend/buffer type. `required_from_check=1` means the size came directly from the failing allocator comparison. For a missing previous allocation, the current assignment is measured only for explanation (`required_from_check=0`); that measurement does not decide validity.
 - `event=buffer`: first three actual backend buffer allocation attempts per backend and scope (explicit reservation or reallocation; all at level 3), including chunk, replacement flag, old/requested/actual bytes, allocation-call time (`alloc_us`) and success.
 - `event=summary`, `event=realloc_totals`: lifetime and reallocation-only aggregates, emitted at most once per five seconds of allocation activity, plus scheduler destruction. Graceful shutdown is needed for final summaries.
+- `event=recovery`: first three recovery attempts per scheduler (every attempt at level 3, all failures), including total time, synchronization, planning, buffer allocation deltas and before/after compute-buffer sizes by backend ID. `reserve_tokens` and `reserve_outputs` describe the synthetic reservation, not an executed batch.
+- `event=recovery_summary`: cumulative recovery-only costs and counts, alongside periodic/final summaries after the first recovery.
 
 Example from a CPU smoke test with a same-count source-size increase (the production context/device labels will differ):
 
@@ -118,6 +120,20 @@ Buffer counters count successful calls to the backend buffer allocator, once per
 
 Counters belong to scheduler instances. Recreated schedulers emit separate final summaries with the same llama context ID. Sum only the final record for each scheduler when comparing lifetime totals. Periodic records are cumulative snapshots, not intervals. A reused compute graph may perform no allocation call, so periodic reporting can pause during reuse. Abrupt termination/OOM cannot produce a final summary.
 
+Recovery records use separate scopes from `realloc_totals`. Their `recovery_us` includes the initial existing scheduler synchronization, full-memory simulation, construction of the measure graph and explicit worst-case reservation. `sync_us` includes all calls to the existing scheduler synchronization function within that scope, including the synchronization inside explicit reservation. It can wait for work that was already in flight. No synchronization is added for measurement.
+
+`planning_us`, `buffer_us`, `binding_us`, `buffer_allocs` and `gpu_buffer_allocs` in recovery records are allocator-statistic deltas for the same scope. The real next batch's graph construction and binding occur afterward and are not recovery work; `binding_us` will normally be zero during reserve-only recovery. `buffers_before`/`buffers_after` use `[backend_id:bytes,...]`; aliased buffer types are counted once according to the existing allocator API. A physical backend buffer allocation during recovery also has `event=buffer scope=recovery`, with old and new chunk sizes. These sizes are not measurements of driver residency or total VRAM, and a GPU-owned host buffer type can be classified as GPU by the device-based counter.
+
+For a comparison of allocation-path overhead, consider reallocation `path_us` together with recovery `recovery_us`, plus end-to-end server timings. Do not conclude that synchronization was eliminated just because it moved from `realloc_totals` to `recovery_summary`. These totals are cumulative, and the ordinary lifetime allocator statistics already include explicit recovery reservations; do not add those lifetime values a second time. Diagnostic bookkeeping and enabled graph fingerprints also perturb host timings.
+
+After text/image/text, an expected bounded record has this form (illustrative values):
+
+```text
+sched_realloc_diag: event=recovery sched=6 context=2 role=main reason="restore_text_plan" recovery_count=1 success=1 recovery_us=900 sync_us=200 planning_us=300 buffer_us=0 binding_us=0 buffer_allocs=0 gpu_buffer_allocs=0 buffers_before=[0:428122116,1:407142600,2:0,3:289722400] buffers_after=[0:428122116,1:407142600,2:0,3:289722400] reserve_tokens=512 reserve_outputs=49 nodes=4512 leafs=992 splits=2 copies=1
+```
+
+The draft context should report its own scheduler/context ID and output bound. Necessary one-time backend/layout changes may remain. Repeated ordinary draft/catch-up size failures should stop once the canonical text plan is restored. Do not expect recovery counts to increase on every generated token.
+
 ## Collect a real Codex session
 
 1. Start the instrumented server with level 1 and its unchanged production arguments. Capture startup through graceful shutdown. Keep the build commit, backend/device lines, model/quantization, context size, MTP/N-Gram parameters, batch/ubatch and pipeline configuration with the run.
@@ -133,6 +149,12 @@ Counters belong to scheduler instances. Recreated schedulers emit separate final
 The most useful evidence is the `reason` and first failed tensor joined to `context/role`, `outputs/tokens`, previous/reserved graph characteristics, and `buffer_allocs`. Repeated `tensor_size` events with zero backend buffer allocations identify replanning rather than repeated GPU buffer creation. Alternating hashes suggest graph alternation; increasing required tensor bytes/positions suggest context-dependent storage. Neither observation alone establishes the final optimization.
 
 ## Validation
+
+Recovery coverage adds two-buffer allocator/scheduler oscillation tests with one and multiple pipeline copies, plus small CPU Llama, Qwen35 and Qwen35-MTP context tests using F16 KV and Q8_0 KV with Flash Attention. They cover raw/mixed embeddings, the 49-output bound, checkpoint continuation in a separate context, graph reuse and retained scheduler/buffer size. The diagnostic-specific recovery tests cover levels 0/1/2/3, bounded output, failed recovery accounting and scheduler isolation without timing thresholds. These tests do not establish dual-GPU runtime correctness.
+
+On the integrated branch, the CPU server and affected test targets built successfully. The five selected tests (`test-alloc`, `test-graph-recovery`, `test-batch-alloc`, `test-prompt-cache-ssd`, `test-responses`) passed with tracing disabled and at level 1; the allocator and recovery tests also passed at level 2. A level-3 run of the six model configurations reported twelve successful recoveries, unchanged compute-buffer sizes and zero additional backend buffer allocations during recovery. The allocator/scheduler tests passed under ASan/UBSan with LeakSanitizer disabled because of the execution environment. Before integration, the context regression was also checked against the unchanged production base and failed at the expected missing-recovery assertion. No Vulkan or ROCm runtime result is claimed.
+
+The following measurements describe validation of the original diagnostic implementation, before recovery was merged:
 
 `tests/test-alloc.cpp` contains model-free regressions for exact node-count, leaf-count, missing-allocation and tensor-size reasons, a same-count source-size reproducer, backend allocation failure accounting, aliased buffer-type accounting, and interleaved scheduler instances with tracing disabled and at levels 1/2/3. It checks backend assignment changes and isolation of final counters. The second scheduler uses pipeline copies.
 
@@ -163,4 +185,4 @@ cmake --build build-diag-cpu --target llama-server test-alloc test-batch-alloc t
 ctest --test-dir build-diag-cpu --output-on-failure -R '^(test-alloc|test-batch-alloc|test-prompt-cache-ssd|test-server-component)$'
 ```
 
-Vulkan and ROCm use the same backend-neutral diagnostic path and require no backend-specific source changes. GPU compilation/runtime verification still requires the corresponding SDK, compiler and devices. Actual production overhead and attribution of the 88/4512-node graphs remain to be measured on the real workload.
+Vulkan and ROCm use the same backend-neutral diagnostic path and require no backend-specific source changes. GPU compilation/runtime verification still requires the corresponding SDK, compiler and devices. Post-recovery overhead and behavior remain to be measured on the real workload; the supplied production log identifies the 88-node scheduler as MTP and the 4512-node scheduler as main through context labels, not by node count alone.

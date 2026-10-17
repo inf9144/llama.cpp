@@ -45,7 +45,7 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
-    ctx->alloc_calls++;
+    ++ctx->alloc_calls;
     if (ctx->fail_alloc) {
         return nullptr;
     }
@@ -1111,6 +1111,111 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static test_context_with_graph make_output_graph(int64_t tokens, int64_t outputs) {
+    auto r = make_context();
+    auto * weights = ggml_new_tensor_2d(r.ctx, GGML_TYPE_F32, 4, 64);
+    auto * ids = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, tokens);
+    auto * out_ids = ggml_new_tensor_1d(r.ctx, GGML_TYPE_I32, outputs);
+    ggml_set_input(ids);
+    ggml_set_input(out_ids);
+    // Check the input sources before their consumers, as scheduler copy dependencies do.
+    ggml_build_forward_expand(r.graph, ggml_view_1d(r.ctx, ids, tokens, 0));
+    ggml_build_forward_expand(r.graph, ggml_view_1d(r.ctx, out_ids, outputs, 0));
+    auto * hidden = ggml_get_rows(r.ctx, weights, ids);
+    auto * output = ggml_get_rows(r.ctx, hidden, out_ids);
+    ggml_set_output(output);
+    ggml_build_forward_expand(r.graph, output);
+    return r;
+}
+
+static void test_output_plan_recovery() {
+    dummy_backend first = dummy_backend_init(SIZE_MAX);
+    dummy_backend second = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type_t bufts[] = { &first.buffer_type, &second.buffer_type };
+    ggml_gallocr_ptr alloc(ggml_gallocr_new_n(bufts, 2));
+    const int nodes[] = { 1, 1, 0, 0 };
+    const int leaves[] = { 1, 1, 0 };
+    auto reserve = [&](int64_t tokens, int64_t outputs) {
+        auto graph = make_output_graph(tokens, outputs);
+        GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph.graph, nodes, leaves));
+    };
+    reserve(64, 49);
+    const auto first_buffers = first.context->buffers;
+    const auto second_buffers = second.context->buffers;
+    const size_t size = first.context->allocated_total() + second.context->allocated_total();
+    const auto alloc_calls = first.context->alloc_calls + second.context->alloc_calls;
+    auto alternate = [&]() {
+        int replans = 0;
+        for (int i = 0; i < 40; ++i) {
+            auto graph = make_output_graph(i % 2 ? 4 : 1, i % 2 ? 0 : 1);
+            GGML_ASSERT(graph.graph->n_nodes == 4 && graph.graph->n_leafs == 3);
+            if (!ggml_gallocr_alloc_graph(alloc.get(), graph.graph)) {
+                ++replans;
+                GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph.graph, nodes, leaves));
+                GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph.graph));
+            }
+        }
+        return replans;
+    };
+    GGML_ASSERT(alternate() == 0);
+    reserve(33, 0);
+    GGML_ASSERT(alternate() == 40);
+    reserve(64, 49);
+    GGML_ASSERT(alternate() == 0);
+    auto verify = make_output_graph(49, 49);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), verify.graph));
+    GGML_ASSERT(first.context->buffers == first_buffers && second.context->buffers == second_buffers);
+    GGML_ASSERT(first.context->allocated_total() + second.context->allocated_total() == size);
+    GGML_ASSERT(first.context->alloc_calls + second.context->alloc_calls == alloc_calls);
+}
+
+static void test_scheduler_output_plan_recovery() {
+    for (bool parallel : { false, true }) {
+        dummy_backend first = dummy_backend_init(SIZE_MAX);
+        dummy_backend second = dummy_backend_init(SIZE_MAX);
+        ggml_backend_t backends[] = { &first.context->backend, &second.context->backend };
+        ggml_backend_buffer_type_t bufts[] = { &first.buffer_type, &second.buffer_type };
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, parallel, false));
+        int replans = 0;
+        ggml_backend_sched_set_realloc_callback(sched.get(),
+            [](ggml_backend_sched_t, ggml_cgraph *, bool, bool, void * data) { ++*static_cast<int *>(data); }, &replans);
+        auto assign = [&](ggml_cgraph * graph) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), graph->leafs[2], backends[0]);
+            ggml_backend_sched_set_tensor_backend(sched.get(), graph->nodes[2], backends[0]);
+            ggml_backend_sched_set_tensor_backend(sched.get(), graph->nodes[3], backends[0]);
+        };
+        auto reserve = [&](int64_t tokens, int64_t outputs) {
+            ggml_backend_sched_reset(sched.get());
+            auto graph = make_output_graph(tokens, outputs);
+            assign(graph.graph);
+            GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), graph.graph));
+        };
+        auto alternate = [&]() {
+            const int before = replans;
+            for (int i = 0; i < 40; ++i) {
+                ggml_backend_sched_reset(sched.get());
+                auto graph = make_output_graph(i % 2 ? 4 : 1, i % 2 ? 0 : 1);
+                assign(graph.graph);
+                GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.graph));
+            }
+            return replans - before;
+        };
+        reserve(64, 49);
+        const auto first_buffers = first.context->buffers;
+        const auto second_buffers = second.context->buffers;
+        const auto alloc_calls = first.context->alloc_calls + second.context->alloc_calls;
+        const int copies = ggml_backend_sched_get_n_copies(sched.get());
+        GGML_ASSERT(alternate() == 0);
+        reserve(33, 0);
+        GGML_ASSERT(alternate() == 40);
+        reserve(64, 49);
+        GGML_ASSERT(alternate() == 0);
+        GGML_ASSERT(ggml_backend_sched_get_n_copies(sched.get()) == copies);
+        GGML_ASSERT(first.context->buffers == first_buffers && second.context->buffers == second_buffers);
+        GGML_ASSERT(first.context->alloc_calls + second.context->alloc_calls == alloc_calls);
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1332,9 +1437,68 @@ static void test_scheduler_realloc_trace() {
     trace_test_env(had_env ? saved_env.c_str() : nullptr);
 }
 
+static void test_scheduler_recovery_trace() {
+    const char * env = getenv("GGML_SCHED_TRACE_REALLOC");
+    const bool had_env = env != nullptr;
+    const std::string saved_env = env ? env : "";
+    for (int level : { 0, 1, 2, 3 }) {
+        trace_test_env(std::to_string(level).c_str());
+        std::string log;
+        ggml_log_set(trace_test_log, &log);
+        dummy_backend first = dummy_backend_init(SIZE_MAX);
+        dummy_backend second = dummy_backend_init(SIZE_MAX);
+        ggml_backend_t backends[] = { &first.context->backend, &second.context->backend };
+        ggml_backend_buffer_type_t bufts[] = { &first.buffer_type, &second.buffer_type };
+        ggml_backend_sched_ptr a(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        ggml_backend_sched_ptr b(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        ggml_backend_sched_set_realloc_trace_context(a.get(), 2001, "main");
+        ggml_backend_sched_set_realloc_trace_context(b.get(), 2002, "mtp_draft");
+        auto initial_a = make_trace_graph(16);
+        auto initial_b = make_trace_graph(16);
+        GGML_ASSERT(ggml_backend_sched_reserve(a.get(), initial_a.graph));
+        GGML_ASSERT(ggml_backend_sched_reserve(b.get(), initial_b.graph));
+        for (int i = 0; i < 5; ++i) {
+            ggml_backend_sched_realloc_trace_recovery_begin(a.get(), "test");
+            ggml_backend_sched_synchronize(a.get());
+            ggml_backend_sched_reset(a.get());
+            auto graph = make_trace_graph(16);
+            GGML_ASSERT(ggml_backend_sched_reserve(a.get(), graph.graph));
+            ggml_backend_sched_realloc_trace_recovery_end(a.get(), true);
+        }
+        ggml_backend_sched_realloc_trace_recovery_begin(b.get(), "test_failure");
+        ggml_backend_sched_reset(b.get());
+        second.context->fail_alloc = true;
+        auto failed = make_trace_graph(1024);
+        GGML_ASSERT(!ggml_backend_sched_reserve(b.get(), failed.graph));
+        ggml_backend_sched_realloc_trace_recovery_end(b.get(), false);
+        second.context->fail_alloc = false;
+        a.reset();
+        b.reset();
+        ggml_log_set(nullptr, nullptr);
+        if (level) {
+            GGML_ASSERT(trace_test_line(log, { "event=recovery ", "context=2001 ", "role=main ", "success=1 ", "buffer_allocs=0 ", "buffers_before=[" }));
+            GGML_ASSERT(trace_test_line(log, { "event=recovery ", "context=2002 ", "success=0 ", "sync_us=" }));
+            GGML_ASSERT(trace_test_line(log, { "event=recovery_summary ", "when=final ", "context=2001 ", "recovery_count=5 failed=0", "buffer_allocs=0 " }));
+            GGML_ASSERT(trace_test_line(log, { "event=recovery_summary ", "when=final ", "context=2002 ", "recovery_count=1 failed=1" }));
+            size_t details = 0;
+            for (size_t pos = log.find("event=recovery "); pos != std::string::npos; pos = log.find("event=recovery ", pos + 1)) {
+                const size_t end = log.find('\n', pos);
+                details += log.substr(pos, end - pos).find("context=2001 ") != std::string::npos;
+            }
+            GGML_ASSERT(details == (level >= 3 ? 5 : 3));
+        } else {
+            GGML_ASSERT(log.find("sched_realloc_diag:") == std::string::npos);
+        }
+    }
+    trace_test_env(had_env ? saved_env.c_str() : nullptr);
+}
+
 int main() {
+    run("test_scheduler_recovery_trace", test_scheduler_recovery_trace);
     run("test_realloc_trace_reasons", test_realloc_trace_reasons);
     run("test_scheduler_realloc_trace", test_scheduler_realloc_trace);
+    run("test_output_plan_recovery", test_output_plan_recovery);
+    run("test_scheduler_output_plan_recovery", test_scheduler_output_plan_recovery);
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
     run("test_tensor_larger_than_max_size", test_tensor_larger_than_max_size);

@@ -383,6 +383,8 @@ extern "C" {
     GGML_API void ggml_backend_sched_set_realloc_trace_context(ggml_backend_sched_t sched, uint64_t context_id, const char * role);
     GGML_API void ggml_backend_sched_set_realloc_trace_batch(ggml_backend_sched_t sched, const char * phase,
             uint32_t tokens, uint32_t outputs, uint32_t sequences, int32_t pos_first, int32_t pos_last, int32_t nextn_layer);
+    GGML_API void ggml_backend_sched_realloc_trace_recovery_begin(ggml_backend_sched_t sched, const char * reason);
+    GGML_API void ggml_backend_sched_realloc_trace_recovery_end(ggml_backend_sched_t sched, bool success);
 
     //
     // Meta backend

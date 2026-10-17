@@ -463,7 +463,222 @@ static bool test_responses_tool_search_streaming_lifecycle() {
     return true;
 }
 
+static bool test_responses_compaction_update() {
+    const std::string template_path = "models/templates/llama-cpp-qwen-based-codex.jinja";
+    std::ifstream file(template_path, std::ios::binary);
+    if (!file) {
+        std::cerr << "failed to open template: " << template_path << "\n";
+        return false;
+    }
+    const std::string template_text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, template_text));
+
+    common_chat_msg system;
+    system.role = "system";
+    system.content = "Stable Codex instructions.";
+    common_chat_msg user;
+    user.role = "user";
+    user.content = "Summarize the current task.";
+    common_chat_tool shell_tool;
+    shell_tool.name = "shell_command";
+    shell_tool.description = "Runs a shell command";
+    shell_tool.parameters = R"({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})";
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = {system, user};
+    inputs.tools = {shell_tool};
+    inputs.enable_thinking = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    inputs.chat_template_kwargs["is_compaction"] = "true";
+
+    struct generation {
+        server_task_result_cmpl_final result;
+        json events = json::array();
+        std::string prefill;
+    };
+    auto run = [&](bool stream, const std::vector<std::string> & chunks, const std::string & prefill) {
+        auto session_inputs = inputs;
+        if (!prefill.empty()) {
+            common_chat_msg assistant;
+            assistant.role = "assistant";
+            assistant.content = prefill;
+            session_inputs.messages.push_back(assistant);
+            session_inputs.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
+        }
+        common_chat_session session(tmpls.get(), nullptr, session_inputs);
+        const std::string parsed_prefill = session.parse_prefill().content;
+        if (session.format() != COMMON_CHAT_FORMAT_PEG_NATIVE ||
+            (!prefill.empty() && (parsed_prefill.size() < prefill.size() ||
+                                 parsed_prefill.compare(parsed_prefill.size() - prefill.size(), prefill.size(), prefill) != 0))) {
+            throw std::runtime_error("compaction test session has an unexpected parser or prefill");
+        }
+        task_result_state state(std::move(session));
+        generation out;
+        out.prefill = parsed_prefill;
+        std::string generated;
+        int n_chunks = 0;
+        for (const auto & chunk : chunks) {
+            generated += chunk;
+            if (stream) {
+                server_task_result_cmpl_partial partial {};
+                partial.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+                partial.n_decoded = ++n_chunks;
+                partial.content = common_chat_input(chunk);
+                partial.update(state);
+                for (const auto & event : partial.to_json()) {
+                    out.events.push_back(event);
+                }
+            }
+        }
+
+        out.result = make_response_result("");
+        out.result.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+        out.result.stop = STOP_TYPE_EOS;
+        out.result.stream = stream;
+        out.result.generation_params.stream = stream;
+        out.result.generation_params.responses_compaction = true;
+        // Streaming finals carry no text; partial.update() already fed every chunk.
+        out.result.content = stream ? common_chat_input() : common_chat_input(generated);
+        out.result.update(state);
+        return out;
+    };
+
+    auto valid = [&](const std::string & name, bool stream, const std::vector<std::string> & chunks,
+                     const std::string & summary, const std::string & prefill = "") {
+        auto fail = [&](const std::string & detail) {
+            std::cerr << "Compaction " << name << ": " << detail << "\n";
+            return false;
+        };
+        try {
+            auto out = run(stream, chunks, prefill);
+            if (out.result.oai_resp_compaction_content != summary ||
+                out.result.oaicompat_msg.content != out.prefill + summary) {
+                return fail("final.update() did not extract the exact summary");
+            }
+            if (prefill.empty() && out.result.oaicompat_msg.reasoning_content.find("Preserve the completed work.") == std::string::npos) {
+                return fail("production parser did not separate the reasoning from the summary");
+            }
+            json response;
+            json added;
+            json done;
+            if (stream) {
+                for (const auto & event : out.result.to_json()) {
+                    out.events.push_back(event);
+                }
+                int n_completed = 0;
+                int n_added = 0;
+                int n_done = 0;
+                for (const auto & event : out.events) {
+                    const auto type = event.value("event", std::string());
+                    const auto & data = event.at("data");
+                    if (type == "response.completed") {
+                        ++n_completed;
+                        response = data.at("response");
+                    } else if ((type == "response.output_item.added" || type == "response.output_item.done") &&
+                               data.at("item").value("type", std::string()) == "compaction") {
+                        if (type == "response.output_item.added") {
+                            ++n_added;
+                            added = data.at("item");
+                        } else {
+                            ++n_done;
+                            done = data.at("item");
+                        }
+                    }
+                }
+                if (n_completed != 1 || n_added != 1 || n_done != 1 || added != done ||
+                    out.events.back().at("event") != "response.completed") {
+                    return fail("expected one compaction lifecycle followed by response.completed");
+                }
+                if (format_oai_resp_sse(out.events).find("event: response.completed\n") == std::string::npos) {
+                    return fail("SSE output lost response.completed");
+                }
+            } else {
+                response = out.result.to_json();
+            }
+            if (response.at("status") != "completed" || !response.value("end_turn", true)) {
+                return fail("compaction response is not completed");
+            }
+            int n_compaction = 0;
+            for (const auto & item : response.at("output")) {
+                if (item.value("type", std::string()) != "compaction") {
+                    continue;
+                }
+                ++n_compaction;
+                if (item.at("encrypted_content") != "llama.cpp.compaction.v1\n" + summary ||
+                    item.at("id").get<std::string>().find("cmp_") != 0 || (stream && item != done)) {
+                    return fail("durable payload differs from the extracted summary or stream item");
+                }
+            }
+            if (n_compaction != 1) {
+                return fail("expected exactly one compaction item in the completed response");
+            }
+            std::cout << "Compaction " << name << " passed\n";
+            return true;
+        } catch (const std::exception & e) {
+            return fail(e.what());
+        }
+    };
+    auto invalid = [&](const std::string & name, bool stream, const std::string & generated, const std::string & prefill = "") {
+        try {
+            run(stream, {generated}, prefill);
+            std::cerr << "Compaction " << name << ": final.update() accepted an invalid summary\n";
+            return false;
+        } catch (const std::runtime_error & e) {
+            if (std::string(e.what()) != "Responses compaction generated no model output") {
+                std::cerr << "Compaction " << name << ": unexpected rejection: " << e.what() << "\n";
+                return false;
+            }
+            std::cout << "Compaction " << name << " rejected by final.update()\n";
+            return true;
+        }
+    };
+
+    const std::string reasoning = "Preserve the completed work.\n</think>\n\n";
+    const std::string summary = "## Goal\nFix streaming compaction.\n\n- Progress: parser checked.\n- Next: run tests!\n";
+    const std::vector<std::string> chunks = {reasoning.substr(0, 30), reasoning.substr(30),
+                                           summary.substr(0, 11), summary.substr(11, 27), summary.substr(38)};
+    bool ok = valid("streaming empty final chunk", true, chunks, summary);
+    ok = valid("non-streaming", false, chunks, summary) && ok;
+    std::string long_summary = "## Detailed checkpoint\n";
+    while (long_summary.size() < 128*1024) {
+        long_summary += "- Preserve paths, commands, decisions and next steps exactly; retain every Markdown line.\n";
+    }
+    ok = valid("long streaming summary", true, {reasoning, long_summary}, long_summary) && ok;
+    ok = valid("long non-streaming summary", false, {reasoning, long_summary}, long_summary) && ok;
+    for (const bool stream : {false, true}) {
+        const std::string mode = stream ? "streaming " : "non-streaming ";
+        ok = invalid(mode + "empty", stream, "") && ok;
+        ok = invalid(mode + "whitespace only", stream, " \t\r\n") && ok;
+        ok = invalid(mode + "open reasoning only", stream, "Still thinking.") && ok;
+        ok = invalid(mode + "closed reasoning only", stream, reasoning) && ok;
+        ok = invalid(mode + "whitespace summary", stream, reasoning + " \t\r\n") && ok;
+
+        const std::string prefill = "## Generation prefill\n";
+        ok = valid(mode + "prefill removal", stream, {summary.substr(0, 11), summary.substr(11)}, summary, prefill) && ok;
+        ok = invalid(mode + "prefill only", stream, "", prefill) && ok;
+        ok = invalid(mode + "prefill and whitespace", stream, " \t\r\n", prefill) && ok;
+
+        // These are text, not the tab/CR/newline escape sequences used by validation.
+        for (const std::string literal : {"t", "r", "n", "\\", "\\n"}) {
+            ok = valid(mode + "literal " + literal, stream, {reasoning, literal}, literal) && ok;
+        }
+    }
+    const std::string generated = reasoning + summary;
+    for (const size_t size : {size_t(1), size_t(2), size_t(7), size_t(16), size_t(63)}) {
+        std::vector<std::string> split;
+        for (size_t pos = 0; pos < generated.size(); pos += size) {
+            split.push_back(generated.substr(pos, size));
+        }
+        ok = valid("chunk size " + std::to_string(size), true, split, summary) && ok;
+    }
+    return ok;
+}
+
 int main() {
+    if (!test_responses_compaction_update()) {
+        return 1;
+    }
+
     if (!test_responses_reasoning_replay()) {
         return 1;
     }

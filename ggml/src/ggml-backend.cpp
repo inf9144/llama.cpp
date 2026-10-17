@@ -945,6 +945,14 @@ struct ggml_backend_sched_trace {
     int64_t path_us = 0, sync_us = 0, max_us = 0, observer_us = 0, last_summary_us = 0;
     int64_t realloc_validation_us = 0, realloc_planning_us = 0, realloc_buffer_us = 0, realloc_binding_us = 0;
     uint64_t realloc_buffer_allocs = 0, realloc_gpu_buffer_allocs = 0;
+    bool in_recovery = false;
+    std::string recovery_reason;
+    ggml_gallocr_realloc_stats recovery_before = {};
+    size_t recovery_buffers_before[GGML_SCHED_MAX_BACKENDS] = {};
+    uint64_t recoveries = 0, recovery_failures = 0, recovery_buffer_allocs = 0, recovery_gpu_buffer_allocs = 0;
+    uint64_t recovery_buffer_growths = 0, recovery_buffer_replacements = 0;
+    int64_t recovery_started_us = 0, recovery_event_sync_us = 0;
+    int64_t recovery_us = 0, recovery_sync_us = 0, recovery_planning_us = 0, recovery_buffer_us = 0, recovery_binding_us = 0, recovery_max_us = 0;
 };
 
 struct ggml_backend_sched {
@@ -1051,6 +1059,14 @@ static void ggml_sched_trace_summary(ggml_backend_sched_t sched, const char * wh
             " buffer_allocs=%" PRIu64 " gpu_buffer_allocs=%" PRIu64 "\n",
             d.id, d.context_id, d.realloc_validation_us, d.sync_us, d.realloc_planning_us, d.realloc_buffer_us, d.realloc_binding_us,
             d.realloc_buffer_allocs, d.realloc_gpu_buffer_allocs);
+    if (d.recoveries) {
+        GGML_LOG_INFO("sched_realloc_diag: event=recovery_summary when=%s sched=%" PRIu64 " context=%" PRIu64 " role=%s recovery_count=%" PRIu64 " failed=%" PRIu64
+                " recovery_us=%" PRId64 " sync_us=%" PRId64 " planning_us=%" PRId64 " buffer_us=%" PRId64 " binding_us=%" PRId64
+                " buffer_allocs=%" PRIu64 " gpu_buffer_allocs=%" PRIu64 " buffer_growths=%" PRIu64 " buffer_replacements=%" PRIu64 " max_event_us=%" PRId64 "\n",
+                when, d.id, d.context_id, d.role.c_str(), d.recoveries, d.recovery_failures,
+                d.recovery_us, d.recovery_sync_us, d.recovery_planning_us, d.recovery_buffer_us, d.recovery_binding_us,
+                d.recovery_buffer_allocs, d.recovery_gpu_buffer_allocs, d.recovery_buffer_growths, d.recovery_buffer_replacements, d.recovery_max_us);
+    }
     d.last_summary_us = ggml_time_us();
     d.observer_us += d.last_summary_us - t_start;
 }
@@ -1062,7 +1078,7 @@ static void ggml_sched_trace_buffer(int buffer_id, int chunk, bool replacement, 
     const int64_t t_start = ggml_time_us();
     if (d.buffer_details[buffer_id][d.in_realloc]++ < 3 || d.level >= 3 || !success) {
         GGML_LOG_INFO("sched_realloc_diag: event=buffer sched=%" PRIu64 " context=%" PRIu64 " role=%s scope=%s buffer=%d chunk=%d backend=%s buft=%s replacement=%d old_bytes=%zu requested_bytes=%zu actual_bytes=%zu success=%d alloc_us=%" PRId64 "\n",
-                d.id, d.context_id, d.role.c_str(), d.in_realloc ? "realloc" : "explicit_reserve", buffer_id, chunk,
+                d.id, d.context_id, d.role.c_str(), d.in_realloc ? "realloc" : d.in_recovery ? "recovery" : "explicit_reserve", buffer_id, chunk,
                 ggml_sched_trace_quote(ggml_backend_name(sched->backends[buffer_id])).c_str(),
                 ggml_sched_trace_quote(ggml_backend_buft_name(sched->bufts[buffer_id])).c_str(),
                 replacement, old_size, requested_size, actual_size, success, allocation_us);
@@ -2442,8 +2458,13 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const bool recovery = sched->trace && sched->trace->in_recovery;
+    const int64_t t_start = recovery ? ggml_time_us() : 0;
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (recovery) {
+        sched->trace->recovery_event_sync_us += ggml_time_us() - t_start;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2496,6 +2517,68 @@ void ggml_backend_sched_set_realloc_trace_batch(ggml_backend_sched_t sched, cons
         d.pos_last = pos_last;
         d.nextn_layer = nextn_layer;
     }
+}
+
+void ggml_backend_sched_realloc_trace_recovery_begin(ggml_backend_sched_t sched, const char * reason) {
+    if (!sched->trace) {
+        return;
+    }
+    auto & d = *sched->trace;
+    const int64_t t_start = ggml_time_us();
+    GGML_ASSERT(!d.in_recovery);
+    d.recovery_reason = reason;
+    d.phase = "recovery";
+    d.tokens = d.outputs = 0;
+    d.recovery_before = *ggml_gallocr_get_realloc_stats(sched->galloc);
+    for (int i = 0; i < sched->n_backends; ++i) {
+        d.recovery_buffers_before[i] = ggml_gallocr_get_buffer_size(sched->galloc, i);
+    }
+    d.recovery_event_sync_us = 0;
+    d.in_recovery = true;
+    d.recovery_started_us = ggml_time_us();
+    d.observer_us += d.recovery_started_us - t_start;
+}
+
+void ggml_backend_sched_realloc_trace_recovery_end(ggml_backend_sched_t sched, bool success) {
+    if (!sched->trace || !sched->trace->in_recovery) {
+        return;
+    }
+    auto & d = *sched->trace;
+    const int64_t elapsed = ggml_time_us() - d.recovery_started_us;
+    const int64_t t_start = ggml_time_us();
+    const auto & a = *ggml_gallocr_get_realloc_stats(sched->galloc);
+    const auto & before = d.recovery_before;
+    ++d.recoveries;
+    d.recovery_failures += !success;
+    d.recovery_us += elapsed;
+    d.recovery_sync_us += d.recovery_event_sync_us;
+    d.recovery_planning_us += a.planning_us - before.planning_us;
+    d.recovery_buffer_us += a.buffer_us - before.buffer_us;
+    d.recovery_binding_us += a.binding_us - before.binding_us;
+    d.recovery_buffer_allocs += a.buffer_allocations - before.buffer_allocations;
+    d.recovery_gpu_buffer_allocs += a.gpu_buffer_allocations - before.gpu_buffer_allocations;
+    d.recovery_buffer_growths += a.buffer_growths - before.buffer_growths;
+    d.recovery_buffer_replacements += a.buffer_replacements - before.buffer_replacements;
+    d.recovery_max_us = std::max(d.recovery_max_us, elapsed);
+    if (d.recoveries <= 3 || d.level >= 3 || !success) {
+        std::string buffers_before = "[", buffers_after = "[";
+        for (int i = 0; i < sched->n_backends; ++i) {
+            const std::string prefix = (i ? "," : "") + std::to_string(i) + ":";
+            buffers_before += prefix + std::to_string(d.recovery_buffers_before[i]);
+            buffers_after += prefix + std::to_string(ggml_gallocr_get_buffer_size(sched->galloc, i));
+        }
+        buffers_before += "]";
+        buffers_after += "]";
+        GGML_LOG_INFO("sched_realloc_diag: event=recovery sched=%" PRIu64 " context=%" PRIu64 " role=%s reason=%s recovery_count=%" PRIu64
+                " success=%d recovery_us=%" PRId64 " sync_us=%" PRId64 " planning_us=%" PRId64 " buffer_us=%" PRId64 " binding_us=%" PRId64
+                " buffer_allocs=%" PRIu64 " gpu_buffer_allocs=%" PRIu64 " buffers_before=%s buffers_after=%s reserve_tokens=%u reserve_outputs=%u nodes=%d leafs=%d splits=%d copies=%d\n",
+                d.id, d.context_id, d.role.c_str(), ggml_sched_trace_quote(d.recovery_reason.c_str()).c_str(), d.recoveries,
+                success, elapsed, d.recovery_event_sync_us, a.planning_us - before.planning_us, a.buffer_us - before.buffer_us, a.binding_us - before.binding_us,
+                a.buffer_allocations - before.buffer_allocations, a.gpu_buffer_allocations - before.gpu_buffer_allocations,
+                buffers_before.c_str(), buffers_after.c_str(), d.tokens, d.outputs, d.nodes, d.leafs, sched->n_splits, sched->n_copies);
+    }
+    d.in_recovery = false;
+    d.observer_us += ggml_time_us() - t_start;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

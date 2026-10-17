@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-context.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -94,6 +95,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1149,6 +1151,155 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+struct recovery_log {
+    ggml_log_callback callback;
+    void * user_data;
+    int reserves = 0;
+    int recoveries = 0;
+
+    recovery_log() {
+        llama_log_get(&callback, &user_data);
+        llama_log_set([](ggml_log_level level, const char * text, void * data) {
+            auto & log = *static_cast<recovery_log *>(data);
+            if (strstr(text, "graph_reserve: reserving a graph for ubatch")) {
+                ++log.reserves;
+            }
+            const bool recovery = strstr(text, "sched_realloc_diag: event=recovery ") != nullptr;
+            log.recoveries += recovery;
+            if (recovery || level >= GGML_LOG_LEVEL_ERROR) {
+                log.callback(level, text, log.user_data);
+            }
+        }, this);
+    }
+
+    ~recovery_log() {
+        llama_log_set(callback, user_data);
+    }
+};
+
+static std::vector<float> recovery_decode(llama_context * ctx, llama_pos & pos, int tokens, int outputs, bool raw, bool mtp, bool mixed = false) {
+    const auto * model = llama_get_model(ctx);
+    const size_t n_embd = llama_model_n_embd_inp(model);
+    const size_t n_state = llama_model_n_embd(model);
+    const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    std::vector<float> embd(n_embd, 0.01f);
+    std::vector<float> state(n_state, 0.02f);
+    common_batch batch(ctx);
+    for (int i = 0; i < tokens; ++i) {
+        llama_pos p[4] = { pos, pos, pos, 0 };
+        const bool output = i >= tokens - outputs;
+        const int idx = raw && (!mixed || i % 2 == 0)
+            ? batch.add_embd({ embd.data(), 1, n_embd }, p, 0, output)
+            : batch.add(pos % n_vocab, pos, 0, output);
+        if (mtp) {
+            GGML_ASSERT(batch.set_embd_state(idx, { state.data(), 1, n_state }));
+        }
+        ++pos;
+    }
+    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    llama_synchronize(ctx);
+    std::vector<float> logits;
+    for (int i = 0; i < outputs; ++i) {
+        const float * row = llama_get_logits_ith(ctx, tokens - outputs + i);
+        GGML_ASSERT(row);
+        for (size_t j = 0; j < n_vocab; ++j) {
+            GGML_ASSERT(std::isfinite(row[j]));
+            logits.push_back(row[j]);
+        }
+    }
+    return logits;
+}
+
+static int test_graph_recovery(size_t seed, float stdev) {
+    recovery_log log;
+    for (int config = 0; config < 6; ++config) {
+        const bool mtp = config % 3 == 2;
+        const bool quantized = config >= 3;
+        const llm_arch arch = config % 3 == 0 ? LLM_ARCH_LLAMA : LLM_ARCH_QWEN35;
+        auto meta = get_gguf_ctx(arch, false);
+        if (arch == LLM_ARCH_QWEN35) {
+            gguf_set_val_u32(meta.get(), "qwen35.full_attention_interval", 2);
+        }
+        if (mtp) {
+            gguf_set_val_u32(meta.get(), "qwen35.nextn_predict_layers", 1);
+            gguf_set_val_u32(meta.get(), "qwen35.block_count", 3);
+        }
+        auto mp = llama_model_default_params();
+        ggml_backend_dev_t devices[] = { nullptr };
+        mp.devices = devices;
+        mp.n_gpu_layers = 0;
+        mp.load_mtp = mtp;
+        tensor_data_params data = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+        GGML_ASSERT(model);
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 512;
+        cp.n_batch = cp.n_ubatch = 64;
+        cp.n_outputs_max = cp.n_outputs_max_per_seq = mtp ? 1 : 49;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.ctx_type = mtp ? LLAMA_CONTEXT_TYPE_MTP : LLAMA_CONTEXT_TYPE_DEFAULT;
+        if (quantized) {
+            cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        llama_context_ptr reference(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(ctx && reference);
+        if (mtp) {
+            llama_set_embeddings_nextn(ctx.get(), true, true);
+            llama_set_embeddings_nextn(reference.get(), true, true);
+        }
+        llama_pos pos = 0;
+        recovery_decode(ctx.get(), pos, 4, 1, false, mtp);
+        llama_pos ref_start = 0;
+        recovery_decode(reference.get(), ref_start, 4, 1, false, mtp);
+        ggml_backend_sched_t scheduler = ctx->get_sched();
+        const size_t buffer_size = ggml_backend_sched_get_buffer_size(scheduler, ggml_backend_sched_get_backend(scheduler, 0));
+        for (int transition = 0; transition < 2; ++transition) {
+            recovery_decode(ctx.get(), pos, 3, 0, true, mtp, transition == 1 && !mtp);
+            // Restore the same sequence into a context that still has its initial text plan.
+            const size_t size = llama_state_seq_get_size(ctx.get(), 0);
+            std::vector<uint8_t> checkpoint(size);
+            GGML_ASSERT(size && llama_state_seq_get_data(ctx.get(), checkpoint.data(), size, 0) == size);
+            GGML_ASSERT(llama_state_seq_set_data(reference.get(), checkpoint.data(), size, 0) == size);
+            llama_pos ref_pos = pos;
+            for (int step = 0; step < 9; ++step) {
+                const int tokens = step == 0 ? 33 : step % 2 ? 1 : 4;
+                const int outputs = step % 2 ? 1 : 0;
+                const int before = log.reserves;
+                const int before_recovery = log.recoveries;
+                auto actual = recovery_decode(ctx.get(), pos, tokens, outputs, false, mtp);
+                GGML_ASSERT(log.reserves - before == (step == 0 ? 1 : 0));
+                const bool traced = ggml_backend_sched_get_realloc_trace_id(scheduler) != 0;
+                GGML_ASSERT(log.recoveries - before_recovery == (traced && step == 0 ? 1 : 0));
+                const int before_ref = log.reserves;
+                auto expected = recovery_decode(reference.get(), ref_pos, tokens, outputs, false, mtp);
+                GGML_ASSERT(log.reserves == before_ref);
+                GGML_ASSERT(actual == expected);
+            }
+            if (!mtp) {
+                const int before = log.reserves;
+                auto actual = recovery_decode(ctx.get(), pos, 49, 49, false, mtp);
+                auto expected = recovery_decode(reference.get(), ref_pos, 49, 49, false, mtp);
+                GGML_ASSERT(actual == expected && log.reserves == before);
+            }
+            const auto reused = llama_perf_context(ctx.get()).n_reused;
+            const int before = log.reserves;
+            for (int i = 0; i < 4; ++i) {
+                auto actual = recovery_decode(ctx.get(), pos, 1, 1, false, mtp);
+                auto expected = recovery_decode(reference.get(), ref_pos, 1, 1, false, mtp);
+                GGML_ASSERT(actual == expected);
+            }
+            GGML_ASSERT(log.reserves == before && llama_perf_context(ctx.get()).n_reused > reused);
+            GGML_ASSERT(ctx->get_sched() == scheduler);
+            GGML_ASSERT(ggml_backend_sched_get_buffer_size(scheduler, ggml_backend_sched_get_backend(scheduler, 0)) == buffer_size);
+            GGML_ASSERT(llama_perf_context(ctx.get()).n_reallocs_same == 0);
+        }
+        printf("graph recovery: %s%s KV=%s passed\n", llm_arch_name(arch), mtp ? " MTP" : "", quantized ? "q8_0" : "f16");
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1162,6 +1313,7 @@ int main(int argc, char ** argv) {
     float stdev = 0.1f;
     std::string out;
     const char * target_backend = nullptr;
+    bool graph_recovery = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1229,6 +1381,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--test-graph-recovery") == 0) {
+            graph_recovery = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1242,6 +1396,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (graph_recovery) {
+            return test_graph_recovery(seed, stdev);
+        }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
