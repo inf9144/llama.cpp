@@ -62,6 +62,57 @@ static server_prompt_cache_state make_state(const std::vector<llama_token> & tok
     return state;
 }
 
+static common_prompt_checkpoint make_checkpoint() {
+    common_prompt_checkpoint ckpt;
+    ckpt.n_tokens = 3;
+    ckpt.id_task = 7;
+    ckpt.pos_min = 0;
+    ckpt.pos_max = 2;
+    ckpt.data_tgt = {1, 2, 3};
+    ckpt.data_dft = {4, 5};
+    ckpt.data_spec = {6, 7, 8, 9};
+    return ckpt;
+}
+
+static std::vector<char> read_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    CHECK(f.good(), "open snapshot file");
+    return std::vector<char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static void check_stored_state(server_prompt_cache_ssd & cache, const server_prompt_cache_state & expected) {
+    int lcp = -1;
+    const auto * e = cache.find_best(expected.prompt.tokens, lcp);
+    CHECK(e != nullptr, "stored entry discoverable");
+    CHECK(lcp == static_cast<int>(expected.prompt.tokens.size()), "stored tokens match");
+    if (!e) {
+        return;
+    }
+
+    server_prompt prompt;
+    server_prompt_data data;
+    const bool ok = cache.read_state(*e, prompt, data);
+    CHECK(ok, "read serialized state without a llama context");
+    if (!ok) {
+        return;
+    }
+    CHECK(prompt.tokens.serialize() == expected.prompt.tokens.serialize(), "serialized tokens intact");
+    CHECK(data.main == expected.data.main, "main state bytes intact");
+    CHECK(data.drft == expected.data.drft, "draft state bytes intact");
+    CHECK(prompt.checkpoints.size() == expected.prompt.checkpoints.size(), "checkpoint count intact");
+    auto actual = prompt.checkpoints.begin();
+    for (const auto & ckpt : expected.prompt.checkpoints) {
+        if (actual == prompt.checkpoints.end()) {
+            break;
+        }
+        CHECK(actual->n_tokens == ckpt.n_tokens && actual->id_task == ckpt.id_task &&
+              actual->pos_min == ckpt.pos_min && actual->pos_max == ckpt.pos_max, "checkpoint metadata intact");
+        CHECK(actual->data_tgt == ckpt.data_tgt && actual->data_dft == ckpt.data_dft &&
+              actual->data_spec == ckpt.data_spec, "checkpoint bytes intact");
+        ++actual;
+    }
+}
+
 // test the file format round-trip
 static void test_roundtrip(const std::string & dir) {
     const auto fp = make_fp();
@@ -70,6 +121,7 @@ static void test_roundtrip(const std::string & dir) {
 
     const std::vector<llama_token> toks = {1, 2, 3, 4, 5, 6, 7, 8};
     auto state = make_state(toks, 100, 50);
+    state.prompt.checkpoints.push_back(make_checkpoint());
 
     CHECK(cache.save(state), "save");
     CHECK(cache.n_entries() == 1, "n_entries == 1");
@@ -96,6 +148,83 @@ static void test_roundtrip(const std::string & dir) {
     server_prompt_cache_ssd cache2(dir, 0);
     CHECK(cache2.init(fp), "init2");
     CHECK(cache2.n_entries() == 1, "n_entries2 == 1");
+    check_stored_state(cache2, state);
+}
+
+static void test_save_limit_and_replacement(const std::string & dir) {
+    const auto fp = make_fp();
+    auto state = make_state({1, 2, 3, 4}, 100, 50);
+    state.prompt.checkpoints.push_back(make_checkpoint());
+
+    size_t snapshot_size = 0;
+    std::string path;
+    {
+        server_prompt_cache_ssd probe(dir, 0);
+        CHECK(probe.init(fp), "probe init");
+        CHECK(probe.save(state), "probe save");
+        int lcp = -1;
+        const auto * e = probe.find_best(state.prompt.tokens, lcp);
+        CHECK(e != nullptr, "probe entry");
+        if (!e) {
+            return;
+        }
+        snapshot_size = e->size;
+        path = probe.model_dir() + "/" + e->key + ".lsc";
+    }
+
+    // Two snapshots fit exactly, including tokens, checkpoints and format metadata.
+    const size_t limit = 2*snapshot_size;
+    server_prompt_cache_ssd cache(dir, limit);
+    CHECK(cache.init(fp), "limited cache init");
+    auto second = make_state({9, 9, 9, 9}, 100, 50);
+    second.prompt.checkpoints.push_back(make_checkpoint());
+    CHECK(cache.save(second), "save at exact capacity");
+    CHECK(cache.n_entries() == 2 && cache.size() == limit, "exact capacity accounting");
+    CHECK(cache.n_evictions() == 0, "no eviction at capacity");
+    const auto original_bytes = read_file(path);
+
+    auto oversized = make_state({1, 2, 3, 4}, limit - 50 - make_checkpoint().size(), 50);
+    oversized.prompt.checkpoints.push_back(make_checkpoint());
+    CHECK(oversized.size() == limit, "payload fits but serialized metadata exceeds limit");
+    const std::string tmp_path = path + ".tmp";
+    {
+        std::ofstream f(tmp_path, std::ios::binary);
+        f << "untouched";
+    }
+    const auto tmp_bytes = read_file(tmp_path);
+    CHECK(!cache.save(oversized), "oversized replacement rejected");
+    CHECK(read_file(tmp_path) == tmp_bytes, "oversized save does not open the temp file");
+    CHECK(read_file(path) == original_bytes, "oversized replacement preserves old snapshot");
+    std::filesystem::remove(tmp_path);
+
+    oversized.prompt.tokens = server_tokens(llama_tokens({8, 8, 8, 8}), false);
+    CHECK(!cache.save(oversized), "oversized new snapshot rejected");
+    CHECK(cache.n_entries() == 2 && cache.size() == limit && cache.n_evictions() == 0, "rejection preserves cache accounting");
+
+    // A directory at the temp path causes a deterministic write failure, including as root.
+    std::filesystem::create_directory(tmp_path);
+    state.data.main[0] ^= 0xff;
+    CHECK(!cache.save(state), "failed replacement reports failure");
+    CHECK(read_file(path) == original_bytes, "failed write preserves old snapshot");
+    CHECK(cache.n_entries() == 2 && cache.size() == limit && cache.n_evictions() == 0, "failed write preserves accounting");
+    std::filesystem::remove(tmp_path);
+
+    CHECK(cache.save(state), "normal replacement succeeds");
+    CHECK(cache.n_entries() == 2 && cache.size() == limit, "replacement counted once");
+    auto third = make_state({7, 7, 7, 7}, 100, 50);
+    third.prompt.checkpoints.push_back(make_checkpoint());
+    CHECK(cache.save(third), "normal snapshot retained after eviction");
+    CHECK(cache.n_entries() == 2 && cache.size() == limit && cache.n_evictions() == 1, "LRU eviction accounting");
+    int lcp = -1;
+    CHECK(cache.find_best(second.prompt.tokens, lcp) == nullptr, "replacement becomes most recently used");
+    check_stored_state(cache, state);
+    check_stored_state(cache, third);
+
+    server_prompt_cache_ssd restarted(dir, limit);
+    CHECK(restarted.init(fp), "limited cache restart");
+    CHECK(restarted.n_entries() == 2 && restarted.size() == limit, "retained snapshots indexed after restart");
+    check_stored_state(restarted, state);
+    check_stored_state(restarted, third);
 }
 
 // test LRU eviction
@@ -237,29 +366,59 @@ static void test_version_mismatch(const std::string & dir) {
     server_prompt_cache_ssd cache(dir, 0);
     CHECK(cache.init(fp), "init");
 
-    const std::string mdir = cache.model_dir();
+    auto old_state = make_state({1, 2, 3, 4, 5}, 100, 50);
+    old_state.prompt.checkpoints.push_back(make_checkpoint());
+    auto current_state = make_state({9, 8, 7, 6, 5}, 200, 75);
+    CHECK(cache.save(old_state), "save snapshot to downgrade");
+    CHECK(cache.save(current_state), "save current-version control");
 
-    // write a file with a valid magic but an old format version (1 < current)
-    const std::string old_path = mdir + "/oldversionoldversionoldversion.lsc";
-    {
-        std::ofstream f(old_path, std::ios::binary);
-        const uint32_t magic   = 0x5343504c;  // SSD_MAGIC
-        const uint32_t version = 1;          // older than the current SSD_VERSION
-        f.write(reinterpret_cast<const char *>(&magic),   sizeof(magic));
-        f.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    server_prompt_cache_ssd valid(dir, 0);
+    CHECK(valid.init(fp), "index valid snapshots");
+    CHECK(valid.n_entries() == 2, "both current snapshots indexed");
+    check_stored_state(valid, old_state);
+    check_stored_state(valid, current_state);
+    int lcp = -1;
+    const auto * e = valid.find_best(old_state.prompt.tokens, lcp);
+    CHECK(e != nullptr, "find snapshot to downgrade");
+    if (!e) {
+        return;
     }
+    const std::string old_path = valid.model_dir() + "/" + e->key + ".lsc";
+    const auto original = read_file(old_path);
+    const size_t version_offset = sizeof(uint32_t);
+    uint32_t version = 0;
+    if (original.size() < version_offset + sizeof(version)) {
+        CHECK(false, "complete version field");
+        return;
+    }
+    std::memcpy(&version, original.data() + version_offset, sizeof(version));
+    CHECK(version == 2, "production serializer writes version 2");
+    --version;
+    {
+        std::fstream f(old_path, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekp(version_offset);
+        f.write(reinterpret_cast<const char *>(&version), sizeof(version));
+        CHECK(f.good(), "patch only the version field");
+    }
+    auto expected_bytes = original;
+    std::memcpy(expected_bytes.data() + version_offset, &version, sizeof(version));
+    CHECK(read_file(old_path) == expected_bytes, "remaining serialized structure unchanged");
+
+    server_prompt prompt;
+    server_prompt_data data;
+    CHECK(!valid.read_state(*e, prompt, data), "state reader rejects incompatible version");
 
     // re-init, the old-version file must be removed, not indexed
     server_prompt_cache_ssd cache2(dir, 0);
     CHECK(cache2.init(fp), "init2");
     CHECK(!std::filesystem::exists(old_path), "old-version file removed");
-    CHECK(cache2.n_entries() == 0, "old-version file not indexed");
+    CHECK(cache2.n_entries() == 1, "only current-version snapshot indexed");
+    CHECK(cache2.find_best(old_state.prompt.tokens, lcp) == nullptr, "old-version snapshot not discoverable");
+    check_stored_state(cache2, current_state);
 }
 
-// test the RAM tier behavior that triggers the SSD fallback in server_slot::prompt_save():
-// an oversized state makes alloc() fail without being reported as cached, and RAM
-// eviction saves the evicted entry to the SSD tier
-static void test_ram_limit_ssd_fallback(const std::string & dir) {
+// Test RAM allocation and eviction separately from the direct save_state() fallback.
+static void test_ram_alloc_eviction(const std::string & dir) {
     const auto fp = make_fp();
     server_prompt_cache_ssd ssd(dir, 0);
     CHECK(ssd.init(fp), "ssd init");
@@ -290,6 +449,83 @@ static void test_ram_limit_ssd_fallback(const std::string & dir) {
     auto * st2 = ram.alloc(prompt2, size_half, 0);
     CHECK(st2 != nullptr, "alloc succeeds for second state");
     CHECK(ssd.n_entries() == 1, "evicted state saved to SSD");
+}
+
+static constexpr size_t TEST_STATE_SIZE = 2*1024*1024;
+static constexpr llama_seq_id TEST_SLOT_ID = 7;
+
+// Replace only llama state capture. RAM allocation, SSD saving and reading remain real.
+static void use_test_state_reader(server_prompt_cache & cache) {
+    cache.get_state_size = [](llama_context *, llama_seq_id id, llama_state_seq_flags flags) -> size_t {
+        CHECK(id == TEST_SLOT_ID && flags == LLAMA_STATE_SEQ_FLAGS_NONE, "state size arguments");
+        return TEST_STATE_SIZE;
+    };
+    cache.get_state_data = [](llama_context *, uint8_t * dst, size_t size, llama_seq_id id, llama_state_seq_flags flags) -> size_t {
+        CHECK(size == TEST_STATE_SIZE && id == TEST_SLOT_ID && flags == LLAMA_STATE_SEQ_FLAGS_NONE, "state read arguments");
+        for (size_t i = 0; i < size; ++i) {
+            dst[i] = static_cast<uint8_t>(i & 0xff);
+        }
+        return size;
+    };
+}
+
+static void test_ram_limit_ssd_fallback(const std::string & dir) {
+    const auto fp = make_fp();
+    server_prompt_cache_ssd ssd(dir, 0);
+    CHECK(ssd.init(fp), "ssd init");
+    auto state = make_state({1, 2, 3, 4, 5}, TEST_STATE_SIZE, 0);
+    state.prompt.checkpoints.push_back(make_checkpoint());
+
+    server_prompt_cache ram(1, 0, &ssd);
+    use_test_state_reader(ram);
+    CHECK(state.size() > ram.limit_size, "snapshot exceeds RAM capacity");
+    CHECK(ram.alloc(state.prompt, TEST_STATE_SIZE, 0) == nullptr, "RAM cannot retain snapshot");
+    CHECK(ram.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "save_state directly persists oversized RAM snapshot to SSD");
+    CHECK(ram.states.empty() && !ram.is_in_cache(state.prompt), "snapshot not retained in RAM");
+    CHECK(ssd.n_entries() == 1 && ssd.n_evictions() == 0, "direct save without RAM eviction");
+    check_stored_state(ssd, state);
+    server_prompt_cache_ssd restarted(dir, 0);
+    CHECK(restarted.init(fp), "fallback snapshot restart");
+    check_stored_state(restarted, state);
+
+    server_prompt_cache no_ssd(1, 0);
+    use_test_state_reader(no_ssd);
+    CHECK(!no_ssd.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "no SSD fallback reports failure");
+    CHECK(no_ssd.states.empty(), "failed save leaves RAM empty");
+
+    server_prompt_cache_ssd too_small(dir + "/small", 1024);
+    CHECK(too_small.init(fp), "small SSD init");
+    server_prompt_cache limited(1, 0, &too_small);
+    use_test_state_reader(limited);
+    CHECK(!limited.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "oversized SSD fallback reports failure");
+    CHECK(limited.states.empty() && too_small.n_entries() == 0 && too_small.size() == 0 && too_small.n_evictions() == 0, "oversized fallback retains nothing");
+
+    server_prompt_cache_ssd unwritable(dir + "/blocked", 0);
+    CHECK(unwritable.init(fp), "blocked SSD init");
+    std::filesystem::remove(unwritable.model_dir());
+    {
+        std::ofstream f(unwritable.model_dir());
+        f << "block snapshot directory";
+    }
+    server_prompt_cache failed(1, 0, &unwritable);
+    use_test_state_reader(failed);
+    CHECK(!failed.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "failed SSD write reports failure");
+    CHECK(failed.states.empty() && unwritable.n_entries() == 0 && unwritable.size() == 0, "failed fallback retains nothing");
+
+    ram.get_state_data = [](llama_context *, uint8_t *, size_t, llama_seq_id, llama_state_seq_flags) -> size_t { return 0; };
+    auto other = state.prompt.clone();
+    other.tokens = server_tokens(llama_tokens({9, 9, 9, 9, 9}), false);
+    CHECK(!ram.save_state(other, nullptr, nullptr, TEST_SLOT_ID), "failed state capture reports failure before SSD save");
+    CHECK(ram.states.empty() && ssd.n_entries() == 1, "failed capture does not publish a snapshot");
+
+    server_prompt_cache fitting(3, 0);
+    use_test_state_reader(fitting);
+    fitting.get_state_data = ram.get_state_data;
+    CHECK(!fitting.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "failed RAM state capture reports failure");
+    CHECK(fitting.states.empty() && !fitting.is_in_cache(state.prompt), "failed RAM capture is not reusable");
+    use_test_state_reader(fitting);
+    CHECK(fitting.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "normal RAM save_state succeeds");
+    CHECK(fitting.is_in_cache(state.prompt) && fitting.states.back().data.main == state.data.main, "normal RAM state bytes intact");
 }
 
 // test temp file cleanup
@@ -327,6 +563,11 @@ int main(int argc, char ** argv) {
     test_lru(dir2);
     std::filesystem::remove_all(dir2);
 
+    const std::string dir2b = make_temp_dir() + "-save-limit";
+    std::filesystem::create_directories(dir2b);
+    test_save_limit_and_replacement(dir2b);
+    std::filesystem::remove_all(dir2b);
+
     const std::string dir3 = make_temp_dir() + "-fp";
     std::filesystem::create_directories(dir3);
     test_fingerprint_mismatch(dir3);
@@ -346,6 +587,11 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir4d);
     test_ram_limit_ssd_fallback(dir4d);
     std::filesystem::remove_all(dir4d);
+
+    const std::string dir4e = make_temp_dir() + "-ram-eviction";
+    std::filesystem::create_directories(dir4e);
+    test_ram_alloc_eviction(dir4e);
+    std::filesystem::remove_all(dir4e);
 
     const std::string dir4b = make_temp_dir() + "-fp-lora-swa";
     std::filesystem::create_directories(dir4b);

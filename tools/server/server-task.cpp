@@ -2203,8 +2203,17 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
         return true;
     }
 
-    const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-    const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+    const size_t cur_size_tgt =           get_state_size(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t cur_size_dft = ctx_dft ? get_state_size(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    auto read_data = [&](server_prompt_data & data) {
+        if (get_state_data(ctx_tgt, data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_tgt ||
+                (ctx_dft && get_state_data(ctx_dft, data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != cur_size_dft)) {
+            SRV_ERR("%s", "failed to capture prompt cache state\n");
+            return false;
+        }
+        return true;
+    };
 
     auto * cur = alloc(prompt, cur_size_tgt, cur_size_dft);
     if (cur == nullptr) {
@@ -2215,9 +2224,8 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
                 state.prompt = prompt.clone();
                 state.data.main.resize(cur_size_tgt);
                 state.data.drft.resize(cur_size_dft);
-                llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-                if (ctx_dft) {
-                    llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (!read_data(state.data)) {
+                    return false;
                 }
                 return ssd->save(state);
             } catch (const std::bad_alloc & e) {
@@ -2228,9 +2236,9 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
         return false;
     }
 
-    llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-    if (ctx_dft) {
-        llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (!read_data(cur->data)) {
+        states.pop_back();
+        return false;
     }
     return true;
 }

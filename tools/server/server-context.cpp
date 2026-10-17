@@ -3009,6 +3009,9 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+                                } else if (slot.prompt.n_tokens() > 0) {
+                                    SLT_WRN(slot, "failed to cache idle prompt with %zu tokens; %s\n", slot.prompt.tokens.size(),
+                                            params_base.kv_unified ? "clearing slot to reclaim unified KV memory" : "keeping state in slot");
                                 }
 
                                 if (params_base.kv_unified) {

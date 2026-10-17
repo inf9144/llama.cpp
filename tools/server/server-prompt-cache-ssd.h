@@ -108,12 +108,15 @@ struct server_prompt_cache_ssd {
     // corrupt entries (bad magic/version, truncated) are deleted
     bool init(const server_prompt_cache_ssd_fingerprint & fp);
 
-    // write a state to SSD atomically. returns true on success
+    // write a state to SSD atomically. returns true only when the snapshot is retained
     bool save(const server_prompt_cache_state & state);
 
     // find the best candidate by common prefix length, using only the in-RAM token index
     // returns nullptr when no entry qualifies, sets lcp_out to the best common prefix length
     const entry * find_best(const server_tokens & tokens_new, int & lcp_out);
+
+    // read the serialized state without restoring a llama context or updating the LRU
+    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data) const;
 
     // load the state of the given entry into the slot (restores main + draft KV)
     // returns false when the restore failed
@@ -156,8 +159,7 @@ private:
     // path of a snapshot file inside the model subdirectory
     std::string entry_path(const std::string & key) const;
 
-    bool save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms) const;
+    bool save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms, size_t & file_size) const;
     bool read_header(const std::string & path, entry & e, server_prompt_cache_ssd_fingerprint & fp_out) const;
-    bool read_state(const std::string & path, server_prompt & prompt, server_prompt_data & data) const;
     void touch_file(const std::string & path, int64_t last_access_ms) const;
 };

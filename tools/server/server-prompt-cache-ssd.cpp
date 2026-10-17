@@ -165,7 +165,34 @@ bool server_prompt_cache_ssd::init(const server_prompt_cache_ssd_fingerprint & f
     return true;
 }
 
-bool server_prompt_cache_ssd::save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms) const {
+bool server_prompt_cache_ssd::save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms, size_t & file_size) const {
+    const std::vector<char> packed = state.prompt.tokens.serialize();
+
+    if (limit_size > 0) {
+        size_t remaining = limit_size;
+        auto fits = [&](size_t size) {
+            if (size > remaining) {
+                return false;
+            }
+            remaining -= size;
+            return true;
+        };
+
+        // Include all format metadata. Subtract each blob size to avoid overflow.
+        const size_t header_size = sizeof(SSD_MAGIC) + sizeof(SSD_VERSION) + sizeof(last_access_ms) + sizeof(fp)
+                                 + sizeof(uint8_t) + 2*sizeof(uint32_t) + 3*sizeof(uint64_t);
+        bool fits_limit = fits(header_size) && fits(packed.size()) && fits(state.data.main.size()) && fits(state.data.drft.size());
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            fits_limit = fits_limit
+                      && fits(sizeof(ckpt.n_tokens) + sizeof(ckpt.id_task) + sizeof(ckpt.pos_min) + sizeof(ckpt.pos_max) + 3*sizeof(uint64_t))
+                      && fits(ckpt.data_tgt.size()) && fits(ckpt.data_dft.size()) && fits(ckpt.data_spec.size());
+        }
+        if (!fits_limit) {
+            SRV_WRN("ssd cache: snapshot exceeds size limit %.3f MiB, skipping\n", limit_size / (1024.0 * 1024.0));
+            return false;
+        }
+    }
+
     const std::string tmp_path = path + ".tmp";
 
     std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
@@ -192,7 +219,6 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
     }
 
     if (ok) {
-        const std::vector<char> packed = state.prompt.tokens.serialize();
         const uint32_t n_tokens = static_cast<uint32_t>(packed.size() / sizeof(llama_token));
         ok = write(&n_tokens, sizeof(n_tokens))
            && write(packed.data(), packed.size());
@@ -239,6 +265,13 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
         ok = f.good();
     }
     f.close();
+    ok = ok && !f.fail();
+
+    if (ok) {
+        std::error_code ec;
+        file_size = std::filesystem::file_size(tmp_path, ec);
+        ok = !ec && (limit_size == 0 || file_size <= limit_size);
+    }
 
     if (!ok) {
         std::remove(tmp_path.c_str());
@@ -342,8 +375,8 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
     return true;
 }
 
-bool server_prompt_cache_ssd::read_state(const std::string & path, server_prompt & prompt, server_prompt_data & data) const {
-    std::ifstream f(path, std::ios::binary);
+bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data) const {
+    std::ifstream f(entry_path(e.key), std::ios::binary);
     if (!f) {
         return false;
     }
@@ -479,11 +512,10 @@ bool server_prompt_cache_ssd::save(const server_prompt_cache_state & state) {
     const std::string path = entry_path(key);
     const int64_t now = now_ms();
 
-    if (!save_file(path, state, now)) {
+    size_t file_size = 0;
+    if (!save_file(path, state, now, file_size)) {
         return false;
     }
-
-    const size_t file_size = std::filesystem::file_size(path);
 
     auto it = index.find(key);
     if (it != index.end()) {
@@ -507,7 +539,7 @@ bool server_prompt_cache_ssd::save(const server_prompt_cache_state & state) {
 
     update();
 
-    return true;
+    return index.find(key) != index.end();
 }
 
 const server_prompt_cache_ssd::entry * server_prompt_cache_ssd::find_best(const server_tokens & tokens_new, int & lcp_out) {
@@ -538,7 +570,7 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
 
     server_prompt prompt_loaded;
     server_prompt_data data;
-    if (!read_state(path, prompt_loaded, data)) {
+    if (!read_state(e, prompt_loaded, data)) {
         SRV_ERR("ssd cache: failed to read state '%s'\n", e.key.c_str());
         // remove the corrupt entry so it is not offered again
         std::remove(path.c_str());

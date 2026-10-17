@@ -728,6 +728,10 @@ struct server_prompt_cache {
     // optional persistent second tier, nullptr when disabled
     server_prompt_cache_ssd * ssd = nullptr;
 
+    // State accessors separate snapshot capture from cache storage.
+    decltype(llama_state_seq_get_size_ext) * get_state_size = llama_state_seq_get_size_ext;
+    decltype(llama_state_seq_get_data_ext) * get_state_data = llama_state_seq_get_data_ext;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -740,7 +744,7 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     // save the current slot state into the RAM cache, called only when the slot is about to be replaced
-    // returns true when the state is now in the RAM tier or was written to the SSD tier
+    // returns true when the state is retained in the RAM or SSD tier
     bool save_state(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
