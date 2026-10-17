@@ -442,10 +442,6 @@ struct server_task_result_cmpl_final : server_task_result {
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         if (generation_params.responses_compaction) {
-            if (content.text.find_first_not_of(" \t\r\n") == std::string::npos) {
-                throw std::runtime_error("Responses compaction generated no model output");
-            }
-
             const std::string & prefill_content = compaction_prefill_msg.content;
             const std::string & final_content = oaicompat_msg.content;
             if (final_content.size() < prefill_content.size() ||
@@ -453,6 +449,9 @@ struct server_task_result_cmpl_final : server_task_result {
                 throw std::runtime_error("Responses compaction output does not extend its generation prefill");
             }
             oai_resp_compaction_content = final_content.substr(prefill_content.size());
+            if (oai_resp_compaction_content.find_first_not_of(" \t\r\n") == std::string::npos) {
+                throw std::runtime_error("Responses compaction generated no model output");
+            }
         }
 
         oai_resp_id = state.oai_resp_id;

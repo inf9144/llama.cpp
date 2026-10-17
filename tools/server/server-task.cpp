@@ -14,7 +14,7 @@
 #include <sstream>
 
 static json server_task_build_response_compaction(const std::string & summary) {
-    if (summary.find_first_not_of(" \\t\\r\\n") == std::string::npos) {
+    if (summary.find_first_not_of(" \t\r\n") == std::string::npos) {
         throw std::runtime_error("Responses compaction generated an empty summary");
     }
 
