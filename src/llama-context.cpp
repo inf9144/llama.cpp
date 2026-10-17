@@ -812,22 +812,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        // TODO: the worst case graph is not always reached for `n_seqs > 1`
-        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
-        switch (model.arch) {
-            case LLM_ARCH_KIMI_LINEAR:
-            case LLM_ARCH_MINIMAX_01:
-                // [TAG_RESERVE_DIAG_DECAY]
-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-                break;
-            default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
-        };
-
-        if (!gf) {
+        if (!graph_reserve_worst_case(mctx.get(), model.hparams.no_alloc)) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
     }
@@ -866,6 +851,49 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+ggml_cgraph * llama_context::graph_reserve_worst_case(const llama_memory_context_i * mctx, bool split_only) {
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
+    uint32_t n_seqs = cparams.n_seq_max;
+
+    // TODO: the worst case graph is not always reached for `n_seqs > 1`
+    //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+    switch (model.arch) {
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_MINIMAX_01:
+            // [TAG_RESERVE_DIAG_DECAY]
+            // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+            // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+            n_seqs = 1;
+            break;
+        default:
+            break;
+    }
+
+    sched_need_recover = true;
+    auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx, split_only);
+    if (gf) {
+        sched_need_recover = false;
+    }
+    return gf;
+}
+
+bool llama_context::sched_recover() {
+    // Finish async work before graph_reserve() releases graph metadata and reuses allocation addresses.
+    ggml_backend_sched_synchronize(sched.get());
+
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx) {
+            LLAMA_LOG_ERROR("%s: failed to initialize full memory context\n", __func__);
+            return false;
+        }
+    }
+
+    return graph_reserve_worst_case(mctx.get()) != nullptr;
 }
 
 void llama_context::synchronize() {
@@ -992,12 +1020,7 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
-
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
-
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve_worst_case(mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -1508,6 +1531,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const bool text_graph = ubatch.token && !ubatch.is_mixed() && gtype == ctx_type_to_graph_type(cparams.ctx_type);
+    if (!text_graph) {
+        // Embedding and auxiliary graphs can replace the text allocation plan, including on single-buffer schedulers.
+        sched_need_recover = true;
+    } else if (sched_need_recover && !sched_recover()) {
+        LLAMA_LOG_ERROR("%s: failed to recover text graph allocation\n", __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
 
@@ -2655,7 +2688,17 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (...) {
+        this->n_outputs = save_n_outputs;
+        throw;
+    }
+    this->n_outputs = save_n_outputs;
+    if (!gf) {
+        return nullptr;
+    }
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
@@ -2664,7 +2707,6 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
-    this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -2710,12 +2752,13 @@ llm_graph_params llama_context::graph_params(
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    lctx->sched_need_recover = true;
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
