@@ -229,6 +229,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
 
+    llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
