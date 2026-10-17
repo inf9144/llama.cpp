@@ -11,6 +11,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-context.h"
+#include "../src/llama-memory.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1156,6 +1157,7 @@ struct recovery_log {
     void * user_data;
     int reserves = 0;
     int recoveries = 0;
+    unsigned last_reserve_n_seqs = 0;
 
     recovery_log() {
         llama_log_get(&callback, &user_data);
@@ -1163,6 +1165,8 @@ struct recovery_log {
             auto & log = *static_cast<recovery_log *>(data);
             if (strstr(text, "graph_reserve: reserving a graph for ubatch")) {
                 ++log.reserves;
+                const auto * n_seqs = strstr(text, "n_seqs = ");
+                GGML_ASSERT(n_seqs && sscanf(n_seqs, "n_seqs = %u", &log.last_reserve_n_seqs) == 1);
             }
             const bool recovery = strstr(text, "sched_realloc_diag: event=recovery ") != nullptr;
             log.recoveries += recovery;
@@ -1210,8 +1214,95 @@ static std::vector<float> recovery_decode(llama_context * ctx, llama_pos & pos, 
     return logits;
 }
 
+static void test_text_plan_retention(size_t seed, float stdev, recovery_log & log) {
+    auto meta = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto mp = llama_model_default_params();
+    // Two CPU backends make allocation failures use the scheduler callback, even with aliased buffer types.
+    ggml_backend_dev_t devices[] = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    GGML_ASSERT(devices[0]);
+    mp.devices = devices;
+    mp.n_gpu_layers = 0;
+    tensor_data_params data = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+    GGML_ASSERT(model);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 512;
+    cp.n_batch = cp.n_ubatch = 64;
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = 49;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+    llama_context_ptr reference(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(ctx && reference);
+    llama_pos pos = 0;
+    llama_pos ref_pos = 0;
+    recovery_decode(ctx.get(), pos, 4, 1, false, false);
+    recovery_decode(reference.get(), ref_pos, 4, 1, false, false);
+    const auto scheduler = ctx->get_sched();
+    GGML_ASSERT(ggml_backend_sched_get_n_backends(scheduler) == 2);
+
+    // Emulate a text reservation that does not cover the next valid batch.
+    auto mctx = ctx->get_memory()->init_full();
+    GGML_ASSERT(ctx->graph_reserve(1, 1, 1, mctx.get()));
+    auto perf = llama_perf_context(ctx.get());
+    const auto reallocs_before = perf.n_reallocs_same + perf.n_reallocs_diff;
+    for (int step = 0; step < 8; ++step) {
+        const int reserves_before = log.reserves;
+        auto actual = recovery_decode(ctx.get(), pos, 4, 4, false, false);
+        GGML_ASSERT(log.reserves == reserves_before);
+        auto expected = recovery_decode(reference.get(), ref_pos, 4, 4, false, false);
+        GGML_ASSERT(actual == expected);
+        const auto current = llama_perf_context(ctx.get());
+        if (step == 0) {
+            GGML_ASSERT(current.n_reallocs_same + current.n_reallocs_diff > reallocs_before);
+            perf = current;
+        } else {
+            GGML_ASSERT(current.n_reallocs_same == perf.n_reallocs_same && current.n_reallocs_diff == perf.n_reallocs_diff);
+        }
+        GGML_ASSERT(ctx->get_sched() == scheduler);
+    }
+    printf("graph recovery: undersized text plan retains runtime reservation passed\n");
+}
+
+static void test_memory_update_reservation(size_t seed, float stdev, recovery_log & log) {
+    for (auto arch : { LLM_ARCH_KIMI_LINEAR, LLM_ARCH_MINIMAX_01 }) {
+        auto meta = get_gguf_ctx(arch, true);
+        auto mp = llama_model_default_params();
+        ggml_backend_dev_t devices[] = { nullptr };
+        mp.devices = devices;
+        mp.n_gpu_layers = 0;
+        tensor_data_params data = { seed, stdev };
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+        GGML_ASSERT(model);
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 256;
+        cp.n_batch = cp.n_ubatch = 16;
+        cp.n_seq_max = 2;
+        cp.n_outputs_max = 2;
+        cp.n_outputs_max_per_seq = 1;
+        cp.n_threads = cp.n_threads_batch = 2;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(ctx && log.last_reserve_n_seqs == 1);
+        llama_pos pos = 0;
+        recovery_decode(ctx.get(), pos, 4, 0, true, false);
+        auto * memory = ctx->get_memory();
+        GGML_ASSERT(memory->get_can_shift());
+        memory->seq_add(0, 0, -1, 1);
+        ++pos;
+        const int before = log.reserves;
+        GGML_ASSERT(ctx->memory_update(false));
+        llama_synchronize(ctx.get());
+        GGML_ASSERT(log.reserves > before && log.last_reserve_n_seqs == cp.n_seq_max);
+        const int after = log.reserves;
+        recovery_decode(ctx.get(), pos, 1, 1, false, false);
+        GGML_ASSERT(log.reserves == after);
+        printf("graph recovery: %s memory update preserves n_seq_max passed\n", llm_arch_name(arch));
+    }
+}
+
 static int test_graph_recovery(size_t seed, float stdev) {
     recovery_log log;
+    test_text_plan_retention(seed, stdev, log);
+    test_memory_update_reservation(seed, stdev, log);
     for (int config = 0; config < 6; ++config) {
         const bool mtp = config % 3 == 2;
         const bool quantized = config >= 3;

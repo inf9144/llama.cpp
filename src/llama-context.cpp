@@ -1038,7 +1038,13 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        auto * gf = graph_reserve_worst_case(mctx.get());
+        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        sched_need_recover = !gf;
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2780,13 +2786,12 @@ llm_graph_params llama_context::graph_params(
 }
 
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
-    auto * lctx = static_cast<llama_context *>(user_data);
-    lctx->sched_need_recover = true;
-
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
+
+    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
