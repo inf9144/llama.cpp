@@ -2309,12 +2309,25 @@ Note that the following endpoints are exempt from being considered as incoming t
 
 The RAM prompt cache (see `--cache-ram`) can be extended with a persistent second tier on disk. States that are evicted from the RAM cache, as well as the active slots on a controlled shutdown, are written to a directory on SSD and survive server restarts. This is useful when several long-running agents (for example a multi-agent coding setup) each hold a large context and the RAM cache regularly evicts states that are needed again later, so that a full prefill can be avoided on restore.
 
-The SSD tier is disabled by default. When it is not configured, the server behavior is unchanged. It requires `--cache-ram` to be enabled.
+The SSD tier is disabled by default. When it is not configured, the server behavior is unchanged. It can be used with or without the RAM tier: `--cache-ram 0 --cache-ssd-dir PATH` keeps snapshots only on SSD. The token index and active context checkpoints still use RAM.
 
 ### Parameters
 
 - `--cache-ssd-dir PATH`: directory for the SSD tier. Created if it does not exist.
 - `--cache-ssd-size N`: maximum size of the SSD tier in MiB per model (default: 0, no limit). Eviction is LRU. The limit applies to each model's subdirectory, so the total on disk can be larger when several models are cached.
+- `--cache-ssd-io MODE`: `buffered` (default) captures and restores each SSD snapshot through a full host-memory buffer. `streaming` transfers the main and draft state in blocks through a host buffer of at most 64 MiB per transfer. Both modes read and write the same cache format and can share a cache directory. The setting also applies to active-slot saves on shutdown and sleep. Existing RAM snapshots are written from their buffers in either mode.
+
+For SSD-only storage with bounded transfer buffers:
+
+```sh
+llama-server -m /path/to/model.gguf \
+  --cache-ram 0 \
+  --cache-ssd-dir /path/to/ssd-cache \
+  --cache-ssd-size 450000 \
+  --cache-ssd-io streaming
+```
+
+Streaming removes the additional full-snapshot host buffer. It does not remove active checkpoints, token metadata, backend staging allocations, or the operating system's file cache. Restored checkpoints remain in RAM. With a nonzero RAM tier, retaining a snapshot there still requires its full RAM allocation.
 
 ### How it works
 
@@ -2322,6 +2335,7 @@ The SSD tier is disabled by default. When it is not configured, the server behav
 - **Restore without a redundant RAM copy.** When a SSD entry wins, its state is loaded directly into the active slot. The SSD copy is kept as a recovery point until a newer state replaces it; the normal RAM eviction flow handles the RAM tier separately.
 - **Compatibility fingerprint.** Each entry stores a fingerprint of the loaded model and the relevant KV/context configuration: target model dimensions, `ftype`, parameter and file size, file modification time, the draft model identity (for speculative decoding), the effective RoPE configuration (base, scale, scaling type) and YaRN overrides, KV cache data types, `--swa-full`, per-slot context size, flash attention and unified KV settings, the base LoRA adapters (path and scale), plus the state format version. Snapshots are stored in a per-model subdirectory (named by a hash of the fingerprint), so switching models never collides. An entry whose fingerprint does not match the currently loaded model is not offered as a candidate, but it is kept on disk so that switching back to that model reuses its cache again. Corrupt or truncated files are removed. Note that the fingerprint covers the base LoRA adapters loaded at startup; per-request LoRA adapters are not part of it, so a state saved under one per-request adapter set is not automatically excluded for a request with a different one (the same limitation applies to the RAM tier).
 - **Atomic writes.** Each entry is written to a `.tmp` file, verified, and then renamed into place. A trailing total-size field guards against truncated writes, so a previous valid snapshot is preserved until its successor is fully published. Leftover `.tmp` files are cleaned up on startup.
+- **Failed restores.** Both modes validate the container layout before applying the main and draft state. A failed restore clears the destination sequence in both contexts and discards its prompt metadata, so the server can prefill again. Other sequences are preserved.
 
 ### Observing hits, misses, and eviction
 

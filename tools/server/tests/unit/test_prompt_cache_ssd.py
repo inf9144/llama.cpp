@@ -37,14 +37,19 @@ def read_fingerprints():
     return fps
 
 
+@pytest.fixture(params=[(1, "buffered"), (1, "streaming"), (0, "buffered"), (0, "streaming")])
+def cache_mode(request):
+    return request.param
+
+
 @pytest.fixture(autouse=True)
-def create_server(tmp_path):
+def create_server(tmp_path, cache_mode):
     global server
     server = ServerPreset.tinyllama2()
     server.temperature = 0.0
     server.cache_ssd_dir = str(tmp_path / "ssd-cache")
-    # small RAM cache to force eviction to SSD
-    server.cache_ram = 1
+    # Exercise both RAM eviction and SSD-only storage in each I/O mode.
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     server.server_metrics = True
 
@@ -165,6 +170,7 @@ def test_ssd_restore_after_restart(tmp_path):
 
     # restart the server with the same SSD directory
     server.stop()
+    server.cache_ssd_io = "streaming" if server.cache_ssd_io == "buffered" else "buffered"
     server.start()
 
     # the state should be restored from the SSD cache after the restart
@@ -221,7 +227,7 @@ def test_ssd_flush_on_shutdown_while_sleeping(tmp_path):
         f"expected an SSD hit after shutdown while sleeping, before={hits_before} after={hits_after}"
 
 
-def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
+def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path, cache_mode):
     # a single state larger than the RAM limit must still be saved to SSD, even
     # though it can never fit in the RAM tier. tinygemma3 has a large enough KV
     # cache that a short prompt already exceeds the 1 MiB RAM limit.
@@ -229,7 +235,7 @@ def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
     server = ServerPreset.tinygemma3()
     server.temperature = 0.0
     server.cache_ssd_dir = str(tmp_path / "ssd-cache")
-    server.cache_ram = 1
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     server.server_metrics = True
     server.start()
@@ -269,12 +275,12 @@ def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
         f"expected an SSD hit for the large state, before={hits_before} after={hits_after}"
 
 
-def test_no_ssd_config_unchanged(tmp_path):
+def test_no_ssd_config_unchanged(tmp_path, cache_mode):
     # without the SSD config, the behavior is unchanged (no SSD cache)
     global server
     server = ServerPreset.tinyllama2()
     server.temperature = 0.0
-    server.cache_ram = 1
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     # no cache_ssd_dir
     server.start()

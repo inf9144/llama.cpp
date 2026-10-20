@@ -182,6 +182,19 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        common_params cache_params;
+        assert(!cache_params.cache_ssd_streaming);
+        for (const std::string mode : {"buffered", "streaming"}) {
+            argv = {"binary_name", "--cache-ram", "0", "--cache-ssd-dir", "cache", "--cache-ssd-io", mode};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+            assert(cache_params.cache_ram_mib == 0 && cache_params.cache_ssd_dir == "cache");
+            assert(cache_params.cache_ssd_streaming == (mode == "streaming"));
+        }
+        argv = {"binary_name", "--cache-ssd-io", "invalid"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value

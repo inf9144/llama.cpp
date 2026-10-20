@@ -1717,7 +1717,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
+        string_format("set the maximum RAM prompt cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable RAM tier)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
@@ -1742,6 +1742,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-io"}, "MODE",
+        "SSD prompt cache I/O: buffered or streaming (default: buffered)",
+        [](common_params & params, const std::string & value) {
+            if (value != "buffered" && value != "streaming") {
+                throw std::invalid_argument("cache-ssd-io must be buffered or streaming");
+            }
+            params.cache_ssd_streaming = value == "streaming";
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_IO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -1752,7 +1762,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
-        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
+        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires RAM or SSD cache)",
         [](common_params & params, bool value) {
             params.cache_idle_slots = value;
         }

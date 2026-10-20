@@ -3,8 +3,12 @@
 #include "common.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-cpp.h"
+#include "gguf.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -526,6 +530,206 @@ static void test_ram_limit_ssd_fallback(const std::string & dir) {
     use_test_state_reader(fitting);
     CHECK(fitting.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "normal RAM save_state succeeds");
     CHECK(fitting.is_in_cache(state.prompt) && fitting.states.back().data.main == state.data.main, "normal RAM state bytes intact");
+
+    server_prompt_cache disabled(0, 0, &ssd);
+    use_test_state_reader(disabled);
+    CHECK(disabled.alloc(state.prompt, 1, 0) == nullptr, "zero RAM limit disables even small RAM entries");
+    CHECK(disabled.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "zero RAM limit still saves to SSD");
+    CHECK(disabled.states.empty() && disabled.size() == 0, "SSD-only mode retains no RAM snapshots");
+
+    server_prompt_cache no_cache(0, 0);
+    use_test_state_reader(no_cache);
+    CHECK(!no_cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "both tiers disabled retain nothing");
+    CHECK(no_cache.states.empty(), "both tiers disabled leave RAM empty");
+
+    server_prompt_cache unlimited(-1, 0);
+    CHECK(unlimited.alloc(state.prompt, 1, 0) != nullptr, "negative RAM limit still allows RAM entries");
+}
+
+// A small deterministic model exercises real KV transfers without a download.
+static llama_model_ptr make_test_model(const std::string & path) {
+    gguf_context * meta = gguf_init_empty();
+    gguf_set_val_str(meta, "general.architecture", "llama");
+    gguf_set_val_str(meta, "tokenizer.ggml.model", "none");
+    gguf_set_val_u32(meta, "llama.vocab_size", 64);
+    gguf_set_val_u32(meta, "llama.context_length", 256);
+    gguf_set_val_u32(meta, "llama.embedding_length", 64);
+    gguf_set_val_u32(meta, "llama.feed_forward_length", 128);
+    gguf_set_val_u32(meta, "llama.block_count", 2);
+    gguf_set_val_u32(meta, "llama.attention.head_count", 2);
+    gguf_set_val_u32(meta, "llama.attention.head_count_kv", 1);
+    gguf_set_val_f32(meta, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    ggml_init_params init = {2*1024*1024, nullptr, false};
+    ggml_context * weights = ggml_init(init);
+    int seed = 0;
+    auto add_tensor = [&](const std::string & name, int64_t nx, int64_t ny = 0) {
+        auto * tensor = ny ? ggml_new_tensor_2d(weights, GGML_TYPE_F32, nx, ny) : ggml_new_tensor_1d(weights, GGML_TYPE_F32, nx);
+        ggml_set_name(tensor, name.c_str());
+        auto * data = static_cast<float *>(tensor->data);
+        for (int64_t i = 0; i < ggml_nelements(tensor); ++i) {
+            data[i] = name.find("norm") != std::string::npos ? 1.0f : 0.05f*std::sin(float(i + ++seed));
+        }
+        gguf_add_tensor(meta, tensor);
+    };
+    add_tensor("token_embd.weight", 64, 64);
+    add_tensor("output_norm.weight", 64);
+    add_tensor("output.weight", 64, 64);
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        add_tensor(prefix + "attn_norm.weight", 64);
+        add_tensor(prefix + "attn_q.weight", 64, 64);
+        add_tensor(prefix + "attn_k.weight", 64, 32);
+        add_tensor(prefix + "attn_v.weight", 64, 32);
+        add_tensor(prefix + "attn_output.weight", 64, 64);
+        add_tensor(prefix + "ffn_norm.weight", 64);
+        add_tensor(prefix + "ffn_gate.weight", 64, 128);
+        add_tensor(prefix + "ffn_down.weight", 128, 64);
+        add_tensor(prefix + "ffn_up.weight", 64, 128);
+    }
+    CHECK(gguf_write_to_file(meta, path.c_str(), false), "write test model");
+    gguf_free(meta);
+    ggml_free(weights);
+    auto params = llama_model_default_params();
+    params.n_gpu_layers = 0;
+    return llama_model_ptr(llama_model_load_from_file(path.c_str(), params));
+}
+
+static std::vector<uint8_t> capture_state(llama_context * ctx, llama_seq_id seq_id = 0) {
+    std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE));
+    CHECK(!state.empty(), "real state has a size");
+    CHECK(llama_state_seq_get_data_ext(ctx, state.data(), state.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == state.size(), "capture real sequence");
+    return state;
+}
+
+static void decode_test_tokens(llama_context * ctx, const llama_tokens & tokens, llama_pos pos = 0, llama_seq_id seq_id = 0) {
+    common_batch batch(ctx);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.add(tokens[i], pos + i, seq_id, true);
+    }
+    CHECK(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decode test tokens");
+}
+
+static void test_io_modes(const std::string & dir) {
+    std::filesystem::create_directories(dir);
+    auto model = make_test_model(dir + "/model.gguf");
+    CHECK(model != nullptr, "load deterministic test model");
+    if (!model) {
+        return;
+    }
+    for (const auto kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        auto params = llama_context_default_params();
+        params.n_ctx = 256;
+        params.n_batch = params.n_ubatch = 64;
+        params.n_seq_max = 2;
+        params.n_threads = params.n_threads_batch = 2;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.type_k = params.type_v = kv_type;
+        auto make_ctx = [&]() { return llama_context_ptr(llama_init_from_model(model.get(), params)); };
+        auto source = make_ctx();
+        auto draft = make_ctx();
+        CHECK(source && draft, "create real target and draft contexts");
+        if (!source || !draft) {
+            continue;
+        }
+        const llama_tokens tokens = {1, 2, 3, 4, 5, 6, 7, 8};
+        decode_test_tokens(source.get(), tokens);
+        decode_test_tokens(draft.get(), {8, 7, 6, 5, 4, 3, 2, 1});
+        server_prompt_cache_state expected;
+        expected.prompt.tokens = server_tokens(tokens, false);
+        expected.prompt.checkpoints.push_back(make_checkpoint());
+        expected.data.main = capture_state(source.get());
+        expected.data.drft = capture_state(draft.get());
+
+        decode_test_tokens(source.get(), {9}, 8);
+        const float * logits = llama_get_logits_ith(source.get(), -1);
+        std::vector<float> reference(logits, logits + 64);
+        CHECK(llama_state_seq_set_data_ext(source.get(), expected.data.main.data(), expected.data.main.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) == expected.data.main.size(), "reset reference state");
+
+        for (const bool with_draft : {false, true}) {
+            server_prompt_cache_state state;
+            state.prompt = expected.prompt.clone();
+            state.data = expected.data;
+            if (!with_draft) {
+                state.data.drft.clear();
+            }
+            for (const bool save_streaming : {false, true}) {
+                const std::string cache_dir = dir + "/" + std::to_string(kv_type) + "-" + std::to_string(with_draft) + "-" + std::to_string(save_streaming);
+                server_prompt_cache_ssd writer(cache_dir, 0, save_streaming, 128);
+                CHECK(writer.init(make_fp()), "initialize real-state writer");
+                CHECK(writer.save_context(state.prompt, source.get(), with_draft ? draft.get() : nullptr, 0), "save real state in selected mode");
+                check_stored_state(writer, state);
+                server_prompt_cache ssd_only(0, 0, &writer);
+                if (save_streaming) {
+                    ssd_only.get_state_data = [](llama_context *, uint8_t *, size_t, llama_seq_id, llama_state_seq_flags) -> size_t {
+                        CHECK(false, "streaming must not use buffered state capture");
+                        return 0;
+                    };
+                }
+                CHECK(ssd_only.save_state(state.prompt, source.get(), with_draft ? draft.get() : nullptr, 0), "SSD-only coordinator saves real state");
+                CHECK(ssd_only.states.empty() && ssd_only.size() == 0, "SSD-only coordinator retains no RAM state");
+
+                for (const bool load_streaming : {false, true}) {
+                    auto target = make_ctx();
+                    auto target_draft = make_ctx();
+                    CHECK(target && target_draft, "create restore contexts");
+                    if (!target || !target_draft) {
+                        continue;
+                    }
+                    decode_test_tokens(target.get(), {20, 21, 22}, 0, 1);
+                    const auto other_sequence = capture_state(target.get(), 1);
+                    server_prompt_cache_ssd reader(cache_dir, 0, load_streaming, 192);
+                    CHECK(reader.init(make_fp()), "reopen real-state cache in selected mode");
+                    int lcp = -1;
+                    const auto * entry = reader.find_best(state.prompt.tokens, lcp);
+                    CHECK(entry != nullptr, "real state discoverable after reopening");
+                    if (!entry) {
+                        continue;
+                    }
+                    server_prompt restored;
+                    CHECK(reader.load(*entry, restored, target.get(), with_draft ? target_draft.get() : nullptr, 0), "cross-mode restore succeeds");
+                    CHECK(reader.n_hits() == 1, "successful restore counts as a hit");
+                    CHECK(capture_state(target.get()) == state.data.main, "cross-mode target state is byte-identical");
+                    CHECK(capture_state(target.get(), 1) == other_sequence, "restore preserves unrelated sequence");
+                    if (with_draft) {
+                        CHECK(capture_state(target_draft.get()) == state.data.drft, "cross-mode draft state is byte-identical");
+                    }
+                    CHECK(restored.tokens.get_common_prefix(state.prompt.tokens) == tokens.size(), "cross-mode tokens intact");
+                    CHECK(restored.checkpoints.size() == 1 && restored.checkpoints.front().data_spec == state.prompt.checkpoints.front().data_spec, "cross-mode checkpoint state intact");
+                    decode_test_tokens(target.get(), {9}, 8);
+                    logits = llama_get_logits_ith(target.get(), -1);
+                    for (size_t i = 0; i < reference.size(); ++i) {
+                        CHECK(std::isfinite(logits[i]) && std::abs(logits[i] - reference[i]) < 1e-5f, "cross-mode continuation logits match");
+                    }
+
+                    // A valid container with a truncated state must fail after partial I/O.
+                    for (const bool fail_draft : {false, true}) {
+                        server_prompt_cache_state corrupt;
+                        corrupt.prompt = expected.prompt.clone();
+                        corrupt.data = expected.data;
+                        if (fail_draft) {
+                            corrupt.data.drft[0] ^= 0xff;
+                        } else {
+                            corrupt.data.main.pop_back();
+                        }
+                        CHECK(reader.save(corrupt), "publish malformed state inside valid container");
+                        entry = reader.find_best(corrupt.prompt.tokens, lcp);
+                        CHECK(entry != nullptr, "malformed state indexed before restore");
+                        if (!entry) {
+                            continue;
+                        }
+                        CHECK(!reader.load(*entry, restored, target.get(), target_draft.get(), 0), "malformed state restore rejected");
+                        CHECK(restored.tokens.empty() && restored.checkpoints.empty(), "failed restore clears prompt metadata");
+                        CHECK(llama_memory_seq_pos_max(llama_get_memory(target.get()), 0) < 0, "failed restore clears target sequence");
+                        CHECK(llama_memory_seq_pos_max(llama_get_memory(target_draft.get()), 0) < 0, "failed restore clears draft sequence");
+                        CHECK(capture_state(target.get(), 1) == other_sequence, "failed restore preserves unrelated sequence");
+                        CHECK(reader.n_hits() == 1 && reader.n_entries() == 0, "failed restore does not count a hit or retain corrupt entry");
+                    }
+                    CHECK(writer.save(state), "restore valid snapshot for next reader mode");
+                }
+            }
+        }
+    }
 }
 
 static void test_state_size_failure(const std::string & dir, bool fail_draft) {
@@ -653,6 +857,12 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir5);
     test_tmp_cleanup(dir5);
     std::filesystem::remove_all(dir5);
+
+    llama_backend_init();
+    const std::string dir6 = make_temp_dir() + "-io-modes";
+    test_io_modes(dir6);
+    std::filesystem::remove_all(dir6);
+    llama_backend_free();
 
     LOG_INF("summary: %d passed, %d failed\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;

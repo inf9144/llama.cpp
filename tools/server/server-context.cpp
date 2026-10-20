@@ -1072,19 +1072,9 @@ private:
                     continue;
                 }
 
-                const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-                server_prompt_cache_state state;
-                state.prompt = slot.prompt.clone();
-                state.data.main.resize(size_tgt);
-                state.data.drft.resize(size_dft);
-                llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                if (ctx_dft) {
-                    llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (!prompt_cache_ssd->save_context(slot.prompt, ctx_tgt, ctx_dft, slot.id)) {
+                    SRV_WRN("ssd cache: failed to save slot %d on shutdown\n", slot.id);
                 }
-
-                prompt_cache_ssd->save(state);
             }
         }
 
@@ -1532,18 +1522,22 @@ private:
 
         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
         if (decision.type != COMMON_DECISION_TYPE_NONE && !params_base.cache_ram_explicit) {
-            SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
-            params_base.cache_ram_mib    = 0;
-            params_base.cache_idle_slots = false;
+            SRV_INF("%s", "decision model: RAM prompt cache disabled by default, use `--cache-ram N` to enable it\n");
+            params_base.cache_ram_mib = 0;
+            if (params_base.cache_ssd_dir.empty()) {
+                params_base.cache_idle_slots = false;
+            }
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+        if (params_base.cache_ram_mib != 0 || !params_base.cache_ssd_dir.empty()) {
+            if (params_base.cache_ram_mib == 0) {
+                SRV_TRC("%s", "RAM prompt cache is disabled; SSD prompt cache is enabled\n");
+            } else if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
             }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+            SRV_TRC("%s", "use `--cache-ram 0` to disable the RAM prompt cache\n");
 
             // create the SSD cache if configured
             if (!params_base.cache_ssd_dir.empty()) {
@@ -1623,7 +1617,7 @@ private:
 
                 const size_t ssd_limit = params_base.cache_ssd_size_mib > 0 ?
                     1024ull*1024ull*static_cast<size_t>(params_base.cache_ssd_size_mib) : 0;
-                prompt_cache_ssd = std::make_unique<server_prompt_cache_ssd>(params_base.cache_ssd_dir, ssd_limit);
+                prompt_cache_ssd = std::make_unique<server_prompt_cache_ssd>(params_base.cache_ssd_dir, ssd_limit, params_base.cache_ssd_streaming);
                 prompt_cache_ssd->init(fp);
             }
 
@@ -1689,15 +1683,15 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires RAM or SSD cache, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
-                    // publish a RAM-cache copy of idle slots (their KV stays in VRAM) [TAG_IDLE_SLOT_CLEAR]
+                    // publish a prompt-cache copy of idle slots (their KV stays in VRAM) [TAG_IDLE_SLOT_CLEAR]
                     SRV_TRC("%s", "idle slots will be saved to prompt cache upon starting a new task\n");
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");

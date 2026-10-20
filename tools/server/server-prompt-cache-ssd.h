@@ -3,6 +3,8 @@
 #include "server-task.h"
 
 #include <cstdint>
+#include <functional>
+#include <iosfwd>
 #include <list>
 #include <string>
 #include <unordered_map>
@@ -97,7 +99,7 @@ struct server_prompt_cache_ssd {
         server_tokens tokens;     // kept in RAM for prefix matching without reading the file
     };
 
-    server_prompt_cache_ssd(std::string dir, size_t limit_size);
+    server_prompt_cache_ssd(std::string dir, size_t limit_size, bool streaming = false, size_t io_buffer_size = 64*1024*1024);
     ~server_prompt_cache_ssd();
 
     server_prompt_cache_ssd(const server_prompt_cache_ssd &) = delete;
@@ -110,6 +112,9 @@ struct server_prompt_cache_ssd {
 
     // write a state to SSD atomically. returns true only when the snapshot is retained
     bool save(const server_prompt_cache_state & state);
+
+    bool save_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool is_streaming() const { return streaming; }
 
     // find the best candidate by common prefix length, using only the in-RAM token index
     // returns nullptr when no entry qualifies, sets lcp_out to the best common prefix length
@@ -142,6 +147,8 @@ struct server_prompt_cache_ssd {
 private:
     std::string dir;
     size_t limit_size = 0;
+    bool streaming = false;
+    size_t io_buffer_size;
 
     server_prompt_cache_ssd_fingerprint fp;
 
@@ -159,7 +166,10 @@ private:
     // path of a snapshot file inside the model subdirectory
     std::string entry_path(const std::string & key) const;
 
-    bool save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms, size_t & file_size) const;
+    using state_writer = std::function<bool(std::ostream &, bool)>;
+    bool save(const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state);
+    bool save_file(const std::string & path, const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state, int64_t last_access_ms, size_t & file_size) const;
+    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const;
     bool read_header(const std::string & path, entry & e, server_prompt_cache_ssd_fingerprint & fp_out) const;
     void touch_file(const std::string & path, int64_t last_access_ms) const;
 };

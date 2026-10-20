@@ -3519,6 +3519,47 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+size_t llama_context::state_seq_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (flags & ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return 0;
+    }
+    try {
+        const size_t start = io.n_bytes();
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        state_seq_write_data(io, seq_id, flags);
+        return io.n_bytes() - start;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    try {
+        if (flags & ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+            throw std::runtime_error("unsupported stream state flags");
+        }
+        const size_t start = io.n_bytes();
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (magic_read != io_magic) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+        state_seq_read_data(io, seq_id, flags);
+        return io.n_bytes() - start;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+        io.discard();
+        if (memory) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+        return 0;
+    }
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -4620,6 +4661,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_write(llama_context * ctx, llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return ctx->state_seq_write(io, seq_id, flags);
+}
+
+size_t llama_state_seq_read(llama_context * ctx, llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return ctx->state_seq_read(io, seq_id, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

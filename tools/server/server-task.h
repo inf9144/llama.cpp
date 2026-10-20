@@ -714,9 +714,12 @@ struct server_prompt_cache {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->ssd          = ssd;
+        this->ram_enabled  = limit_size_mib != 0;
     }
 
     std::list<server_prompt_cache_state> states;
+
+    bool ram_enabled = true;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
