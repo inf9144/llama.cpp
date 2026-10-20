@@ -2,6 +2,7 @@ import pytest
 from utils import *
 
 import os
+from pathlib import Path
 import struct
 import time
 
@@ -331,3 +332,46 @@ def test_growing_prompt_same_slot_no_full_refill():
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] < prompt_n_base
+
+
+def test_unchanged_idle_slot_skips_ssd_write():
+    if server.cache_ram != 0:
+        pytest.skip("exercises repeated direct saves in SSD-only mode")
+    server.kv_unified = False
+    server.n_slots = 2
+    server.start()
+
+    prompt_a = list(range(1, 25))
+    prompt_b = list(range(30, 54))
+
+    def complete(slot, tokens):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": tokens,
+            "id_slot": slot,
+            "n_predict": 1,
+            "cache_prompt": True,
+            "temperature": 0,
+            "seed": 42,
+        })
+        assert res.status_code == 200
+
+    complete(0, prompt_a)
+    complete(1, prompt_b)
+    snapshots = list(Path(server.cache_ssd_dir).rglob("*.lsc"))
+    assert len(snapshots) == 1
+    snapshot_a = snapshots[0]
+    fixed_ns = 1_600_000_000_000_000_000
+    os.utime(snapshot_a, ns=(fixed_ns, fixed_ns))
+
+    for i in range(3):
+        complete(1, prompt_b + [60 + i])
+        assert snapshot_a.stat().st_mtime_ns == fixed_ns, "unchanged idle slot rewrote its SSD snapshot"
+
+    # A new task invalidates the saved identity even if its final token key is identical.
+    complete(0, prompt_a)
+    complete(1, prompt_b)
+    assert snapshot_a.stat().st_mtime_ns != fixed_ns, "new task reused a potentially stale same-token snapshot"
+
+    os.utime(snapshot_a, ns=(fixed_ns, fixed_ns))
+    server.stop()
+    assert snapshot_a.stat().st_mtime_ns == fixed_ns, "shutdown rewrote the unchanged idle snapshot"

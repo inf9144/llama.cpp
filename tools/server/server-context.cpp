@@ -765,6 +765,7 @@ struct server_slot {
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
+        other.prompt.invalidate_ssd_snapshot();
     }
 
     void copy_state_to(server_slot & other) const {
@@ -778,6 +779,7 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.prompt.invalidate_ssd_snapshot();
         other.init_sampler();
     }
 };
@@ -1963,6 +1965,8 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.prompt.invalidate_ssd_snapshot();
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);

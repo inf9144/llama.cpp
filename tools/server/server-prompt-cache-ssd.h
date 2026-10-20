@@ -97,6 +97,7 @@ struct server_prompt_cache_ssd {
         int64_t last_access_ms = 0;
         size_t n_tokens = 0;
         server_tokens tokens;     // kept in RAM for prefix matching without reading the file
+        uint64_t snapshot_id = 0;  // runtime identity, changes on every replacement
     };
 
     server_prompt_cache_ssd(std::string dir, size_t limit_size, bool streaming = false, size_t io_buffer_size = 64*1024*1024);
@@ -114,6 +115,7 @@ struct server_prompt_cache_ssd {
     bool save(const server_prompt_cache_state & state);
 
     bool save_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool is_saved(const server_prompt & prompt) const;
     bool is_streaming() const { return streaming; }
 
     // find the best candidate by common prefix length, using only the in-RAM token index
@@ -169,7 +171,7 @@ private:
     using state_writer = std::function<bool(std::ostream &, bool)>;
     bool save(const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state);
     bool save_file(const std::string & path, const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state, int64_t last_access_ms, size_t & file_size) const;
-    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const;
+    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & restore_started) const;
     bool read_header(const std::string & path, entry & e, server_prompt_cache_ssd_fingerprint & fp_out) const;
     void touch_file(const std::string & path, int64_t last_access_ms) const;
 };

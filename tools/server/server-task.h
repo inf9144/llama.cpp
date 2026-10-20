@@ -668,9 +668,17 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Runtime identity of the saved SSD snapshot. Invalidate before changing KV or prompt metadata.
+    mutable uint64_t ssd_snapshot_id = 0;
+
+    void invalidate_ssd_snapshot() {
+        ssd_snapshot_id = 0;
+    }
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        invalidate_ssd_snapshot();
     }
 
     int n_tokens() const {
@@ -681,6 +689,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            ssd_snapshot_id,
         };
     }
 };

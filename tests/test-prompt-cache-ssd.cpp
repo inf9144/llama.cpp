@@ -546,6 +546,63 @@ static void test_ram_limit_ssd_fallback(const std::string & dir) {
     CHECK(unlimited.alloc(state.prompt, 1, 0) != nullptr, "negative RAM limit still allows RAM entries");
 }
 
+static void test_unchanged_ssd_snapshot(const std::string & dir) {
+    server_prompt_cache_ssd ssd(dir, 3*1024*1024);
+    CHECK(ssd.init(make_fp()), "unchanged snapshot SSD init");
+    server_prompt_cache cache(0, 0, &ssd);
+    use_test_state_reader(cache);
+    auto state = make_state({1, 2, 3, 4, 5}, TEST_STATE_SIZE, 0);
+    state.prompt.checkpoints.push_back(make_checkpoint());
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "save initial SSD-only snapshot");
+    CHECK(ssd.is_saved(state.prompt), "live prompt remembers retained snapshot");
+    int lcp;
+    const auto * entry = ssd.find_best(state.prompt.tokens, lcp);
+    CHECK(entry != nullptr, "unchanged snapshot indexed");
+    if (!entry) {
+        return;
+    }
+    const std::string path = ssd.model_dir() + "/" + entry->key + ".lsc";
+    const auto fixed_time = std::filesystem::file_time_type{};
+    std::filesystem::last_write_time(path, fixed_time);
+    cache.get_state_size = [](llama_context *, llama_seq_id, llama_state_seq_flags) -> size_t {
+        CHECK(false, "unchanged snapshot must skip state capture");
+        return 0;
+    };
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "repeat save reuses unchanged SSD snapshot");
+    CHECK(ssd.save_context(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "context save also skips unchanged snapshot");
+    CHECK(std::filesystem::last_write_time(path) == fixed_time, "repeat saves do not write the snapshot file");
+
+    use_test_state_reader(cache);
+    state.prompt.invalidate_ssd_snapshot();
+    state.prompt.checkpoints.front().data_spec.push_back(42);
+    CHECK(!ssd.is_saved(state.prompt), "modified prompt invalidates saved identity despite equal tokens");
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "modified same-token state is saved again");
+    CHECK(std::filesystem::last_write_time(path) != fixed_time, "modified same-token state rewrites snapshot");
+    check_stored_state(ssd, state);
+
+    auto replacement = make_state({1, 2, 3, 4, 5}, TEST_STATE_SIZE, 0);
+    CHECK(ssd.save(replacement), "another producer replaces same token key");
+    CHECK(!ssd.is_saved(state.prompt), "replacement invalidates previous live snapshot identity");
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "re-save after same-key replacement");
+    check_stored_state(ssd, state);
+
+    auto other = make_state({9, 9, 9, 9, 9}, TEST_STATE_SIZE, 0);
+    CHECK(ssd.save(other) && ssd.n_entries() == 1, "evict previously saved snapshot");
+    CHECK(!ssd.is_saved(state.prompt), "evicted snapshot is no longer reusable");
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "re-save after eviction");
+    CHECK(ssd.is_saved(state.prompt), "re-saved snapshot identity is valid");
+
+    std::filesystem::remove(path);
+    CHECK(!ssd.is_saved(state.prompt), "missing snapshot cannot suppress a write");
+    CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "recreate missing snapshot");
+    CHECK(ssd.is_saved(state.prompt), "recreated snapshot has a valid identity");
+    server_prompt_cache_ssd reopened(dir, 0);
+    CHECK(reopened.init(make_fp()), "reopen snapshot index");
+    CHECK(!reopened.is_saved(state.prompt), "a different cache instance cannot match an old runtime identity");
+    state.prompt.clear();
+    CHECK(state.prompt.ssd_snapshot_id == 0, "clearing prompt invalidates snapshot identity");
+}
+
 // A small deterministic model exercises real KV transfers without a download.
 static llama_model_ptr make_test_model(const std::string & path) {
     gguf_context * meta = gguf_init_empty();
@@ -658,7 +715,19 @@ static void test_io_modes(const std::string & dir) {
                 server_prompt_cache_ssd writer(cache_dir, 0, save_streaming, 128);
                 CHECK(writer.init(make_fp()), "initialize real-state writer");
                 CHECK(writer.save_context(state.prompt, source.get(), with_draft ? draft.get() : nullptr, 0), "save real state in selected mode");
+                CHECK(writer.is_saved(state.prompt), "context save remembers exact SSD snapshot");
                 check_stored_state(writer, state);
+                int lcp;
+                const auto * saved_entry = writer.find_best(state.prompt.tokens, lcp);
+                CHECK(saved_entry != nullptr, "context snapshot indexed");
+                if (saved_entry) {
+                    const std::string path = writer.model_dir() + "/" + saved_entry->key + ".lsc";
+                    const auto fixed_time = std::filesystem::file_time_type{};
+                    std::filesystem::last_write_time(path, fixed_time);
+                    CHECK(writer.save_context(state.prompt, source.get(), with_draft ? draft.get() : nullptr, 0), "repeated context save succeeds");
+                    CHECK(std::filesystem::last_write_time(path) == fixed_time, "repeated context save skips SSD write in both modes");
+                }
+                state.prompt.invalidate_ssd_snapshot();
                 server_prompt_cache ssd_only(0, 0, &writer);
                 if (save_streaming) {
                     ssd_only.get_state_data = [](llama_context *, uint8_t *, size_t, llama_seq_id, llama_state_seq_flags) -> size_t {
@@ -723,10 +792,60 @@ static void test_io_modes(const std::string & dir) {
                         CHECK(llama_memory_seq_pos_max(llama_get_memory(target.get()), 0) < 0, "failed restore clears target sequence");
                         CHECK(llama_memory_seq_pos_max(llama_get_memory(target_draft.get()), 0) < 0, "failed restore clears draft sequence");
                         CHECK(capture_state(target.get(), 1) == other_sequence, "failed restore preserves unrelated sequence");
-                        CHECK(reader.n_hits() == 1 && reader.n_entries() == 0, "failed restore does not count a hit or retain corrupt entry");
+                        CHECK(reader.n_hits() == 1 && reader.n_entries() == 1, "opaque apply failure keeps the snapshot without counting a hit");
+                    }
+                    entry = reader.find_best(state.prompt.tokens, lcp);
+                    CHECK(entry != nullptr, "apply failure retains index entry");
+                    if (entry) {
+                        const std::string path = reader.model_dir() + "/" + entry->key + ".lsc";
+                        std::filesystem::resize_file(path, entry->size - 1);
+                        CHECK(!reader.load(*entry, restored, target.get(), target_draft.get(), 0), "truncated container rejected");
+                        CHECK(reader.n_entries() == 0 && !std::filesystem::exists(path), "proven invalid container is removed");
                     }
                     CHECK(writer.save(state), "restore valid snapshot for next reader mode");
                 }
+            }
+        }
+
+        for (const bool streaming : {false, true}) {
+            const std::string cache_dir = dir + "/capacity-" + std::to_string(kv_type) + "-" + std::to_string(streaming);
+            server_prompt_cache_ssd cache(cache_dir, 0, streaming, 192);
+            CHECK(cache.init(make_fp()) && cache.save(expected), "save snapshot for capacity failure test");
+            for (const bool full_draft : {false, true}) {
+                auto target = make_ctx();
+                auto target_draft = make_ctx();
+                CHECK(target && target_draft, "create capacity test contexts");
+                if (!target || !target_draft) {
+                    continue;
+                }
+                auto * full = full_draft ? target_draft.get() : target.get();
+                const int n_fill = llama_n_ctx(full) - tokens.size() + 1;
+                for (int pos = 0; pos < n_fill; pos += 64) {
+                    decode_test_tokens(full, llama_tokens(std::min(64, n_fill - pos), 20), pos, 1);
+                }
+                const auto unrelated = capture_state(full, 1);
+                int lcp;
+                const auto * entry = cache.find_best(expected.prompt.tokens, lcp);
+                CHECK(entry != nullptr, "capacity test snapshot indexed");
+                if (!entry) {
+                    continue;
+                }
+                const std::string path = cache.model_dir() + "/" + entry->key + ".lsc";
+                const auto before = read_file(path);
+                const auto hits_before = cache.n_hits();
+                server_prompt restored;
+                CHECK(!cache.load(*entry, restored, target.get(), target_draft.get(), 0), "insufficient KV capacity rejects restore");
+                CHECK(restored.tokens.empty() && restored.ssd_snapshot_id == 0, "capacity failure clears prompt identity");
+                CHECK(llama_memory_seq_pos_max(llama_get_memory(target.get()), 0) < 0 &&
+                      llama_memory_seq_pos_max(llama_get_memory(target_draft.get()), 0) < 0, "capacity failure clears both destination sequences");
+                CHECK(capture_state(full, 1) == unrelated, "capacity failure preserves unrelated sequence");
+                CHECK(cache.n_entries() == 1 && cache.n_hits() == hits_before, "capacity failure retains index and does not count a hit");
+                CHECK(read_file(path) == before, "capacity failure leaves valid snapshot intact");
+                llama_memory_seq_rm(llama_get_memory(full), 1, -1, -1);
+                entry = cache.find_best(expected.prompt.tokens, lcp);
+                CHECK(entry && cache.load(*entry, restored, target.get(), target_draft.get(), 0), "restore succeeds after releasing KV cells");
+                CHECK(capture_state(target.get()) == expected.data.main && capture_state(target_draft.get()) == expected.data.drft, "retry restores byte-identical main and draft states");
+                CHECK(cache.is_saved(restored), "successful retry remembers retained snapshot");
             }
         }
     }
@@ -832,6 +951,10 @@ int main(int argc, char ** argv) {
     std::filesystem::create_directories(dir4d);
     test_ram_limit_ssd_fallback(dir4d);
     std::filesystem::remove_all(dir4d);
+
+    const std::string dir4h = make_temp_dir() + "-unchanged";
+    test_unchanged_ssd_snapshot(dir4h);
+    std::filesystem::remove_all(dir4h);
 
     const std::string dir4e = make_temp_dir() + "-ram-eviction";
     std::filesystem::create_directories(dir4e);

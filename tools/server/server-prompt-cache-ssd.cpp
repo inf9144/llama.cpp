@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,9 @@ constexpr uint32_t SSD_VERSION = 2;
 constexpr const char * SSD_EXT = ".lsc";
 constexpr const char * SSD_TMP_EXT = ".lsc.tmp";
 constexpr size_t SSD_IO_BUFFER_SIZE = 64*1024*1024;
+
+// Process-wide IDs also distinguish snapshots from different cache instances.
+std::atomic<uint64_t> next_snapshot_id{1};
 
 class ssd_io_write : public llama_io_write_i {
 public:
@@ -234,6 +238,7 @@ bool server_prompt_cache_ssd::init(const server_prompt_cache_ssd_fingerprint & f
             continue;
         }
 
+        e.snapshot_id = next_snapshot_id.fetch_add(1, std::memory_order_relaxed);
         lru.push_back(std::move(e));
         index[lru.back().key] = std::prev(lru.end());
         total_size += lru.back().size;
@@ -467,10 +472,13 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
 }
 
 bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data) const {
-    return read_state(e, prompt, data, nullptr, nullptr, 0);
+    bool restore_started;
+    return read_state(e, prompt, data, nullptr, nullptr, 0, restore_started);
 }
 
-bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) const {
+bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & restore_started) const {
+    restore_started = false;
+    prompt.invalidate_ssd_snapshot();
     std::ifstream f(entry_path(e.key), std::ios::binary);
     if (!f) {
         return false;
@@ -594,6 +602,7 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
 
     // Validate the complete container before applying any streamed tensor data.
     if (ctx_tgt) {
+        restore_started = true;
         if (main_size == 0 || (ctx_dft != nullptr) != (drft_size > 0)) {
             return false;
         }
@@ -639,6 +648,9 @@ bool server_prompt_cache_ssd::save_context(const server_prompt & prompt, llama_c
     if (prompt.tokens.empty()) {
         return false;
     }
+    if (is_saved(prompt)) {
+        return true;
+    }
     try {
         const size_t main_size = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t drft_size = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -664,11 +676,27 @@ bool server_prompt_cache_ssd::save_context(const server_prompt & prompt, llama_c
             SRV_ERR("%s", "ssd cache: failed to capture sequence state\n");
             return false;
         }
-        return save(state);
+        if (!save(state)) {
+            return false;
+        }
+        prompt.ssd_snapshot_id = state.prompt.ssd_snapshot_id;
+        return true;
     } catch (const std::exception & err) {
         SRV_ERR("ssd cache: failed to save context: %s\n", err.what());
         return false;
     }
+}
+
+bool server_prompt_cache_ssd::is_saved(const server_prompt & prompt) const {
+    if (prompt.ssd_snapshot_id == 0) {
+        return false;
+    }
+    const auto it = index.find(make_key(prompt.tokens));
+    if (it == index.end() || it->second->snapshot_id != prompt.ssd_snapshot_id) {
+        return false;
+    }
+    std::error_code ec;
+    return std::filesystem::file_size(entry_path(it->first), ec) == it->second->size && !ec;
 }
 
 bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state) {
@@ -685,6 +713,7 @@ bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_siz
         return false;
     }
 
+    const uint64_t snapshot_id = next_snapshot_id.fetch_add(1, std::memory_order_relaxed);
     auto it = index.find(key);
     if (it != index.end()) {
         total_size -= it->second->size;
@@ -692,6 +721,7 @@ bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_siz
         it->second->last_access_ms = now;
         it->second->n_tokens       = prompt.tokens.size();
         it->second->tokens         = prompt.tokens.clone();
+        it->second->snapshot_id    = snapshot_id;
         lru.splice(lru.end(), lru, it->second);
     } else {
         entry e;
@@ -700,6 +730,7 @@ bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_siz
         e.last_access_ms = now;
         e.n_tokens       = prompt.tokens.size();
         e.tokens         = prompt.tokens.clone();
+        e.snapshot_id    = snapshot_id;
         lru.push_back(std::move(e));
         index[lru.back().key] = std::prev(lru.end());
     }
@@ -707,7 +738,11 @@ bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_siz
 
     update();
 
-    return index.find(key) != index.end();
+    if (index.find(key) == index.end()) {
+        return false;
+    }
+    prompt.ssd_snapshot_id = snapshot_id;
+    return true;
 }
 
 const server_prompt_cache_ssd::entry * server_prompt_cache_ssd::find_best(const server_tokens & tokens_new, int & lcp_out) {
@@ -761,9 +796,11 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
     server_prompt prompt_loaded;
     server_prompt_data data;
     try {
-        if (!read_state(e, prompt_loaded, data, streaming ? ctx_tgt : nullptr, ctx_dft, id_slot)) {
+        bool restore_started;
+        if (!read_state(e, prompt_loaded, data, streaming ? ctx_tgt : nullptr, ctx_dft, id_slot, restore_started)) {
             SRV_ERR("ssd cache: failed to read state '%s'\n", key.c_str());
-            return fail(true);
+            // Applying valid state can fail when other sequences occupy the KV cells.
+            return fail(!restore_started);
         }
 
         if (!streaming) {
@@ -771,7 +808,7 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
                     llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), data.main.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != data.main.size() ||
                     (!data.drft.empty() && llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), data.drft.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != data.drft.size())) {
                 SRV_ERR("ssd cache: failed to restore state '%s'\n", key.c_str());
-                return fail(true);
+                return fail(false);
             }
         }
     } catch (const std::exception & err) {
@@ -786,6 +823,7 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
     touch_file(path, now);
     auto it = index.find(e.key);
     if (it != index.end()) {
+        prompt.ssd_snapshot_id = it->second->snapshot_id;
         it->second->last_access_ms = now;
         lru.splice(lru.end(), lru, it->second);
     }

@@ -2205,6 +2205,9 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
     if (is_in_cache(prompt)) {
         return true;
     }
+    if (ssd && ssd->is_saved(prompt)) {
+        return true;
+    }
 
     const size_t cur_size_tgt =           get_state_size(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t cur_size_dft = ctx_dft ? get_state_size(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -2238,7 +2241,11 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
                 if (!read_data(state.data)) {
                     return false;
                 }
-                return ssd->save(state);
+                if (!ssd->save(state)) {
+                    return false;
+                }
+                prompt.ssd_snapshot_id = state.prompt.ssd_snapshot_id;
+                return true;
             } catch (const std::bad_alloc & e) {
                 SRV_ERR("failed to allocate memory for SSD prompt cache state: %s\n", e.what());
                 return false;
