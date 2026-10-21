@@ -2175,6 +2175,7 @@ const slot_info_vec_t *   sinfos_in) {
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
+        io.fail_invalid_data();
         throw std::runtime_error("n_stream mismatch");
     }
 
@@ -2191,6 +2192,7 @@ const slot_info_vec_t *   sinfos_in) {
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
             if (sinfos_in && !(*sinfos_in)[s].empty()) {
+                io.fail_invalid_data();
                 throw std::runtime_error("failed to restore kv cache: mirrored cache holds cells this one does not");
             }
             continue;
@@ -2362,7 +2364,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // single sequence
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-            return false;
+            return io.fail_invalid_data();
         }
 
         seq_rm(dest_seq_id, -1, -1);
@@ -2388,7 +2390,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             if (n_seq_id != 1) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
-                return false;
+                return io.fail_invalid_data();
             }
 
             if (has_cell_ext()) {
@@ -2422,7 +2424,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
                 LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                         sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
-                return false;
+                return io.fail_invalid_data();
             }
 
             sinfo = *sinfo_in;
@@ -2478,14 +2480,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-            return false;
+            return io.fail_invalid_data();
         }
 
         // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
         if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
             LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
                     sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
-            return false;
+            return io.fail_invalid_data();
         }
 
         for (uint32_t i = 0; i < cell_count; ++i) {
@@ -2509,7 +2511,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
                 if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, n_seq_max);
-                    return false;
+                    return io.fail_invalid_data();
                 }
 
                 cells.seq_add(i, seq_id);
@@ -2565,27 +2567,27 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
-        return false;
+        return io.fail_invalid_data();
     }
 
     if (cell_count > cells.size()) {
         LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, cells.size());
-        return false;
+        return io.fail_invalid_data();
     }
 
     if (this->v_trans != (bool) v_trans) {
         LLAMA_LOG_ERROR("%s: incompatible V transposition\n", __func__);
-        return false;
+        return io.fail_invalid_data();
     }
 
     if (n_rot_k_ref != n_rot_k) {
         LLAMA_LOG_ERROR("%s: incompatible key rotation (%u instead of %u)\n", __func__, n_rot_k_ref, n_rot_k);
-        return false;
+        return io.fail_invalid_data();
     }
 
     if (n_rot_v_ref != n_rot_v) {
         LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)\n", __func__, n_rot_v_ref, n_rot_v);
-        return false;
+        return io.fail_invalid_data();
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -2602,7 +2604,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const int32_t k_type_i = (int32_t) k->type;
         if (k_type_i != k_type_i_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
+            return io.fail_invalid_data();
         }
 
         // Read row size of key
@@ -2611,7 +2613,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
         if (k_size_row != k_size_row_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-            return false;
+            return io.fail_invalid_data();
         }
 
         for (const auto & r : runs) {
@@ -2636,7 +2638,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
+                return io.fail_invalid_data();
             }
 
             // Read row size of value
@@ -2645,7 +2647,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             const size_t v_size_row = ggml_row_size(v->type, n_embd_v_gqa);
             if (v_size_row != v_size_row_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value row size (%zu != %zu, layer %d)\n", __func__, v_size_row, (size_t) v_size_row_ref, il);
-                return false;
+                return io.fail_invalid_data();
             }
 
             for (const auto & r : runs) {
@@ -2670,7 +2672,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             const int32_t v_type_i = (int32_t) v->type;
             if (v_type_i != v_type_i_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value type (%d != %d, layer %d)\n", __func__, v_type_i, v_type_i_ref, il);
-                return false;
+                return io.fail_invalid_data();
             }
 
             // Read element size of value
@@ -2679,7 +2681,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             const size_t v_size_el = ggml_type_size(v->type);
             if (v_size_el != v_size_el_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched value element size (%zu != %zu, layer %d)\n", __func__, v_size_el, (size_t) v_size_el_ref, il);
-                return false;
+                return io.fail_invalid_data();
             }
 
             // Read GQA embedding size
@@ -2687,7 +2689,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             io.read(&n_embd_v_gqa_ref, sizeof(n_embd_v_gqa_ref));
             if (n_embd_v_gqa != n_embd_v_gqa_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched GQA embedding size (%u != %u, layer %d)\n", __func__, n_embd_v_gqa, n_embd_v_gqa_ref, il);
-                return false;
+                return io.fail_invalid_data();
             }
 
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {

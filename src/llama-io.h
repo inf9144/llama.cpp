@@ -6,6 +6,8 @@
 
 struct ggml_tensor;
 
+static constexpr uint32_t LLAMA_STATE_SEQ_IO_MAGIC = 0xaf143cd8;
+
 class llama_io_write_i {
 public:
     llama_io_write_i() = default;
@@ -35,4 +37,11 @@ public:
     virtual size_t n_bytes() = 0;
 
     void read_string(std::string & str);
+
+    // Format errors survive cleanup code that catches and replaces exceptions.
+    bool fail_invalid_data() { invalid_data = true; return false; }
+    bool has_invalid_data() const { return invalid_data; }
+
+private:
+    bool invalid_data = false;
 };

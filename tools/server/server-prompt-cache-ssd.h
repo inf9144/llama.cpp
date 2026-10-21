@@ -171,7 +171,7 @@ private:
     using state_writer = std::function<bool(std::ostream &, bool)>;
     bool save(const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state);
     bool save_file(const std::string & path, const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state, int64_t last_access_ms, size_t & file_size) const;
-    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & restore_started) const;
+    bool read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & invalid_data) const;
     bool read_header(const std::string & path, entry & e, server_prompt_cache_ssd_fingerprint & fp_out) const;
     void touch_file(const std::string & path, int64_t last_access_ms) const;
 };

@@ -75,10 +75,14 @@ public:
 
     void read(void * dst, size_t size) override {
         if (size > remaining) {
+            fail_invalid_data();
             throw std::runtime_error("SSD state read exceeds blob size");
         }
         stream.read(static_cast<char *>(dst), size);
         if (!stream.good()) {
+            if (stream.eof()) {
+                fail_invalid_data();
+            }
             throw std::runtime_error("SSD state read failed");
         }
         remaining -= size;
@@ -87,6 +91,7 @@ public:
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         if (size > remaining) {
+            fail_invalid_data();
             throw std::runtime_error("SSD tensor read exceeds blob size");
         }
         buffer.reserve(buffer_size);
@@ -108,6 +113,35 @@ private:
     size_t read_size = 0;
     size_t buffer_size;
     std::vector<uint8_t> buffer;
+};
+
+class ssd_io_read_buffer : public llama_io_read_i {
+public:
+    ssd_io_read_buffer(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        memcpy(dst, take(size), size);
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_tensor_set(tensor, take(size), offset, size);
+    }
+
+    size_t n_bytes() override { return read_size; }
+
+private:
+    const uint8_t * take(size_t size) {
+        if (size > data.size() - read_size) {
+            fail_invalid_data();
+            throw std::runtime_error("SSD state read exceeds buffer size");
+        }
+        const auto * result = data.data() + read_size;
+        read_size += size;
+        return result;
+    }
+
+    const std::vector<uint8_t> & data;
+    size_t read_size = 0;
 };
 
 // persistent timestamp, the monotonic clock resets on reboot and would break the LRU order
@@ -472,12 +506,12 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
 }
 
 bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data) const {
-    bool restore_started;
-    return read_state(e, prompt, data, nullptr, nullptr, 0, restore_started);
+    bool invalid_data;
+    return read_state(e, prompt, data, nullptr, nullptr, 0, invalid_data);
 }
 
-bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & restore_started) const {
-    restore_started = false;
+bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & invalid_data) const {
+    invalid_data = true;
     prompt.invalidate_ssd_snapshot();
     std::ifstream f(entry_path(e.key), std::ios::binary);
     if (!f) {
@@ -600,35 +634,62 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
         return false;
     }
 
-    // Validate the complete container before applying any streamed tensor data.
+    // Check both state headers before reading the main payload or changing either context.
     if (ctx_tgt) {
-        restore_started = true;
-        if (main_size == 0 || (ctx_dft != nullptr) != (drft_size > 0)) {
+        auto valid_header = [&](std::streampos pos, uint64_t size) {
+            if (size < sizeof(LLAMA_STATE_SEQ_IO_MAGIC) + sizeof(llama_seq_id)) {
+                return false;
+            }
+            f.seekg(pos);
+            uint32_t magic;
+            return read(&magic, sizeof(magic)) && magic == LLAMA_STATE_SEQ_IO_MAGIC;
+        };
+        if (!valid_header(main_pos, main_size) || (drft_size > 0 && !valid_header(drft_pos, drft_size))) {
             return false;
         }
-        f.seekg(main_pos);
-        {
-            ssd_io_read io(f, main_size, io_buffer_size);
-            if (llama_state_seq_read(ctx_tgt, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != main_size) {
-                return false;
-            }
+        invalid_data = false;
+        if ((ctx_dft != nullptr) != (drft_size > 0)) {
+            return false;
         }
-        if (drft_size > 0) {
-            f.seekg(drft_pos);
-            ssd_io_read io(f, drft_size, io_buffer_size);
-            if (llama_state_seq_read(ctx_dft, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != drft_size) {
-                return false;
-            }
-        }
-    } else {
+    }
+
+    if (!ctx_tgt || !streaming) {
         f.seekg(main_pos);
         data.main.resize(main_size);
         if (main_size && !read(data.main.data(), main_size)) {
+            invalid_data = f.eof();
             return false;
         }
         f.seekg(drft_pos);
         data.drft.resize(drft_size);
         if (drft_size && !read(data.drft.data(), drft_size)) {
+            invalid_data = f.eof();
+            return false;
+        }
+    }
+
+    if (ctx_tgt) {
+        auto restore = [&](llama_context * ctx, std::streampos pos, uint64_t size, const std::vector<uint8_t> & buffer) {
+            auto apply = [&](llama_io_read_i & io) {
+                const size_t n = llama_state_seq_read(ctx, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n != size) {
+                    invalid_data = io.has_invalid_data() || n > 0;
+                    return false;
+                }
+                return true;
+            };
+            if (streaming) {
+                f.seekg(pos);
+                ssd_io_read io(f, size, io_buffer_size);
+                return apply(io);
+            }
+            ssd_io_read_buffer io(buffer);
+            return apply(io);
+        };
+        if (!restore(ctx_tgt, main_pos, main_size, data.main)) {
+            return false;
+        }
+        if (drft_size > 0 && !restore(ctx_dft, drft_pos, drft_size, data.drft)) {
             return false;
         }
     }
@@ -796,20 +857,10 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
     server_prompt prompt_loaded;
     server_prompt_data data;
     try {
-        bool restore_started;
-        if (!read_state(e, prompt_loaded, data, streaming ? ctx_tgt : nullptr, ctx_dft, id_slot, restore_started)) {
-            SRV_ERR("ssd cache: failed to read state '%s'\n", key.c_str());
-            // Applying valid state can fail when other sequences occupy the KV cells.
-            return fail(!restore_started);
-        }
-
-        if (!streaming) {
-            if (data.main.empty() || (ctx_dft != nullptr) != !data.drft.empty() ||
-                    llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), data.main.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != data.main.size() ||
-                    (!data.drft.empty() && llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), data.drft.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != data.drft.size())) {
-                SRV_ERR("ssd cache: failed to restore state '%s'\n", key.c_str());
-                return fail(false);
-            }
+        bool invalid_data;
+        if (!read_state(e, prompt_loaded, data, ctx_tgt, ctx_dft, id_slot, invalid_data)) {
+            SRV_ERR("ssd cache: failed to restore state '%s' (%s)\n", key.c_str(), invalid_data ? "invalid data" : "runtime failure, keeping snapshot");
+            return fail(invalid_data);
         }
     } catch (const std::exception & err) {
         SRV_ERR("ssd cache: failed to restore state '%s': %s\n", key.c_str(), err.what());

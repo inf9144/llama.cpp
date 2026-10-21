@@ -771,15 +771,25 @@ static void test_io_modes(const std::string & dir) {
                         CHECK(std::isfinite(logits[i]) && std::abs(logits[i] - reference[i]) < 1e-5f, "cross-mode continuation logits match");
                     }
 
-                    // A valid container with a truncated state must fail after partial I/O.
-                    for (const bool fail_draft : {false, true}) {
+                    // The container stays valid; each fault is inside a sequence-state payload.
+                    for (int fault = 0; fault < 11; ++fault) {
                         server_prompt_cache_state corrupt;
                         corrupt.prompt = expected.prompt.clone();
                         corrupt.data = expected.data;
-                        if (fail_draft) {
-                            corrupt.data.drft[0] ^= 0xff;
-                        } else {
-                            corrupt.data.main.pop_back();
+                        // This model has one KV stream and 12 metadata bytes per token, without cell extensions.
+                        const size_t tensor_header = 16 + 12*tokens.size();
+                        switch (fault) {
+                            case 0: corrupt.data.main.pop_back(); break;
+                            case 1: corrupt.data.drft[0] ^= 0xff; break;
+                            case 2: corrupt.data.main[8] ^= 0xff; break; // stream count
+                            case 3: corrupt.data.main[20] ^= 0xff; break; // cell sequence count
+                            case 4: corrupt.data.main[tensor_header + 4] ^= 0xff; break; // layer count
+                            case 5: corrupt.data.main[tensor_header + 20] ^= 0xff; break; // key row size
+                            case 6: corrupt.data.drft.pop_back(); break;
+                            case 7: corrupt.data.main.clear(); break;
+                            case 8: corrupt.data.main.resize(8); break; // missing KV metadata
+                            case 9: corrupt.data.main.push_back(0); break; // unconsumed payload bytes
+                            case 10: corrupt.data.main[13] ^= 0xff; break; // cell count exceeds total capacity
                         }
                         CHECK(reader.save(corrupt), "publish malformed state inside valid container");
                         entry = reader.find_best(corrupt.prompt.tokens, lcp);
@@ -787,15 +797,19 @@ static void test_io_modes(const std::string & dir) {
                         if (!entry) {
                             continue;
                         }
+                        const std::string path = reader.model_dir() + "/" + entry->key + ".lsc";
                         CHECK(!reader.load(*entry, restored, target.get(), target_draft.get(), 0), "malformed state restore rejected");
                         CHECK(restored.tokens.empty() && restored.checkpoints.empty(), "failed restore clears prompt metadata");
                         CHECK(llama_memory_seq_pos_max(llama_get_memory(target.get()), 0) < 0, "failed restore clears target sequence");
                         CHECK(llama_memory_seq_pos_max(llama_get_memory(target_draft.get()), 0) < 0, "failed restore clears draft sequence");
                         CHECK(capture_state(target.get(), 1) == other_sequence, "failed restore preserves unrelated sequence");
-                        CHECK(reader.n_hits() == 1 && reader.n_entries() == 1, "opaque apply failure keeps the snapshot without counting a hit");
+                        CHECK(reader.n_hits() == 1 && reader.n_entries() == 0 && reader.size() == 0, "invalid payload is removed without counting a hit");
+                        CHECK(!std::filesystem::exists(path), "invalid payload file is removed");
+                        CHECK(reader.find_best(corrupt.prompt.tokens, lcp) == nullptr, "invalid payload is not offered again");
                     }
+                    CHECK(reader.save(state), "publish valid state before truncating its container");
                     entry = reader.find_best(state.prompt.tokens, lcp);
-                    CHECK(entry != nullptr, "apply failure retains index entry");
+                    CHECK(entry != nullptr, "valid state indexed before container corruption");
                     if (entry) {
                         const std::string path = reader.model_dir() + "/" + entry->key + ".lsc";
                         std::filesystem::resize_file(path, entry->size - 1);
@@ -841,6 +855,15 @@ static void test_io_modes(const std::string & dir) {
                 CHECK(capture_state(full, 1) == unrelated, "capacity failure preserves unrelated sequence");
                 CHECK(cache.n_entries() == 1 && cache.n_hits() == hits_before, "capacity failure retains index and does not count a hit");
                 CHECK(read_file(path) == before, "capacity failure leaves valid snapshot intact");
+
+                auto corrupt = server_prompt_cache_state{expected.prompt.clone(), expected.data};
+                corrupt.data.drft[0] ^= 0xff;
+                CHECK(cache.save(corrupt), "publish invalid draft header with occupied KV cache");
+                entry = cache.find_best(expected.prompt.tokens, lcp);
+                CHECK(entry && !cache.load(*entry, restored, target.get(), target_draft.get(), 0), "invalid draft header rejected before main restore");
+                CHECK(cache.n_entries() == 0 && !std::filesystem::exists(path), "invalid draft header is removed even when main KV is full");
+                CHECK(capture_state(full, 1) == unrelated, "header rejection preserves unrelated sequence");
+                CHECK(cache.save(expected), "publish valid snapshot for capacity retry");
                 llama_memory_seq_rm(llama_get_memory(full), 1, -1, -1);
                 entry = cache.find_best(expected.prompt.tokens, lcp);
                 CHECK(entry && cache.load(*entry, restored, target.get(), target_draft.get(), 0), "restore succeeds after releasing KV cells");

@@ -3445,12 +3445,10 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-static constexpr uint32_t io_magic = 0xaf143cd8;
-
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
+        io.write(&LLAMA_STATE_SEQ_IO_MAGIC, sizeof(LLAMA_STATE_SEQ_IO_MAGIC));
         io.write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(io, seq_id, flags);
@@ -3469,7 +3467,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
+        io->write(&LLAMA_STATE_SEQ_IO_MAGIC, sizeof(LLAMA_STATE_SEQ_IO_MAGIC));
         io->write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(*io, seq_id, flags);
@@ -3487,7 +3485,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (LLAMA_STATE_SEQ_IO_MAGIC != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3504,7 +3502,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (LLAMA_STATE_SEQ_IO_MAGIC != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3525,7 +3523,7 @@ size_t llama_context::state_seq_write(llama_io_write_i & io, llama_seq_id seq_id
     }
     try {
         const size_t start = io.n_bytes();
-        io.write(&io_magic, sizeof(io_magic));
+        io.write(&LLAMA_STATE_SEQ_IO_MAGIC, sizeof(LLAMA_STATE_SEQ_IO_MAGIC));
         io.write(&seq_id, sizeof(seq_id));
         state_seq_write_data(io, seq_id, flags);
         return io.n_bytes() - start;
@@ -3543,7 +3541,8 @@ size_t llama_context::state_seq_read(llama_io_read_i & io, llama_seq_id seq_id, 
         const size_t start = io.n_bytes();
         uint32_t magic_read;
         io.read(&magic_read, sizeof(magic_read));
-        if (magic_read != io_magic) {
+        if (magic_read != LLAMA_STATE_SEQ_IO_MAGIC) {
+            io.fail_invalid_data();
             throw std::runtime_error("wrong sequence state magic");
         }
         llama_seq_id seq_id_read;
