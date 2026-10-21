@@ -647,10 +647,10 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
         if (!valid_header(main_pos, main_size) || (drft_size > 0 && !valid_header(drft_pos, drft_size))) {
             return false;
         }
-        invalid_data = false;
         if ((ctx_dft != nullptr) != (drft_size > 0)) {
             return false;
         }
+        invalid_data = false;
     }
 
     if (!ctx_tgt || !streaming) {

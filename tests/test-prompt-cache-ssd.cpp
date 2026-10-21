@@ -772,7 +772,7 @@ static void test_io_modes(const std::string & dir) {
                     }
 
                     // The container stays valid; each fault is inside a sequence-state payload.
-                    for (int fault = 0; fault < 11; ++fault) {
+                    for (int fault = 0; fault < 12; ++fault) {
                         server_prompt_cache_state corrupt;
                         corrupt.prompt = expected.prompt.clone();
                         corrupt.data = expected.data;
@@ -790,6 +790,7 @@ static void test_io_modes(const std::string & dir) {
                             case 8: corrupt.data.main.resize(8); break; // missing KV metadata
                             case 9: corrupt.data.main.push_back(0); break; // unconsumed payload bytes
                             case 10: corrupt.data.main[13] ^= 0xff; break; // cell count exceeds total capacity
+                            case 11: corrupt.data.drft.clear(); break; // missing payload for an existing draft context
                         }
                         CHECK(reader.save(corrupt), "publish malformed state inside valid container");
                         entry = reader.find_best(corrupt.prompt.tokens, lcp);
