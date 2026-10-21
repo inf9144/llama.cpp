@@ -218,15 +218,29 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_attn_temp_floor_scale != 0);
 
         std::vector<float> attn_scale_data(n_tokens, 0.0f);
-        for (int i = 0; i < n_tokens; ++i) {
-            const float pos = ubatch->pos[i];
-            attn_scale_data[i] = std::log(
-                std::floor((pos + f_attn_temp_offset) / n_attn_temp_floor_scale) + 1.0
-            ) * f_attn_temp_scale + 1.0;
+        if (attn_temp_pow) {
+            // (1 + (pos + offset) / length) ^ power
+            for (int i = 0; i < n_tokens; ++i) {
+                const double pos = ubatch->pos[i];
+                attn_scale_data[i] = (float) std::exp((double) f_attn_temp_scale *
+                    std::log1p((pos + f_attn_temp_offset) / (double) n_attn_temp_floor_scale));
+            }
+        } else {
+            for (int i = 0; i < n_tokens; ++i) {
+                const float pos = ubatch->pos[i];
+                attn_scale_data[i] = std::log(
+                    std::floor((pos + f_attn_temp_offset) / n_attn_temp_floor_scale) + 1.0
+                ) * f_attn_temp_scale + 1.0;
+            }
         }
 
         ggml_backend_tensor_set(attn_scale, attn_scale_data.data(), 0, n_tokens*ggml_element_size(attn_scale));
     }
+}
+
+bool llm_graph_input_attn_temp::can_reuse(const llm_graph_params & params) {
+    // only the power form opts in; the log form keeps no reuse
+    return attn_temp_pow && attn_scale != nullptr && attn_scale->ne[2] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
@@ -1652,6 +1666,40 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
+          ggml_tensor * cur) const {
+    llm_graph_amax_src1 result = {
+        /*.res     =*/ cur,
+        /*.scale_s =*/ nullptr,
+    };
+
+    const int64_t n_embd = cur->ne[0];
+
+    // amax = max|cur| along the rows for each [expert, token] -> [1, n_expert, n_tokens]
+    ggml_tensor * ab = ggml_abs(ctx0, cur);
+    ggml_tensor * amax = ggml_pool_1d(ctx0, ab, GGML_OP_POOL_MAX, n_embd, n_embd, 0);
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/26223
+    constexpr float k_log2_e = 1.4426950408889634f; // 1 / ln(2)
+    constexpr float k_ln_2   = 0.6931471805599453f;
+
+    ggml_tensor * e;
+    e = ggml_scale(ctx0, amax, 1.0f/32768.0f);
+    e = ggml_log  (ctx0, e);
+    e = ggml_scale(ctx0, e, k_log2_e);
+    e = ggml_ceil (ctx0, e);
+    e = ggml_clamp(ctx0, e, 0.0f, 127.0f);
+    e = ggml_scale(ctx0, e, k_ln_2);
+    e = ggml_exp  (ctx0, e);
+
+    result = {
+        /*.res     =*/ ggml_div(ctx0, cur, e),
+        /*.scale_s =*/ e,
+    };
+
+    return result;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -2451,12 +2499,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
-    if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM) {
-        // src1 can exceed F16 range
-        ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+    {
+        // TODO: this graph-level rescaling should only be applied when the corresponding backend does not support
+        //       ggml_prec_set_src(experts, GGML_PREC_BF16, 1);
+        //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
+        llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
+
+        if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM) {
+            amax_src1 = build_amax_src1_f16(cur);
+            cur = amax_src1.res;
+        }
+
+        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+        //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+        cb(experts, "ffn_moe_down", il);
+
+        if (amax_src1.scale_s) {
+            experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
+        }
     }
-    cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2743,7 +2804,7 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 }
 
 ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
-    auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale, hparams.f_attn_temp_offset);
+    auto inp = std::make_unique<llm_graph_input_attn_temp>(hparams.n_attn_temp_floor_scale, hparams.f_attn_temp_scale, hparams.f_attn_temp_offset, hparams.attn_temp_pow);
 
     auto & cur = inp->attn_scale;
 
