@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -138,6 +139,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
+    LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -596,7 +598,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const std::vector<size_t> & moe_cache_sizes = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -613,9 +616,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
-    if (moe_cache_size > 0) {
+    if (moe_cache_size > 0 || !moe_cache_sizes.empty()) {
         // the MoE cache is only used for small ubatches
         ctx_params.moe_cache_size = moe_cache_size;
+        ctx_params.moe_cache_split = moe_cache_sizes.empty() ? nullptr : moe_cache_sizes.data();
         ctx_params.n_ubatch = 2;
     }
 
@@ -629,6 +633,24 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
+    }
+    if (!moe_cache_sizes.empty()) {
+        auto uncached_params = ctx_params;
+        uncached_params.moe_cache_size = 0;
+        uncached_params.moe_cache_split = nullptr;
+        llama_context_ptr uncached(llama_init_from_model(model.get(), uncached_params));
+        GGML_ASSERT(uncached);
+        auto actual = lctx->memory_breakdown();
+        auto baseline = uncached->memory_breakdown();
+        for (size_t i = 0; i < devs.size(); ++i) {
+            auto buft = ggml_backend_dev_buffer_type(devs[i]);
+            GGML_ASSERT(actual[buft].context >= baseline[buft].context);
+            const size_t allocated = actual[buft].context - baseline[buft].context;
+            GGML_ASSERT(allocated <= moe_cache_sizes[i]);
+            if (moe_cache_sizes[i] >= 1536*1024 && baseline[buft].context > 0) {
+                GGML_ASSERT(allocated > 0);
+            }
+        }
     }
     return std::make_pair(std::move(model), std::move(lctx));
 }
@@ -988,9 +1010,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         llama_split_mode                split_mode;
         bool                            host_experts; // keep the experts in host memory, see host_experts_test
         size_t                          moe_cache_size;
+        std::vector<size_t>             moe_cache_sizes;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0, std::vector<size_t> moe_cache_sizes = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size), moe_cache_sizes(std::move(moe_cache_sizes)) {
+            if (!this->moe_cache_sizes.empty()) {
+                this->moe_cache_sizes.resize(llama_max_devices(), 0);
+            }
+        }
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -1036,9 +1063,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache, explicit", LLAMA_SPLIT_MODE_LAYER, true, 0, std::vector<size_t>{1536*1024});
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache, too small", LLAMA_SPLIT_MODE_LAYER, true, 0, std::vector<size_t>{1});
+                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 // each GPU caches the layers assigned to it
                 if (devices_meta.size() > 1) {
                     dev_configs.emplace_back(devices_meta, "MoE cache, layer split", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                    dev_configs.emplace_back(devices_meta, "MoE cache, unequal", LLAMA_SPLIT_MODE_LAYER, true, 0, std::vector<size_t>{1536*1024, 3*1024*1024});
+                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                    std::reverse(devices_meta.begin(), devices_meta.end());
+                    dev_configs.emplace_back(devices_meta, "MoE cache, reversed/zero", LLAMA_SPLIT_MODE_LAYER, true, 0, std::vector<size_t>{0, 1536*1024});
                     max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 }
             }
@@ -1125,7 +1161,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.moe_cache_sizes);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1191,7 +1227,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, dc.moe_cache_sizes);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
@@ -1376,6 +1412,102 @@ static void test_memory_update_reservation(size_t seed, float stdev, recovery_lo
     }
 }
 
+static int test_layer_inputs(size_t seed, float stdev) {
+    auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
+    auto * model = model_and_ctx.first.get();
+    const int n_layer = llama_model_n_layer(model);
+    const int n_embd = llama_model_n_embd(model);
+    const auto tokens = get_tokens(11, 128, seed);
+
+    struct capture {
+        int n_layer;
+        std::vector<std::vector<float>> means;
+    };
+
+    for (auto kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        capture cap = { n_layer, std::vector<std::vector<float>>(n_layer) };
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 128;
+        cp.n_batch = 32;
+        cp.n_ubatch = 4;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k = cp.type_v = kv_type;
+        llama_context_ptr reference(llama_init_from_model(model, cp));
+        GGML_ASSERT(reference);
+        cp.cb_eval_user_data = &cap;
+        cp.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            auto & cap = *static_cast<capture *>(data);
+            int il = -1;
+            if (strcmp(t->name, "hc_init") == 0) {
+                il = 0;
+            } else {
+                int layer = -1;
+                if (sscanf(t->name, "l_last-%d", &layer) == 1 && t->name == "l_last-" + std::to_string(layer)) {
+                    il = layer + 1;
+                }
+            }
+            if (il < 0 || il >= cap.n_layer) {
+                return false;
+            }
+            if (ask) {
+                return true;
+            }
+            GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[1] > 1);
+            std::vector<float> streams(ggml_nbytes(t) / sizeof(float));
+            ggml_backend_tensor_get(t, streams.data(), 0, ggml_nbytes(t));
+            for (int64_t token = 0; token < t->ne[2]; ++token) {
+                for (int64_t col = 0; col < t->ne[0]; ++col) {
+                    float sum = 0;
+                    for (int64_t s = 0; s < t->ne[1]; ++s) {
+                        sum += streams[(token*t->nb[2] + s*t->nb[1] + col*t->nb[0]) / sizeof(float)];
+                    }
+                    cap.means[il].push_back(sum / t->ne[1]);
+                }
+            }
+            return true;
+        };
+        llama_context_ptr ctx(llama_init_from_model(model, cp));
+        GGML_ASSERT(ctx);
+        for (int il = 0; il < n_layer; ++il) {
+            llama_set_embeddings_layer_inp(ctx.get(), il, true);
+        }
+        llama_set_embeddings_nextn(ctx.get(), true, false);
+        llama_set_embeddings_nextn(reference.get(), true, false);
+        const auto expected_logits = get_logits(model, reference.get(), tokens);
+        const auto actual_logits = get_logits(model, ctx.get(), tokens);
+        GGML_ASSERT(nmse(expected_logits, actual_logits) < 1e-10);
+        for (int il = 0; il < n_layer; ++il) {
+            GGML_ASSERT(cap.means[il].size() == tokens.size()*n_embd);
+            const float * actual = llama_get_embeddings_layer_inp(ctx.get(), il);
+            for (size_t i = 0; i < cap.means[il].size(); ++i) {
+                GGML_ASSERT(std::isfinite(actual[i]) && fabsf(actual[i] - cap.means[il][i]) < 1e-5f);
+            }
+        }
+        const size_t n_nextn = tokens.size()*llama_model_n_embd_out(model);
+        const auto * actual_nextn = llama_get_embeddings_nextn(ctx.get());
+        const auto * expected_nextn = llama_get_embeddings_nextn(reference.get());
+        GGML_ASSERT(memcmp(actual_nextn, expected_nextn, n_nextn*sizeof(float)) == 0);
+        printf("qwen4exp layer inputs: stream means, chunked extraction and MTP state KV=%s passed\n", ggml_type_name(kv_type));
+    }
+
+    std::vector<size_t> sizes(llama_max_devices(), 0);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_threads = cp.n_threads_batch = 2;
+    cp.moe_cache_size = 1024 * 1024;
+    cp.moe_cache_split = sizes.data();
+    llama_context_ptr disabled(llama_init_from_model(model, cp));
+    GGML_ASSERT(disabled);
+    sizes[0] = std::numeric_limits<size_t>::max();
+    sizes[1] = 1;
+    llama_context_ptr overflow(llama_init_from_model(model, cp));
+    GGML_ASSERT(!overflow);
+    printf("MoE cache parameters: zero list overrides total, overflowing list rejected\n");
+    return 0;
+}
+
 static int test_graph_recovery(size_t seed, float stdev) {
     recovery_log log;
     test_text_plan_retention(seed, stdev, log);
@@ -1469,6 +1601,7 @@ int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+    ggml_backend_load_all();
     llama_backend_init();
 
     std::random_device rd;
@@ -1479,6 +1612,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool graph_recovery = false;
+    bool layer_inputs = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1548,6 +1682,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--test-graph-recovery") == 0) {
             graph_recovery = true;
+        } else if (strcmp(argv[i], "--test-layer-inputs") == 0) {
+            layer_inputs = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1561,6 +1697,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (layer_inputs) {
+            return test_layer_inputs(seed, stdev);
+        }
         if (graph_recovery) {
             return test_graph_recovery(seed, stdev);
         }
