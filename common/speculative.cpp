@@ -1163,12 +1163,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // Media chunks can advance positions by a different amount than prompt.size().
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
-                    "Drafts may degrade.\n",
+            LOG_DBG("%s: ctx_dft pos_max=%d < N-1=%d - prefill was not fully mirrored or contains media chunks\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    bool fill_gap(llama_seq_id seq_id, llama_pos pos_end) {
+        auto * ctx_dft = params.ctx_dft;
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (pos_max >= pos_end - 1) {
+            return true;
+        }
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        LOG_DBG("%s: filling draft cache gap [%d, %d) for seq %d\n", __func__, pos_max + 1, pos_end, seq_id);
+
+        for (llama_pos pos = pos_max + 1; pos < pos_end;) {
+            const int32_t n_chunk = std::min(n_ubatch, pos_end - pos);
+            features_buf.assign((size_t) n_chunk * n_embd_enc, 0.0f);
+            batch_inject.clear();
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p[4] = { pos + i, pos + i, pos + i, 0 };
+                batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, p, seq_id, false);
+            }
+            // The embedding decode fuses feature projection and KV injection.
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+            if (rc != 0) {
+                LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d while filling [%d, %d) for seq %d\n",
+                        __func__, rc, pos, pos + n_chunk, seq_id);
+                return false;
+            }
+            pos += n_chunk;
+        }
+        return true;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1176,13 +1205,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // Target prefill may contain token IDs or multimodal embeddings. Both
-        // produce the target-layer features used to seed the draft KV cache, so
-        // embeddings are injected too, except the pinned ones skipped below.
+        // M-RoPE image rows do not have consecutive 1-D positions. Fill their gap
+        // with zero features before the next text batch or noise block instead.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.has_token();
         const bool has_embeddings = batch_in.has_embd();
-        if (has_tokens == has_embeddings) {
+        if (!has_tokens || has_embeddings) {
             return true;
         }
 
@@ -1213,11 +1241,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
-                continue;
+            if (!fill_gap(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0])) {
+                return false;
             }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
@@ -1293,6 +1318,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
+
+            if (!fill_gap(seq_id, n)) {
+                throw std::runtime_error("DFlash: failed to fill draft cache gap before drafting");
+            }
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);

@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -140,6 +141,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
     LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
+    LOG("  --test-dflash-vision     Test DFlash2 drafting across M-RoPE image positions\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1272,12 +1274,16 @@ struct recovery_log {
     ggml_log_callback callback;
     void * user_data;
     int reserves = 0;
+    int position_errors = 0;
     unsigned last_reserve_n_seqs = 0;
 
     recovery_log() {
         llama_log_get(&callback, &user_data);
         llama_log_set([](ggml_log_level level, const char * text, void * data) {
             auto & log = *static_cast<recovery_log *>(data);
+            if (strstr(text, "non-consecutive token position") || strstr(text, "inconsistent sequence positions")) {
+                ++log.position_errors;
+            }
             if (strstr(text, "graph_reserve: reserving a graph for ubatch")) {
                 ++log.reserves;
                 const auto * n_seqs = strstr(text, "n_seqs = ");
@@ -1410,6 +1416,226 @@ static void test_memory_update_reservation(size_t seed, float stdev, recovery_lo
         GGML_ASSERT(log.reserves == after);
         printf("graph recovery: %s memory update preserves n_seq_max passed\n", llm_arch_name(arch));
     }
+}
+
+static int test_dflash_vision(size_t seed, float stdev) {
+    recovery_log log;
+    auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false);
+    const int32_t target_layers[] = { 0, 1 };
+    gguf_set_arr_data(draft_meta.get(), "dflash.target_layers", GGUF_TYPE_INT32, target_layers, 2);
+    gguf_set_val_u32(draft_meta.get(), "dflash.block_size", 4);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_kernel_size", 3);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_group_size", 8);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_rank", 8);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_top_k", 2);
+    const bool swa_pattern[] = { true, true };
+    gguf_set_arr_data(draft_meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, swa_pattern, 2);
+    gguf_set_val_u32(draft_meta.get(), "tokenizer.ggml.mask_token_id", 127);
+    auto add_tensor_meta = [](gguf_context * meta, const char * name, int64_t rows) {
+        ggml_tensor t = {};
+        t.type = GGML_TYPE_F32;
+        t.ne[0] = 256;
+        t.ne[1] = rows;
+        t.ne[2] = t.ne[3] = 1;
+        ggml_set_name(&t, name);
+        gguf_add_tensor(meta, &t);
+    };
+    add_tensor_meta(target_meta.get(), "output.weight", 128);
+    add_tensor_meta(draft_meta.get(), "output.weight", 128);
+    add_tensor_meta(draft_meta.get(), "selector_hidden.weight", 8);
+    tensor_data_params data = { seed, stdev };
+    auto fill = [](ggml_tensor * t, void * ud) {
+        set_tensor_data(t, ud);
+        // Equal logits and selector scores make token 0 a deterministic accepted draft.
+        if (strcmp(t->name, "output.weight") == 0 || strcmp(t->name, "selector_hidden.weight") == 0) {
+            std::vector<float> zeros(ggml_nelements(t), 0.0f);
+            ggml_backend_tensor_set(t, zeros.data(), 0, ggml_nbytes(t));
+        }
+    };
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { nullptr };
+    mp.devices = devices;
+    mp.n_gpu_layers = 0;
+    llama_model_ptr target(llama_model_init_from_user(target_meta.get(), fill, &data, mp));
+    GGML_ASSERT(target && llama_model_rope_type(target.get()) == LLAMA_ROPE_TYPE_IMROPE);
+
+    struct capture {
+        size_t zero_rows = 0;
+        int64_t max_rows = 0;
+    } cap;
+    for (bool mrope : { false, true }) {
+        if (mrope) {
+            const uint32_t sections[] = { 64, 0, 0, 0 };
+            gguf_set_arr_data(draft_meta.get(), "dflash.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
+        } else {
+            gguf_remove_key(draft_meta.get(), "dflash.rope.dimension_sections");
+        }
+        llama_model_ptr draft(llama_model_init_from_user(draft_meta.get(), fill, &data, mp));
+        GGML_ASSERT(draft && llama_model_dflash_selector_top_k(draft.get()) == 2);
+        for (auto kv_type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 1024;
+            cp.n_batch = 32;
+            cp.n_ubatch = 8;
+            cp.n_seq_max = 2;
+            cp.n_threads = cp.n_threads_batch = 2;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            cp.type_k = cp.type_v = kv_type;
+            llama_context_ptr ctx_tgt(llama_init_from_model(target.get(), cp));
+            cp.ctx_other = ctx_tgt.get();
+            cp.cb_eval_user_data = &cap;
+            cp.cb_eval = [](ggml_tensor * t, bool ask, void * ud) {
+                if (strcmp(t->name, "inp_g_embeddings") != 0) {
+                    return false;
+                }
+                if (ask) {
+                    return true;
+                }
+                auto & cap = *static_cast<capture *>(ud);
+                std::vector<float> features(ggml_nelements(t));
+                ggml_backend_tensor_get(t, features.data(), 0, ggml_nbytes(t));
+                if (std::all_of(features.begin(), features.end(), [](float v) { return v == 0; })) {
+                    cap.zero_rows += t->ne[1];
+                }
+                cap.max_rows = std::max(cap.max_rows, t->ne[1]);
+                return true;
+            };
+            llama_context_ptr ctx_dft(llama_init_from_model(draft.get(), cp));
+            GGML_ASSERT(ctx_tgt && ctx_dft);
+            common_params_speculative params;
+            params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+            params.draft.ctx_tgt = ctx_tgt.get();
+            params.draft.ctx_dft = ctx_dft.get();
+            params.draft.n_max = 3;
+            params.draft.n_min = 1;
+            common_speculative_ptr spec(common_speculative_init(params, 2));
+            GGML_ASSERT(spec);
+            auto process = [&](const common_batch & in) {
+                const int before = log.position_errors;
+                const bool ok = common_speculative_process(spec.get(), in);
+                GGML_ASSERT(log.position_errors == before);
+                return ok;
+            };
+            const char * cases[] = { "text", "image+text", "image-end", "long+image", "cached+image-end" };
+            for (int test = 0; test < 5; ++test) {
+                llama_memory_clear(llama_get_memory(ctx_tgt.get()), true);
+                llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+                cap = {};
+                std::vector<llama_tokens> prompts(2);
+                std::vector<llama_pos> positions(2);
+                size_t expected_zeros = 0;
+                for (llama_seq_id seq = 0; seq < 2; ++seq) {
+                    const int prefix = (test >= 3 ? 128 : 8) + 4*seq;
+                    for (int pos = 0; pos < prefix;) {
+                        common_batch in(ctx_tgt.get());
+                        const int n = std::min(16, prefix - pos);
+                        for (int i = 0; i < n; ++i) {
+                            in.add(1, pos++, seq, true);
+                            prompts[seq].push_back(1);
+                        }
+                        GGML_ASSERT(llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, in.get()) == 0);
+                        if (test != 4) {
+                            GGML_ASSERT(process(in));
+                        }
+                    }
+                    if (test == 4) {
+                        const size_t size = llama_state_seq_get_size(ctx_tgt.get(), seq);
+                        std::vector<uint8_t> saved(size);
+                        GGML_ASSERT(size && llama_state_seq_get_data(ctx_tgt.get(), saved.data(), size, seq) == size);
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx_tgt.get()), seq, -1, -1));
+                        GGML_ASSERT(llama_state_seq_set_data(ctx_tgt.get(), saved.data(), size, seq) == size);
+                        expected_zeros += prefix;
+                    }
+                    llama_pos pos = prefix;
+                    if (test != 0) {
+                        const llama_pos before = llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), seq);
+                        common_batch image(ctx_tgt.get());
+                        std::vector<float> embeddings(6*256, 0.01f);
+                        for (int i = 0; i < 6; ++i) {
+                            const llama_pos p[4] = { pos, pos + i/3, pos + i%3, 0 };
+                            image.add_embd({ embeddings.data() + i*256, 1, 256 }, p, seq, true);
+                            prompts[seq].push_back(0);
+                        }
+                        GGML_ASSERT(llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, image.get()) == 0);
+                        GGML_ASSERT(process(image));
+                        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), seq) == before);
+                        pos += 3;
+                        expected_zeros += 3;
+                        if (test == 1 || test == 3) {
+                            common_batch text(ctx_tgt.get());
+                            for (int i = 0; i < 3; ++i) {
+                                text.add(1, pos++, seq, true);
+                                prompts[seq].push_back(1);
+                            }
+                            GGML_ASSERT(llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, text.get()) == 0);
+                            GGML_ASSERT(process(text));
+                        }
+                    }
+                    positions[seq] = pos;
+                    common_speculative_begin(spec.get(), seq, prompts[seq]);
+                }
+                for (int round = 0; round < 2; ++round) {
+                    std::vector<llama_tokens> results(2);
+                    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+                        auto & dp = common_speculative_get_draft_params(spec.get(), seq);
+                        dp.drafting = true;
+                        dp.pos0 = positions[seq];
+                        dp.id_last = 0;
+                        dp.prompt = &prompts[seq];
+                        dp.result = &results[seq];
+                    }
+                    const int before = log.position_errors;
+                    common_speculative_draft(spec.get());
+                    GGML_ASSERT(log.position_errors == before);
+                    common_batch verify(ctx_tgt.get());
+                    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+                        GGML_ASSERT(results[seq] == llama_tokens({0, 0, 0}));
+                        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq, positions[seq], -1));
+                        verify.add(0, positions[seq]++, seq, true);
+                        for (auto token : results[seq]) {
+                            verify.add(token, positions[seq]++, seq, true);
+                        }
+                    }
+                    GGML_ASSERT(llama_process(ctx_tgt.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0);
+                    for (int i = 0; i < verify.size(); ++i) {
+                        const float * logits = llama_get_logits_ith(ctx_tgt.get(), i);
+                        GGML_ASSERT(std::max_element(logits, logits + 128) == logits);
+                    }
+                    GGML_ASSERT(process(verify));
+                    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+                        common_speculative_accept(spec.get(), seq, 3);
+                    }
+                }
+                GGML_ASSERT(cap.zero_rows == expected_zeros && cap.max_rows <= 8);
+                printf("DFlash2 %s, draft-rope=%s, KV=%s: 12 draft tokens generated and accepted\n", cases[test], mrope ? "mrope" : "1d", ggml_type_name(kv_type));
+            }
+            llama_set_abort_callback(ctx_dft.get(), [](void *) { return true; }, nullptr);
+            common_batch next(ctx_tgt.get());
+            llama_pos gap_end = llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), 0) + 8;
+            next.add(0, gap_end, 0, true);
+            GGML_ASSERT(!process(next));
+            llama_tokens result;
+            llama_tokens prompt = { 0 };
+            auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+            dp.drafting = true;
+            dp.pos0 = llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), 0) + 8;
+            dp.id_last = 0;
+            dp.prompt = &prompt;
+            dp.result = &result;
+            bool failed = false;
+            const int before = log.position_errors;
+            try {
+                common_speculative_draft(spec.get());
+            } catch (const std::runtime_error &) {
+                failed = true;
+            }
+            GGML_ASSERT(failed && result.empty() && log.position_errors == before);
+            llama_set_abort_callback(ctx_dft.get(), nullptr, nullptr);
+            printf("DFlash2 gap fill failures propagate from process and draft\n");
+        }
+    }
+    return 0;
 }
 
 static int test_layer_inputs(size_t seed, float stdev) {
@@ -1613,6 +1839,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool graph_recovery = false;
     bool layer_inputs = false;
+    bool dflash_vision = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1684,6 +1911,8 @@ int main(int argc, char ** argv) {
             graph_recovery = true;
         } else if (strcmp(argv[i], "--test-layer-inputs") == 0) {
             layer_inputs = true;
+        } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
+            dflash_vision = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -1697,6 +1926,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (dflash_vision) {
+            return test_dflash_vision(seed, stdev);
+        }
         if (layer_inputs) {
             return test_layer_inputs(seed, stdev);
         }

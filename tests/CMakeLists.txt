@@ -231,6 +231,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
     llama_test(test-llama-archs NAME test-qwen4exp-layer-inputs ARGS --test-layer-inputs -s 42)
+    llama_test(test-llama-archs NAME test-dflash-vision ARGS --test-dflash-vision -s 42)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
