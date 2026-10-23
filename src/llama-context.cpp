@@ -552,7 +552,7 @@ llama_context::llama_context(
             }
         }
 
-        cparams.pipeline_parallel = pipeline_parallel;
+        cparams.pipeline_parallel = false;
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
