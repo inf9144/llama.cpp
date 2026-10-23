@@ -1,5 +1,58 @@
 #include "ggml-vulkan-common.h"
 
+#include <cinttypes>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
+
+static bool ggml_vk_env_flag(const char * name, bool default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "1") == 0) {
+        return value[0] == '1';
+    }
+    GGML_LOG_WARN("ggml_vulkan: %s expects 0 or 1; using %d\n", name, int(default_value));
+    return default_value;
+}
+
+struct vk_idle_rebar_options {
+    const bool enabled = ggml_vk_env_flag("GGML_VK_IDLE_REBAR_FASTPATH", true);
+    const bool set = enabled && ggml_vk_env_flag("GGML_VK_IDLE_REBAR_SET", true);
+    const bool cpy = enabled && ggml_vk_env_flag("GGML_VK_IDLE_REBAR_CPY", true);
+    const bool stats = ggml_vk_env_flag("GGML_VK_IDLE_REBAR_STATS", false);
+};
+
+static const vk_idle_rebar_options & ggml_vk_idle_rebar_options() {
+    static const vk_idle_rebar_options options;
+    return options;
+}
+
+static void ggml_vk_idle_rebar_print_stats(vk_device & device) {
+    if (!ggml_vk_idle_rebar_options().stats) {
+        return;
+    }
+    const auto print = [&](const char * path, const vk_idle_rebar_stats & st) {
+        GGML_LOG_INFO("ggml_vulkan: idle-rebar Vulkan%zu %s cumulative: copies=%" PRIu64 " bytes=%" PRIu64 " cpu_us=%" PRIu64
+                      " fallbacks=%" PRIu64 " fallback_bytes=%" PRIu64 " fallback_host_us=%" PRIu64 "\n",
+                      device->idx, path, st.copies.load(), st.bytes.load(), st.copy_us.load(),
+                      st.fallbacks.load(), st.fallback_bytes.load(), st.fallback_host_us.load());
+        GGML_LOG_INFO("ggml_vulkan: idle-rebar Vulkan%zu %s rejected: disabled=%" PRIu64 " busy=%" PRIu64
+                      " not_host_visible=%" PRIu64 " not_coherent=%" PRIu64 " not_mapped=%" PRIu64
+                      " source_async=%" PRIu64 " wrong_device=%" PRIu64 " queue_mode=%" PRIu64 "\n",
+                      device->idx, path, st.rejected[VK_IDLE_REBAR_DISABLED].load(), st.rejected[VK_IDLE_REBAR_BUSY].load(),
+                      st.rejected[VK_IDLE_REBAR_NOT_HOST_VISIBLE].load(), st.rejected[VK_IDLE_REBAR_NOT_COHERENT].load(),
+                      st.rejected[VK_IDLE_REBAR_NOT_MAPPED].load(), st.rejected[VK_IDLE_REBAR_SOURCE_ASYNC].load(),
+                      st.rejected[VK_IDLE_REBAR_WRONG_DEVICE].load(), st.rejected[VK_IDLE_REBAR_QUEUE_MODE].load());
+    };
+    print("set", device->idle_rebar_set_stats);
+    print("cpy", device->idle_rebar_cpy_stats);
+    GGML_LOG_INFO("ggml_vulkan: idle-rebar Vulkan%zu synchronize cumulative: calls=%" PRIu64 " host_us=%" PRIu64 "\n",
+                  device->idx, device->idle_rebar_syncs.load(), device->idle_rebar_sync_us.load());
+}
+
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
 
@@ -5805,6 +5858,12 @@ void ggml_vk_ctx_end(vk_context& ctx) {
 
 void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_begin(" << device->name << ")");
+    const auto & options = ggml_vk_idle_rebar_options();
+    if ((options.set || options.cpy) && !device->serialize_submissions && !subctx->idle_rebar_device) {
+        std::lock_guard<std::recursive_mutex> guard(device->mutex);
+        subctx->idle_rebar_device = device;
+        device->idle_rebar_contexts++;
+    }
     if (subctx->s != nullptr) {
         ggml_vk_ctx_end(subctx);
     }
@@ -13257,6 +13316,7 @@ void ggml_backend_vk_free(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
     ggml_vk_cleanup(ctx);
+    ggml_vk_idle_rebar_print_stats(ctx->device);
 
     delete ctx;
     delete backend;
@@ -13266,6 +13326,72 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     return &ctx->device->buffer_type;
+}
+
+static bool ggml_vk_try_idle_rebar_write(ggml_backend_vk_context * ctx, vk_buffer & dst, size_t offset, const void * data,
+                                       size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data,
+                                       bool copy_tensor, bool source_ready = true) {
+    const auto & options = ggml_vk_idle_rebar_options();
+    vk_idle_rebar_stats & st = copy_tensor ? ctx->device->idle_rebar_cpy_stats : ctx->device->idle_rebar_set_stats;
+    const auto reject = [&](vk_idle_rebar_rejection reason) {
+        if (options.stats) {
+            st.fallbacks.fetch_add(1, std::memory_order_relaxed);
+            st.fallback_bytes.fetch_add(size * n_copies, std::memory_order_relaxed);
+            st.rejected[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    if (!(copy_tensor ? options.cpy : options.set)) {
+        return reject(VK_IDLE_REBAR_DISABLED);
+    }
+    // Serialized synchronize can return without waiting for a transfer-only submission.
+    if (ctx->device->serialize_submissions) {
+        return reject(VK_IDLE_REBAR_QUEUE_MODE);
+    }
+    if (!source_ready) {
+        return reject(VK_IDLE_REBAR_SOURCE_ASYNC);
+    }
+    if (!dst || dst->device != ctx->device) {
+        return reject(VK_IDLE_REBAR_WRONG_DEVICE);
+    }
+    if (!(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        return reject(VK_IDLE_REBAR_NOT_HOST_VISIBLE);
+    }
+    if (!(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+        return reject(VK_IDLE_REBAR_NOT_COHERENT);
+    }
+    if (dst->ptr == nullptr) {
+        return reject(VK_IDLE_REBAR_NOT_MAPPED);
+    }
+
+    // Exclude recording and submitted work on every backend and queue sharing this device.
+    std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+    const bool transfer_idle = !ctx->device->async_use_transfer_queue ||
+                               ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value;
+    if (ctx->device->idle_rebar_contexts != 0 || !ctx->compute_ctx.expired() || !ctx->transfer_ctx.expired() ||
+        ctx->submit_pending || ctx->almost_ready_fence_pending || !transfer_idle) {
+        return reject(VK_IDLE_REBAR_BUSY);
+    }
+
+    GGML_ASSERT(n_copies > 0 && offset <= dst->size && size <= dst->size - offset);
+    GGML_ASSERT(n_copies <= SIZE_MAX / size);
+    GGML_ASSERT(n_copies == 1 || stride_tensor <= (dst->size - offset - size) / (n_copies - 1));
+    GGML_ASSERT(n_copies == 1 || stride_data <= (SIZE_MAX - size) / (n_copies - 1));
+    const int64_t start = options.stats ? ggml_time_us() : 0;
+    ggml_vk_buffer_write_2d(dst, offset, data, stride_data, stride_tensor, size, n_copies);
+    // Drain write-combined stores before another thread can submit work using the mapping.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_sfence();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+    // The next queue submission makes these coherent host writes visible to the device.
+    if (options.stats) {
+        st.copy_us.fetch_add(ggml_time_us() - start, std::memory_order_relaxed);
+        st.copies.fetch_add(1, std::memory_order_relaxed);
+        st.bytes.fetch_add(size * n_copies, std::memory_order_relaxed);
+    }
+    return true;
 }
 
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
@@ -13280,6 +13406,13 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
+    vk_buffer buf = buf_ctx->dev_buffer;
+    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    if (ggml_vk_try_idle_rebar_write(ctx, buf, dst_offset, data, size, n_copies, stride_tensor, stride_data, false)) {
+        return;
+    }
+    const bool stats = ggml_vk_idle_rebar_options().stats;
+    const int64_t start = stats ? ggml_time_us() : 0;
     vk_context cpy_ctx;
 
     if (ctx->device->async_use_transfer_queue) {
@@ -13287,10 +13420,6 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
-
-    vk_buffer buf = buf_ctx->dev_buffer;
-
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
@@ -13323,6 +13452,9 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
             }
         }
         ggml_vk_synchronize(ctx);
+    }
+    if (stats) {
+        ctx->device->idle_rebar_set_stats.fallback_host_us.fetch_add(ggml_time_us() - start, std::memory_order_relaxed);
     }
 }
 
@@ -13427,22 +13559,15 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             return false;
         }
 
-        // If the backend is idle, use a CPU copy to avoid GPU synchronization overhead.
-        static constexpr size_t max_cpu_copy_size = 128 * 1024;
         const bool src_backend_synchronous = backend_src->iface.synchronize == nullptr;
-        const bool transfer_idle = !ctx->device->async_use_transfer_queue ||
-                                   ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value;
-        const bool backend_idle = ctx->compute_ctx.expired() && ctx->transfer_ctx.expired() &&
-                                  !ctx->submit_pending && !ctx->almost_ready_fence_pending && transfer_idle;
-        const bool dst_host_coherent =
-            (dst_buf->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
-            (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-
-        if ((backend_src == backend_dst || src_backend_synchronous) && backend_idle && dst_host_coherent && ggml_nbytes(src) <= max_cpu_copy_size) {
-            ggml_vk_buffer_write(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src));
+        const size_t size = ggml_nbytes(src);
+        if (ggml_vk_try_idle_rebar_write(ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data,
+                                        size, 1, size, size, true, backend_src == backend_dst || src_backend_synchronous)) {
             return true;
         }
 
+        const bool stats = ggml_vk_idle_rebar_options().stats;
+        const int64_t start = stats ? ggml_time_us() : 0;
         vk_context cpy_ctx;
         if (ctx->device->async_use_transfer_queue) {
             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
@@ -13450,9 +13575,13 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
         }
 
-        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
-                                          vk_tensor_offset(dst) + dst->view_offs,
-                                          src->data, ggml_nbytes(src));
+        const bool ret = ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
+                                                    vk_tensor_offset(dst) + dst->view_offs,
+                                                    src->data, size);
+        if (stats) {
+            ctx->device->idle_rebar_cpy_stats.fallback_host_us.fetch_add(ggml_time_us() - start, std::memory_order_relaxed);
+        }
+        return ret;
     }
 
     return false;
@@ -13460,6 +13589,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+    const bool stats = ggml_vk_idle_rebar_options().stats;
+    const int64_t start = stats ? ggml_time_us() : 0;
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
@@ -13526,6 +13657,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
+    }
+    if (stats) {
+        ctx->device->idle_rebar_syncs.fetch_add(1, std::memory_order_relaxed);
+        ctx->device->idle_rebar_sync_us.fetch_add(ggml_time_us() - start, std::memory_order_relaxed);
     }
 }
 
@@ -16448,6 +16583,14 @@ GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
 
 
 // out-of-lined header method definitions
+
+vk_context_struct::~vk_context_struct() {
+    if (idle_rebar_device) {
+        std::lock_guard<std::recursive_mutex> guard(idle_rebar_device->mutex);
+        GGML_ASSERT(idle_rebar_device->idle_rebar_contexts > 0);
+        idle_rebar_device->idle_rebar_contexts--;
+    }
+}
 
 void vk_queue_handle_synchronized::submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) {
     // Workaround for NVIDIA driver bug

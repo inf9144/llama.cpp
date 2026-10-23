@@ -656,9 +656,38 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+enum vk_idle_rebar_rejection {
+    VK_IDLE_REBAR_DISABLED,
+    VK_IDLE_REBAR_BUSY,
+    VK_IDLE_REBAR_NOT_HOST_VISIBLE,
+    VK_IDLE_REBAR_NOT_COHERENT,
+    VK_IDLE_REBAR_NOT_MAPPED,
+    VK_IDLE_REBAR_SOURCE_ASYNC,
+    VK_IDLE_REBAR_WRONG_DEVICE,
+    VK_IDLE_REBAR_QUEUE_MODE,
+    VK_IDLE_REBAR_REJECTION_COUNT,
+};
+
+struct vk_idle_rebar_stats {
+    std::atomic<uint64_t> copies {};
+    std::atomic<uint64_t> bytes {};
+    std::atomic<uint64_t> copy_us {};
+    std::atomic<uint64_t> fallbacks {};
+    std::atomic<uint64_t> fallback_bytes {};
+    std::atomic<uint64_t> fallback_host_us {};
+    std::atomic<uint64_t> rejected[VK_IDLE_REBAR_REJECTION_COUNT] {};
+};
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
+
+    // Guarded by mutex. Contexts retain a lease until queue work has been collected after synchronization.
+    size_t idle_rebar_contexts = 0;
+    vk_idle_rebar_stats idle_rebar_set_stats;
+    vk_idle_rebar_stats idle_rebar_cpy_stats;
+    std::atomic<uint64_t> idle_rebar_syncs {};
+    std::atomic<uint64_t> idle_rebar_sync_us {};
 
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile
@@ -1126,6 +1155,9 @@ struct vk_context_struct {
     std::vector<std::string> debug_labels;
 
     vk_command_pool * p {};
+
+    vk_device idle_rebar_device;
+    ~vk_context_struct();
 };
 
 typedef std::shared_ptr<vk_context_struct> vk_context;
