@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -2805,13 +2806,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N0,N1,N2,...",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. a single value is split among the GPUs like the layers (--tensor-split). a comma-separated list sets each GPU's size in --device order; 0 disables that GPU's cache, unused budgets are not redistributed (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            const auto split_arg = string_split(value, ",");
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+
+            auto parse_mib = [](const std::string & s) {
+                size_t idx = 0;
+                const int v = std::stoi(s, &idx);
+                if (idx != s.size() || v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                if ((size_t) v > std::numeric_limits<size_t>::max() / (1024 * 1024)) {
+                    throw std::invalid_argument("MoE cache size is too large");
+                }
+                return (size_t) v * 1024 * 1024;
+            };
+
+            params.moe_cache_size = 0;
+            params.moe_cache_per_device = split_arg.size() > 1;
+            params.moe_cache_sizes.assign(llama_max_devices(), 0);
+            if (params.moe_cache_per_device) {
+                for (size_t i = 0; i < split_arg.size(); ++i) {
+                    params.moe_cache_sizes[i] = parse_mib(split_arg[i]);
+                    if (params.moe_cache_sizes[i] > std::numeric_limits<size_t>::max() - params.moe_cache_size) {
+                        throw std::invalid_argument("MoE cache size is too large");
+                    }
+                    params.moe_cache_size += params.moe_cache_sizes[i];
+                }
+            } else {
+                params.moe_cache_size = parse_mib(split_arg[0]);
+            }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
