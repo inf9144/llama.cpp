@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -1717,7 +1718,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
+        string_format("set the maximum RAM prompt cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable RAM tier)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
@@ -1742,6 +1743,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-io"}, "MODE",
+        "SSD prompt cache I/O: buffered or streaming (default: buffered)",
+        [](common_params & params, const std::string & value) {
+            if (value != "buffered" && value != "streaming") {
+                throw std::invalid_argument("cache-ssd-io must be buffered or streaming");
+            }
+            params.cache_ssd_streaming = value == "streaming";
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_IO").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -1752,7 +1763,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
-        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
+        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires RAM or SSD cache)",
         [](common_params & params, bool value) {
             params.cache_idle_slots = value;
         }
@@ -2795,13 +2806,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N0,N1,N2,...",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. a single value is split among the GPUs like the layers (--tensor-split). a comma-separated list sets each GPU's size in --device order; 0 disables that GPU's cache, unused budgets are not redistributed (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            const auto split_arg = string_split(value, ",");
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+
+            auto parse_mib = [](const std::string & s) {
+                size_t idx = 0;
+                const int v = std::stoi(s, &idx);
+                if (idx != s.size() || v < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                if ((size_t) v > std::numeric_limits<size_t>::max() / (1024 * 1024)) {
+                    throw std::invalid_argument("MoE cache size is too large");
+                }
+                return (size_t) v * 1024 * 1024;
+            };
+
+            params.moe_cache_size = 0;
+            params.moe_cache_per_device = split_arg.size() > 1;
+            params.moe_cache_sizes.assign(llama_max_devices(), 0);
+            if (params.moe_cache_per_device) {
+                for (size_t i = 0; i < split_arg.size(); ++i) {
+                    params.moe_cache_sizes[i] = parse_mib(split_arg[i]);
+                    if (params.moe_cache_sizes[i] > std::numeric_limits<size_t>::max() - params.moe_cache_size) {
+                        throw std::invalid_argument("MoE cache size is too large");
+                    }
+                    params.moe_cache_size += params.moe_cache_sizes[i];
+                }
+            } else {
+                params.moe_cache_size = parse_mib(split_arg[0]);
+            }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
@@ -3511,6 +3551,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.ui = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI"));
+    add_opt(common_arg(
+        {"--connect"},
+        string_format("(experimental) open a peer-to-peer tunnel for server using llama-connect (default: %s)", params.server_connect ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.server_connect = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONNECT"));
+    add_opt(common_arg(
+        {"--connect-code"}, "CODE",
+        "manually specify a 40-character code for --connect (default: generate a new one for each run)",
+        [](common_params & params, const std::string & value) {
+            std::string val = value;
+            string_replace_all(val, "-", "");
+            string_replace_all(val, " ", "");
+            if (val.size() != 40) {
+                throw std::invalid_argument(string_format("error: invalid connect code '%s', must be 40 characters\n", value.c_str()));
+            }
+            params.server_connect_code = val;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONNECT_CODE"));
     add_opt(common_arg(
         {"--embedding", "--embeddings"},
         string_format("restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled"),

@@ -230,6 +230,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-llama-archs.cpp)
 
     llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
+    llama_test(test-llama-archs NAME test-qwen4exp-layer-inputs ARGS --test-layer-inputs -s 42)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -348,6 +349,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
+    llama_build_and_test(test-gelu-quick.cpp LINK ggml)
 endif()
 
 # libmtmd

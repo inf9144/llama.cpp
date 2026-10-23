@@ -674,7 +674,93 @@ static bool test_responses_compaction_update() {
     return ok;
 }
 
+static bool test_responses_stream_output_indices() {
+    for (const bool reasoning : {false, true}) {
+        for (const bool text : {false, true}) {
+            auto result = make_response_result(text ? "Visible answer." : "");
+            result.oai_resp_reasoning_id = "rs_indices";
+            result.oaicompat_msg.reasoning_content = reasoning ? "Thinking." : "";
+            result.generation_params.responses_custom_tools.insert("apply_patch");
+            result.generation_params.responses_tool_search = true;
+            result.generation_params.responses_compaction = true;
+            result.oai_resp_compaction_content = "Saved progress.";
+            result.oaicompat_msg.tool_calls = {
+                {"exec_command", R"({"cmd":"pwd"})", "exec_indices"},
+                {"apply_patch", R"({"input":"*** Begin Patch\n*** End Patch"})", "patch_indices"},
+                {"tool_search", R"({"query":"calendar"})", "search_indices"},
+                {"exec_command", R"({"cmd":"git status --short"})", "exec_after_search_indices"},
+            };
+            const auto events = result.to_json_oaicompat_resp_stream();
+            const auto & output = events.back().at("data").at("response").at("output");
+            auto check_index = [&](const json & event) {
+                const auto & data = event.at("data");
+                const int index = data.value("output_index", -1);
+                if (index < 0 || static_cast<size_t>(index) >= output.size()) {
+                    std::cerr << "Responses stream event lost its output index: " << event.dump() << '\n';
+                    return false;
+                }
+                const std::string id = data.contains("item") ? data.at("item").at("id").get<std::string>() : data.value("item_id", std::string());
+                if (id != output.at(index).at("id").get<std::string>()) {
+                    std::cerr << "Responses stream index points to a different output item\n";
+                    return false;
+                }
+                return true;
+            };
+            size_t done = 0;
+            for (const auto & event : events) {
+                const auto & data = event.at("data");
+                if (event.at("event") == "response.completed") {
+                    continue;
+                }
+                if (!check_index(event)) {
+                    return false;
+                }
+                if (event.at("event") == "response.output_item.done") {
+                    if (data.at("output_index").get<size_t>() != done++) {
+                        std::cerr << "Responses stream output indices are not consecutive\n";
+                        return false;
+                    }
+                }
+            }
+            if (done != output.size()) {
+                return false;
+            }
+
+            server_task_result_cmpl_partial partial {};
+            partial.oai_resp_created = true;
+            partial.oai_resp_reasoning_id = result.oai_resp_reasoning_id;
+            partial.oai_resp_message_id = result.oai_resp_message_id;
+            partial.anthropic_has_reasoning = reasoning;
+            partial.responses_custom_tools = result.generation_params.responses_custom_tools;
+            partial.responses_tool_search = result.generation_params.responses_tool_search;
+            common_chat_msg_diff diff;
+            diff.reasoning_content_delta = result.oaicompat_msg.reasoning_content;
+            diff.content_delta = result.oaicompat_msg.content;
+            diff.tool_call_index = 0;
+            diff.tool_call_delta = result.oaicompat_msg.tool_calls.front();
+            partial.oaicompat_msg_diffs.push_back(diff);
+            for (size_t i = 1; i < result.oaicompat_msg.tool_calls.size(); ++i) {
+                common_chat_msg_diff tool_diff;
+                tool_diff.tool_call_index = static_cast<int>(i);
+                tool_diff.tool_call_delta = result.oaicompat_msg.tool_calls[i];
+                partial.oaicompat_msg_diffs.push_back(tool_diff);
+            }
+            const auto partial_events = partial.to_json_oaicompat_resp();
+            for (const auto & event : partial_events) {
+                if (!check_index(event)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 int main() {
+    if (!test_responses_stream_output_indices()) {
+        return 1;
+    }
+
     if (!test_responses_compaction_update()) {
         return 1;
     }

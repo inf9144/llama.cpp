@@ -1174,6 +1174,8 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_VLLM_D3,        "vllm-d3"        },
     { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
     { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
+    { COMMON_DECISION_TYPE_GRANITE_SWITCH, "granite-switch"},
+    { COMMON_DECISION_TYPE_H2O_LIGHTNING,  "h2o-lightning" },
     // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
 };
 
@@ -1232,6 +1234,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     if (ctx_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), ctx_id) == GGUF_TYPE_UINT32) {
         info.n_ctx_train = gguf_get_val_u32(gguf_ctx.get(), ctx_id);
     }
+
+    // same key as llama_model_chat_template(model, nullptr)
+    info.has_chat_tmpl = gguf_find_key(gguf_ctx.get(), "tokenizer.chat_template") >= 0;
 
     return info;
 }
@@ -1744,6 +1749,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_split = params.moe_cache_per_device ? params.moe_cache_sizes.data() : nullptr;
 
     return cparams;
 }

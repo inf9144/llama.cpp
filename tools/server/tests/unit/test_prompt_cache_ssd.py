@@ -2,6 +2,7 @@ import pytest
 from utils import *
 
 import os
+from pathlib import Path
 import struct
 import time
 
@@ -37,14 +38,19 @@ def read_fingerprints():
     return fps
 
 
+@pytest.fixture(params=[(1, "buffered"), (1, "streaming"), (0, "buffered"), (0, "streaming")])
+def cache_mode(request):
+    return request.param
+
+
 @pytest.fixture(autouse=True)
-def create_server(tmp_path):
+def create_server(tmp_path, cache_mode):
     global server
     server = ServerPreset.tinyllama2()
     server.temperature = 0.0
     server.cache_ssd_dir = str(tmp_path / "ssd-cache")
-    # small RAM cache to force eviction to SSD
-    server.cache_ram = 1
+    # Exercise both RAM eviction and SSD-only storage in each I/O mode.
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     server.server_metrics = True
 
@@ -165,6 +171,7 @@ def test_ssd_restore_after_restart(tmp_path):
 
     # restart the server with the same SSD directory
     server.stop()
+    server.cache_ssd_io = "streaming" if server.cache_ssd_io == "buffered" else "buffered"
     server.start()
 
     # the state should be restored from the SSD cache after the restart
@@ -221,7 +228,7 @@ def test_ssd_flush_on_shutdown_while_sleeping(tmp_path):
         f"expected an SSD hit after shutdown while sleeping, before={hits_before} after={hits_after}"
 
 
-def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
+def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path, cache_mode):
     # a single state larger than the RAM limit must still be saved to SSD, even
     # though it can never fit in the RAM tier. tinygemma3 has a large enough KV
     # cache that a short prompt already exceeds the 1 MiB RAM limit.
@@ -229,7 +236,7 @@ def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
     server = ServerPreset.tinygemma3()
     server.temperature = 0.0
     server.cache_ssd_dir = str(tmp_path / "ssd-cache")
-    server.cache_ram = 1
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     server.server_metrics = True
     server.start()
@@ -269,12 +276,12 @@ def test_large_state_exceeding_ram_limit_reaches_ssd(tmp_path):
         f"expected an SSD hit for the large state, before={hits_before} after={hits_after}"
 
 
-def test_no_ssd_config_unchanged(tmp_path):
+def test_no_ssd_config_unchanged(tmp_path, cache_mode):
     # without the SSD config, the behavior is unchanged (no SSD cache)
     global server
     server = ServerPreset.tinyllama2()
     server.temperature = 0.0
-    server.cache_ram = 1
+    server.cache_ram, server.cache_ssd_io = cache_mode
     server.n_ctx = 512
     # no cache_ssd_dir
     server.start()
@@ -325,3 +332,46 @@ def test_growing_prompt_same_slot_no_full_refill():
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] < prompt_n_base
+
+
+def test_unchanged_idle_slot_skips_ssd_write():
+    if server.cache_ram != 0:
+        pytest.skip("exercises repeated direct saves in SSD-only mode")
+    server.kv_unified = False
+    server.n_slots = 2
+    server.start()
+
+    prompt_a = list(range(1, 25))
+    prompt_b = list(range(30, 54))
+
+    def complete(slot, tokens):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": tokens,
+            "id_slot": slot,
+            "n_predict": 1,
+            "cache_prompt": True,
+            "temperature": 0,
+            "seed": 42,
+        })
+        assert res.status_code == 200
+
+    complete(0, prompt_a)
+    complete(1, prompt_b)
+    snapshots = list(Path(server.cache_ssd_dir).rglob("*.lsc"))
+    assert len(snapshots) == 1
+    snapshot_a = snapshots[0]
+    fixed_ns = 1_600_000_000_000_000_000
+    os.utime(snapshot_a, ns=(fixed_ns, fixed_ns))
+
+    for i in range(3):
+        complete(1, prompt_b + [60 + i])
+        assert snapshot_a.stat().st_mtime_ns == fixed_ns, "unchanged idle slot rewrote its SSD snapshot"
+
+    # A new task invalidates the saved identity even if its final token key is identical.
+    complete(0, prompt_a)
+    complete(1, prompt_b)
+    assert snapshot_a.stat().st_mtime_ns != fixed_ns, "new task reused a potentially stale same-token snapshot"
+
+    os.utime(snapshot_a, ns=(fixed_ns, fixed_ns))
+    server.stop()
+    assert snapshot_a.stat().st_mtime_ns == fixed_ns, "shutdown rewrote the unchanged idle snapshot"

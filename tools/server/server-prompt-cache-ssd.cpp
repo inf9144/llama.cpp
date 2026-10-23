@@ -2,8 +2,12 @@
 
 #include "common.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
+#include "../../src/llama-io.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -18,6 +22,127 @@ constexpr uint32_t SSD_MAGIC   = 0x5343504c;  // "LPCS"
 constexpr uint32_t SSD_VERSION = 2;
 constexpr const char * SSD_EXT = ".lsc";
 constexpr const char * SSD_TMP_EXT = ".lsc.tmp";
+constexpr size_t SSD_IO_BUFFER_SIZE = 64*1024*1024;
+
+// Process-wide IDs also distinguish snapshots from different cache instances.
+std::atomic<uint64_t> next_snapshot_id{1};
+
+class ssd_io_write : public llama_io_write_i {
+public:
+    ssd_io_write(std::ostream & stream, size_t size, size_t buffer_size) : stream(stream), remaining(size), buffer_size(buffer_size) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > remaining) {
+            throw std::runtime_error("SSD state write exceeds blob size");
+        }
+        stream.write(static_cast<const char *>(src), size);
+        if (!stream.good()) {
+            throw std::runtime_error("SSD state write failed");
+        }
+        remaining -= size;
+        written += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > remaining) {
+            throw std::runtime_error("SSD tensor write exceeds blob size");
+        }
+        // Reserve once so vector growth cannot exceed the transfer limit.
+        buffer.reserve(buffer_size);
+        buffer.resize(std::min(size, buffer_size));
+        while (size > 0) {
+            const size_t chunk = std::min(size, buffer.size());
+            ggml_backend_tensor_get(tensor, buffer.data(), offset, chunk);
+            write(buffer.data(), chunk);
+            offset += chunk;
+            size -= chunk;
+        }
+    }
+
+    size_t n_bytes() override { return written; }
+
+private:
+    std::ostream & stream;
+    size_t remaining;
+    size_t written = 0;
+    size_t buffer_size;
+    std::vector<uint8_t> buffer;
+};
+
+class ssd_io_read : public llama_io_read_i {
+public:
+    ssd_io_read(std::istream & stream, size_t size, size_t buffer_size) : stream(stream), remaining(size), buffer_size(buffer_size) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > remaining) {
+            fail_invalid_data();
+            throw std::runtime_error("SSD state read exceeds blob size");
+        }
+        stream.read(static_cast<char *>(dst), size);
+        if (!stream.good()) {
+            if (stream.eof()) {
+                fail_invalid_data();
+            }
+            throw std::runtime_error("SSD state read failed");
+        }
+        remaining -= size;
+        read_size += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > remaining) {
+            fail_invalid_data();
+            throw std::runtime_error("SSD tensor read exceeds blob size");
+        }
+        buffer.reserve(buffer_size);
+        buffer.resize(std::min(size, buffer_size));
+        while (size > 0) {
+            const size_t chunk = std::min(size, buffer.size());
+            read(buffer.data(), chunk);
+            ggml_backend_tensor_set(tensor, buffer.data(), offset, chunk);
+            offset += chunk;
+            size -= chunk;
+        }
+    }
+
+    size_t n_bytes() override { return read_size; }
+
+private:
+    std::istream & stream;
+    size_t remaining;
+    size_t read_size = 0;
+    size_t buffer_size;
+    std::vector<uint8_t> buffer;
+};
+
+class ssd_io_read_buffer : public llama_io_read_i {
+public:
+    ssd_io_read_buffer(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        memcpy(dst, take(size), size);
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        ggml_backend_tensor_set(tensor, take(size), offset, size);
+    }
+
+    size_t n_bytes() override { return read_size; }
+
+private:
+    const uint8_t * take(size_t size) {
+        if (size > data.size() - read_size) {
+            fail_invalid_data();
+            throw std::runtime_error("SSD state read exceeds buffer size");
+        }
+        const auto * result = data.data() + read_size;
+        read_size += size;
+        return result;
+    }
+
+    const std::vector<uint8_t> & data;
+    size_t read_size = 0;
+};
 
 // persistent timestamp, the monotonic clock resets on reboot and would break the LRU order
 int64_t now_ms() {
@@ -26,8 +151,11 @@ int64_t now_ms() {
 }
 } // namespace
 
-server_prompt_cache_ssd::server_prompt_cache_ssd(std::string dir, size_t limit_size)
-    : dir(std::move(dir)), limit_size(limit_size) {
+server_prompt_cache_ssd::server_prompt_cache_ssd(std::string dir, size_t limit_size, bool streaming, size_t io_buffer_size)
+    : dir(std::move(dir)), limit_size(limit_size), streaming(streaming), io_buffer_size(io_buffer_size) {
+    if (io_buffer_size == 0 || io_buffer_size > SSD_IO_BUFFER_SIZE) {
+        throw std::invalid_argument("SSD I/O buffer must be between 1 byte and 64 MiB");
+    }
 }
 
 server_prompt_cache_ssd::~server_prompt_cache_ssd() = default;
@@ -144,6 +272,7 @@ bool server_prompt_cache_ssd::init(const server_prompt_cache_ssd_fingerprint & f
             continue;
         }
 
+        e.snapshot_id = next_snapshot_id.fetch_add(1, std::memory_order_relaxed);
         lru.push_back(std::move(e));
         index[lru.back().key] = std::prev(lru.end());
         total_size += lru.back().size;
@@ -161,12 +290,13 @@ bool server_prompt_cache_ssd::init(const server_prompt_cache_ssd_fingerprint & f
     const std::string limit_str = limit_size > 0 ? std::to_string(limit_size / (1024 * 1024)) + " MiB" : std::string("none");
     SRV_INF("ssd cache: %zu entries, %.3f MiB (limit: %s) in '%s'\n",
             lru.size(), total_size / (1024.0 * 1024.0), limit_str.c_str(), mdir.c_str());
+    SRV_INF("ssd cache: I/O mode = %s\n", streaming ? "streaming" : "buffered");
 
     return true;
 }
 
-bool server_prompt_cache_ssd::save_file(const std::string & path, const server_prompt_cache_state & state, int64_t last_access_ms, size_t & file_size) const {
-    const std::vector<char> packed = state.prompt.tokens.serialize();
+bool server_prompt_cache_ssd::save_file(const std::string & path, const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state, int64_t last_access_ms, size_t & file_size) const {
+    const std::vector<char> packed = prompt.tokens.serialize();
 
     if (limit_size > 0) {
         size_t remaining = limit_size;
@@ -181,8 +311,8 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
         // Include all format metadata. Subtract each blob size to avoid overflow.
         const size_t header_size = sizeof(SSD_MAGIC) + sizeof(SSD_VERSION) + sizeof(last_access_ms) + sizeof(fp)
                                  + sizeof(uint8_t) + 2*sizeof(uint32_t) + 3*sizeof(uint64_t);
-        bool fits_limit = fits(header_size) && fits(packed.size()) && fits(state.data.main.size()) && fits(state.data.drft.size());
-        for (const auto & ckpt : state.prompt.checkpoints) {
+        bool fits_limit = fits(header_size) && fits(packed.size()) && fits(main_size) && fits(drft_size);
+        for (const auto & ckpt : prompt.checkpoints) {
             fits_limit = fits_limit
                       && fits(sizeof(ckpt.n_tokens) + sizeof(ckpt.id_task) + sizeof(ckpt.pos_min) + sizeof(ckpt.pos_max) + 3*sizeof(uint64_t))
                       && fits(ckpt.data_tgt.size()) && fits(ckpt.data_dft.size()) && fits(ckpt.data_spec.size());
@@ -214,7 +344,7 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
            && write(&fp, sizeof(fp));
 
     if (ok) {
-        const uint8_t has_mtmd = state.prompt.tokens.has_mtmd ? 1 : 0;
+        const uint8_t has_mtmd = prompt.tokens.has_mtmd ? 1 : 0;
         ok = write(&has_mtmd, sizeof(has_mtmd));
     }
 
@@ -225,9 +355,9 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
     }
 
     if (ok) {
-        const uint32_t n_ckpt = static_cast<uint32_t>(state.prompt.checkpoints.size());
+        const uint32_t n_ckpt = static_cast<uint32_t>(prompt.checkpoints.size());
         ok = write(&n_ckpt, sizeof(n_ckpt));
-        for (const auto & ckpt : state.prompt.checkpoints) {
+        for (const auto & ckpt : prompt.checkpoints) {
             uint64_t sz;
             ok = write(&ckpt.n_tokens, sizeof(ckpt.n_tokens))
                && write(&ckpt.id_task,  sizeof(ckpt.id_task))
@@ -246,12 +376,12 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
     }
 
     if (ok) {
-        uint64_t sz = state.data.main.size();
-        ok = write(&sz, sizeof(sz)) && (sz == 0 || write(state.data.main.data(), sz));
+        const uint64_t sz = main_size;
+        ok = write(&sz, sizeof(sz)) && (sz == 0 || write_state(f, false));
     }
     if (ok) {
-        uint64_t sz = state.data.drft.size();
-        ok = write(&sz, sizeof(sz)) && (sz == 0 || write(state.data.drft.data(), sz));
+        const uint64_t sz = drft_size;
+        ok = write(&sz, sizeof(sz)) && (sz == 0 || write_state(f, true));
     }
 
     if (ok) {
@@ -336,7 +466,7 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
     // the token data must fit in the remaining file
     const uint64_t tokens_size = static_cast<uint64_t>(n_tokens) * sizeof(llama_token);
     const uint64_t pos = static_cast<uint64_t>(f.tellg());
-    if (tokens_size > file_size - pos) {
+    if (pos > file_size || tokens_size > file_size - pos) {
         return false;
     }
 
@@ -361,7 +491,7 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
     if (!read(&total_size, sizeof(total_size))) {
         return false;
     }
-    if (total_size + sizeof(total_size) != file_size) {
+    if (total_size != file_size - sizeof(total_size)) {
         return false;
     }
 
@@ -376,6 +506,13 @@ bool server_prompt_cache_ssd::read_header(const std::string & path, entry & e, s
 }
 
 bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data) const {
+    bool invalid_data;
+    return read_state(e, prompt, data, nullptr, nullptr, 0, invalid_data);
+}
+
+bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt, server_prompt_data & data, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool & invalid_data) const {
+    invalid_data = true;
+    prompt.invalidate_ssd_snapshot();
     std::ifstream f(entry_path(e.key), std::ios::binary);
     if (!f) {
         return false;
@@ -393,7 +530,7 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
     // check that a blob of the given size fits in the remaining file
     auto fits = [&](uint64_t size) -> bool {
         const uint64_t pos = static_cast<uint64_t>(f.tellg());
-        return size <= file_size - pos;
+        return pos <= file_size && size <= file_size - pos;
     };
 
     uint32_t magic, version;
@@ -474,10 +611,8 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
     if (!fits(main_size)) {
         return false;
     }
-    data.main.resize(main_size);
-    if (main_size && !read(data.main.data(), main_size)) {
-        return false;
-    }
+    const auto main_pos = f.tellg();
+    f.seekg(static_cast<std::streamoff>(main_size), std::ios::cur);
 
     uint64_t drft_size;
     if (!read(&drft_size, sizeof(drft_size))) {
@@ -486,52 +621,177 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
     if (!fits(drft_size)) {
         return false;
     }
-    data.drft.resize(drft_size);
-    if (drft_size && !read(data.drft.data(), drft_size)) {
-        return false;
-    }
+    const auto drft_pos = f.tellg();
+    f.seekg(static_cast<std::streamoff>(drft_size), std::ios::cur);
 
     // the trailing total size guards against truncated files
     uint64_t total_size;
     if (!read(&total_size, sizeof(total_size))) {
         return false;
     }
-    if (static_cast<uint64_t>(f.tellg()) != total_size + sizeof(total_size)) {
+    if (file_size < sizeof(total_size) || total_size != file_size - sizeof(total_size) ||
+            static_cast<uint64_t>(f.tellg()) != file_size) {
         return false;
+    }
+
+    // Check both state headers before reading the main payload or changing either context.
+    if (ctx_tgt) {
+        auto valid_header = [&](std::streampos pos, uint64_t size) {
+            if (size < sizeof(LLAMA_STATE_SEQ_IO_MAGIC) + sizeof(llama_seq_id)) {
+                return false;
+            }
+            f.seekg(pos);
+            uint32_t magic;
+            return read(&magic, sizeof(magic)) && magic == LLAMA_STATE_SEQ_IO_MAGIC;
+        };
+        if (!valid_header(main_pos, main_size) || (drft_size > 0 && !valid_header(drft_pos, drft_size))) {
+            return false;
+        }
+        if ((ctx_dft != nullptr) != (drft_size > 0)) {
+            return false;
+        }
+        invalid_data = false;
+    }
+
+    if (!ctx_tgt || !streaming) {
+        f.seekg(main_pos);
+        data.main.resize(main_size);
+        if (main_size && !read(data.main.data(), main_size)) {
+            invalid_data = f.eof();
+            return false;
+        }
+        f.seekg(drft_pos);
+        data.drft.resize(drft_size);
+        if (drft_size && !read(data.drft.data(), drft_size)) {
+            invalid_data = f.eof();
+            return false;
+        }
+    }
+
+    if (ctx_tgt) {
+        auto restore = [&](llama_context * ctx, std::streampos pos, uint64_t size, const std::vector<uint8_t> & buffer) {
+            auto apply = [&](llama_io_read_i & io) {
+                const size_t n = llama_state_seq_read(ctx, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n != size) {
+                    invalid_data = io.has_invalid_data() || n > 0;
+                    return false;
+                }
+                return true;
+            };
+            if (streaming) {
+                f.seekg(pos);
+                ssd_io_read io(f, size, io_buffer_size);
+                return apply(io);
+            }
+            ssd_io_read_buffer io(buffer);
+            return apply(io);
+        };
+        if (!restore(ctx_tgt, main_pos, main_size, data.main)) {
+            return false;
+        }
+        if (drft_size > 0 && !restore(ctx_dft, drft_pos, drft_size, data.drft)) {
+            return false;
+        }
     }
 
     return true;
 }
 
 bool server_prompt_cache_ssd::save(const server_prompt_cache_state & state) {
-    if (state.prompt.tokens.size() == 0) {
+    return save(state.prompt, state.data.main.size(), state.data.drft.size(), [&](std::ostream & f, bool draft) {
+        const auto & data = draft ? state.data.drft : state.data.main;
+        f.write(reinterpret_cast<const char *>(data.data()), data.size());
+        return f.good();
+    });
+}
+
+bool server_prompt_cache_ssd::save_context(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (prompt.tokens.empty()) {
+        return false;
+    }
+    if (is_saved(prompt)) {
+        return true;
+    }
+    try {
+        const size_t main_size = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t drft_size = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (main_size == 0 || (ctx_dft && drft_size == 0)) {
+            SRV_ERR("%s", "ssd cache: failed to determine sequence state size\n");
+            return false;
+        }
+
+        if (streaming) {
+            return save(prompt, main_size, drft_size, [&](std::ostream & f, bool draft) {
+                const size_t size = draft ? drft_size : main_size;
+                ssd_io_write io(f, size, io_buffer_size);
+                return llama_state_seq_write(draft ? ctx_dft : ctx_tgt, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) == size;
+            });
+        }
+
+        server_prompt_cache_state state;
+        state.prompt = prompt.clone();
+        state.data.main.resize(main_size);
+        state.data.drft.resize(drft_size);
+        if (llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), main_size, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != main_size ||
+                (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), drft_size, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != drft_size)) {
+            SRV_ERR("%s", "ssd cache: failed to capture sequence state\n");
+            return false;
+        }
+        if (!save(state)) {
+            return false;
+        }
+        prompt.ssd_snapshot_id = state.prompt.ssd_snapshot_id;
+        return true;
+    } catch (const std::exception & err) {
+        SRV_ERR("ssd cache: failed to save context: %s\n", err.what());
+        return false;
+    }
+}
+
+bool server_prompt_cache_ssd::is_saved(const server_prompt & prompt) const {
+    if (prompt.ssd_snapshot_id == 0) {
+        return false;
+    }
+    const auto it = index.find(make_key(prompt.tokens));
+    if (it == index.end() || it->second->snapshot_id != prompt.ssd_snapshot_id) {
+        return false;
+    }
+    std::error_code ec;
+    return std::filesystem::file_size(entry_path(it->first), ec) == it->second->size && !ec;
+}
+
+bool server_prompt_cache_ssd::save(const server_prompt & prompt, size_t main_size, size_t drft_size, const state_writer & write_state) {
+    if (prompt.tokens.size() == 0) {
         return false;
     }
 
-    const std::string key  = make_key(state.prompt.tokens);
+    const std::string key  = make_key(prompt.tokens);
     const std::string path = entry_path(key);
     const int64_t now = now_ms();
 
     size_t file_size = 0;
-    if (!save_file(path, state, now, file_size)) {
+    if (!save_file(path, prompt, main_size, drft_size, write_state, now, file_size)) {
         return false;
     }
 
+    const uint64_t snapshot_id = next_snapshot_id.fetch_add(1, std::memory_order_relaxed);
     auto it = index.find(key);
     if (it != index.end()) {
         total_size -= it->second->size;
         it->second->size           = file_size;
         it->second->last_access_ms = now;
-        it->second->n_tokens       = state.prompt.tokens.size();
-        it->second->tokens         = state.prompt.tokens.clone();
+        it->second->n_tokens       = prompt.tokens.size();
+        it->second->tokens         = prompt.tokens.clone();
+        it->second->snapshot_id    = snapshot_id;
         lru.splice(lru.end(), lru, it->second);
     } else {
         entry e;
         e.key            = key;
         e.size           = file_size;
         e.last_access_ms = now;
-        e.n_tokens       = state.prompt.tokens.size();
-        e.tokens         = state.prompt.tokens.clone();
+        e.n_tokens       = prompt.tokens.size();
+        e.tokens         = prompt.tokens.clone();
+        e.snapshot_id    = snapshot_id;
         lru.push_back(std::move(e));
         index[lru.back().key] = std::prev(lru.end());
     }
@@ -539,7 +799,11 @@ bool server_prompt_cache_ssd::save(const server_prompt_cache_state & state) {
 
     update();
 
-    return index.find(key) != index.end();
+    if (index.find(key) == index.end()) {
+        return false;
+    }
+    prompt.ssd_snapshot_id = snapshot_id;
+    return true;
 }
 
 const server_prompt_cache_ssd::entry * server_prompt_cache_ssd::find_best(const server_tokens & tokens_new, int & lcp_out) {
@@ -568,38 +832,39 @@ const server_prompt_cache_ssd::entry * server_prompt_cache_ssd::find_best(const 
 bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const std::string path = entry_path(e.key);
 
-    server_prompt prompt_loaded;
-    server_prompt_data data;
-    if (!read_state(e, prompt_loaded, data)) {
-        SRV_ERR("ssd cache: failed to read state '%s'\n", e.key.c_str());
-        // remove the corrupt entry so it is not offered again
-        std::remove(path.c_str());
-        auto it = index.find(e.key);
-        if (it != index.end()) {
-            total_size -= it->second->size;
-            lru.erase(it->second);
-            index.erase(it);
+    const std::string key = e.key;
+    auto fail = [&](bool remove_entry) {
+        // A streamed restore may already have changed either context.
+        if (ctx_tgt) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        }
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+        }
+        prompt.clear();
+        if (remove_entry) {
+            std::remove(path.c_str());
+            auto it = index.find(key);
+            if (it != index.end()) {
+                total_size -= it->second->size;
+                lru.erase(it->second);
+                index.erase(it);
+            }
         }
         return false;
-    }
+    };
 
-    {
-        const size_t size = data.main.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), size, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (n != size) {
-            SRV_ERR("ssd cache: failed to restore main state, size = %zu\n", size);
-            return false;
+    server_prompt prompt_loaded;
+    server_prompt_data data;
+    try {
+        bool invalid_data;
+        if (!read_state(e, prompt_loaded, data, ctx_tgt, ctx_dft, id_slot, invalid_data)) {
+            SRV_ERR("ssd cache: failed to restore state '%s' (%s)\n", key.c_str(), invalid_data ? "invalid data" : "runtime failure, keeping snapshot");
+            return fail(invalid_data);
         }
-    }
-
-    if (!data.drft.empty()) {
-        GGML_ASSERT(ctx_dft);
-        const size_t size = data.drft.size();
-        const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), size, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (n != size) {
-            SRV_WRN("ssd cache: failed to restore draft state, size = %zu\n", size);
-            return false;
-        }
+    } catch (const std::exception & err) {
+        SRV_ERR("ssd cache: failed to restore state '%s': %s\n", key.c_str(), err.what());
+        return fail(false);
     }
 
     prompt = std::move(prompt_loaded);
@@ -609,6 +874,7 @@ bool server_prompt_cache_ssd::load(const entry & e, server_prompt & prompt, llam
     touch_file(path, now);
     auto it = index.find(e.key);
     if (it != index.end()) {
+        prompt.ssd_snapshot_id = it->second->snapshot_id;
         it->second->last_access_ms = now;
         lru.splice(lru.end(), lru, it->second);
     }

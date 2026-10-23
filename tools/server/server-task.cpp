@@ -771,8 +771,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     std::vector<json> server_sent_events;
     std::vector<json> output;
+    size_t output_index = 0;
 
     if (oaicompat_msg.reasoning_content != "") {
+        const size_t item_output_index = output_index++;
         const json output_item = json {
             {"id",      oai_resp_reasoning_id},
             {"summary", json::array()},
@@ -788,6 +790,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -795,11 +798,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     if (oaicompat_msg.content != "") {
+        const size_t item_output_index = output_index++;
         server_sent_events.push_back(json {
             {"event", "response.output_text.done"},
             {"data", json {
                 {"type",    "response.output_text.done"},
                 {"item_id", oai_resp_message_id},
+                {"output_index", item_output_index},
+                {"content_index", 0},
                 {"text",    oaicompat_msg.content}
             }}
         });
@@ -816,6 +822,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"data", json {
                 {"type",    "response.content_part.done"},
                 {"item_id", oai_resp_message_id},
+                {"output_index", item_output_index},
+                {"content_index", 0},
                 {"part",    content_part}
             }}
         });
@@ -832,6 +840,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -839,6 +848,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+        const size_t item_output_index = output_index++;
         const bool is_custom = server_task_is_response_custom_tool(
             generation_params.responses_custom_tools, tool_call);
         const json output_item = server_task_build_response_tool_call(
@@ -853,6 +863,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"event", "response.output_item.added"},
                 {"data", json {
                     {"type", "response.output_item.added"},
+                    {"output_index", item_output_index},
                     {"item", added_item}
                 }}
             });
@@ -860,6 +871,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"event", "response.custom_tool_call_input.delta"},
                 {"data", json {
                     {"type",    "response.custom_tool_call_input.delta"},
+                    {"output_index", item_output_index},
                     {"item_id", output_item.at("id")},
                     {"call_id", output_item.at("call_id")},
                     {"delta",   output_item.at("input")},
@@ -871,6 +883,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -878,12 +891,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     if (generation_params.responses_compaction) {
+        const size_t item_output_index = output_index++;
         const json output_item = server_task_build_response_compaction(oai_resp_compaction_content);
 
         server_sent_events.push_back(json {
             {"event", "response.output_item.added"},
             {"data", json {
                 {"type", "response.output_item.added"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -891,6 +906,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             {"event", "response.output_item.done"},
             {"data", json {
                 {"type", "response.output_item.done"},
+                {"output_index", item_output_index},
                 {"item", output_item}
             }}
         });
@@ -1439,6 +1455,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type", "response.output_item.added"},
+                        {"output_index", 0},
                         {"item", json {
                             {"id",                oai_resp_reasoning_id},
                             {"summary",           json::array()},
@@ -1455,9 +1472,10 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"event", "response.reasoning_text.delta"},
                 {"data", json {
                     {"type",    "response.reasoning_text.delta"},
+                    {"output_index", 0},
+                    {"content_index", 0},
                     {"delta",   diff.reasoning_content_delta},
                     {"item_id", oai_resp_reasoning_id},
-                    {"content_index", 0},
                 }},
             });
         }
@@ -1475,6 +1493,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type", "response.output_item.added"},
+                        {"output_index", anthropic_has_reasoning ? 1 : 0},
                         {"item", std::move(message_item)},
                     }},
                 });
@@ -1483,6 +1502,8 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"data", json {
                         {"type",    "response.content_part.added"},
                         {"item_id", oai_resp_message_id},
+                        {"output_index", anthropic_has_reasoning ? 1 : 0},
+                        {"content_index", 0},
                         {"part", json {
                             {"type", "output_text"},
                             {"text", ""},
@@ -1496,6 +1517,8 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 {"data", json {
                     {"type",    "response.output_text.delta"},
                     {"item_id", oai_resp_message_id},
+                    {"output_index", anthropic_has_reasoning ? 1 : 0},
+                    {"content_index", 0},
                     {"delta",   diff.content_delta},
                 }},
             });
@@ -1514,6 +1537,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"event", "response.output_item.added"},
                     {"data", json {
                         {"type",  "response.output_item.added"},
+                        {"output_index", (anthropic_has_reasoning ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index},
                         {"item", server_task_build_response_function_call(tool_call, "in_progress")},
                     }},
                 });
@@ -1531,6 +1555,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"type",    "response.function_call_arguments.delta"},
                     {"delta",   diff.tool_call_delta.arguments},
                     {"item_id", "fc_" + current_tool_id},
+                    {"output_index", (anthropic_has_reasoning ? 1 : 0) + (text_block_started ? 1 : 0) + diff.tool_call_index},
                 }},
             });
         }
@@ -1728,6 +1753,17 @@ json server_task_result_rerank::to_json() {
         {"index",            index},
         {"score",            score},
         {"tokens_evaluated", n_tokens},
+    };
+}
+
+//
+// server_task_result_tts
+//
+json server_task_result_tts::to_json() {
+    return json {
+        {"sample_rate", sample_rate},
+        {"n_bytes",     audio.size()},
+        {"final",       final},
     };
 }
 
@@ -1978,6 +2014,9 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    if (!ram_enabled) {
+        return nullptr;
+    }
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -2202,6 +2241,9 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
     if (is_in_cache(prompt)) {
         return true;
     }
+    if (ssd && ssd->is_saved(prompt)) {
+        return true;
+    }
 
     const size_t cur_size_tgt =           get_state_size(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t cur_size_dft = ctx_dft ? get_state_size(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -2224,6 +2266,9 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
     if (cur == nullptr) {
         // the state does not fit in the RAM tier: save it directly to SSD
         if (ssd) {
+            if (ssd->is_streaming()) {
+                return ssd->save_context(prompt, ctx_tgt, ctx_dft, id_slot);
+            }
             try {
                 server_prompt_cache_state state;
                 state.prompt = prompt.clone();
@@ -2232,7 +2277,11 @@ bool server_prompt_cache::save_state(const server_prompt & prompt, llama_context
                 if (!read_data(state.data)) {
                     return false;
                 }
-                return ssd->save(state);
+                if (!ssd->save(state)) {
+                    return false;
+                }
+                prompt.ssd_snapshot_id = state.prompt.ssd_snapshot_id;
+                return true;
             } catch (const std::bad_alloc & e) {
                 SRV_ERR("failed to allocate memory for SSD prompt cache state: %s\n", e.what());
                 return false;

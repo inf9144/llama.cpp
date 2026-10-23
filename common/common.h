@@ -596,6 +596,8 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    std::vector<size_t> moe_cache_sizes = std::vector<size_t>(llama_max_devices(), 0);
+    bool   moe_cache_per_device = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -639,11 +641,16 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 = disable RAM tier, 1 = 1 MiB, etc.
     int32_t cache_ssd_size_mib  = 0;     // SSD prompt cache size limit in MiB, 0 = no limit
 
     std::string cache_ssd_dir = "";      // SSD prompt cache directory, empty = disabled
+    bool    cache_ssd_streaming = false; // stream SSD state transfers through a bounded host buffer
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+
+    // llama-connect params
+    bool        server_connect      = false;
+    std::string server_connect_code = "";
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -973,6 +980,8 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_VLLM_D3, // same as pplx-decider, non-causal attention
     COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
     COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
+    COMMON_DECISION_TYPE_GRANITE_SWITCH, // same as openjev, run by the decision aLoRA of granite switch
+    COMMON_DECISION_TYPE_H2O_LIGHTNING, // same as openjev, the labels are read after an answer prefill
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 
@@ -982,6 +991,7 @@ common_decision_type common_get_decision_type(const struct llama_model * model);
 struct common_gguf_info {
     common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
     uint32_t             n_ctx_train   = 0;                            // 0 if unknown
+    bool                 has_chat_tmpl = false;                        // has the default tokenizer.chat_template
 };
 
 common_gguf_info common_get_gguf_info(const std::string & fname);

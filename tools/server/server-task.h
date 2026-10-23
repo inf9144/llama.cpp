@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "mtmd-helper.h"
 
 
 // forward declaration, defined in server-prompt-cache-ssd.h
@@ -25,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_INFILL,
+    SERVER_TASK_TYPE_TRANSCRIBE_RT,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
@@ -35,6 +37,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_TTS,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -53,6 +56,14 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+};
+
+enum server_control_action {
+    SERVER_CONTROL_ACTION_NONE,
+    SERVER_CONTROL_ACTION_REASONING_END,
+    SERVER_CONTROL_ACTION_AUDIO_APPEND, // push control_audio into the slot's audio stream
+    SERVER_CONTROL_ACTION_AUDIO_COMMIT, // flush the audio stream, more audio can follow
+    SERVER_CONTROL_ACTION_AUDIO_END,    // flush the audio stream and end it
 };
 
 struct task_params {
@@ -96,8 +107,9 @@ struct task_params {
     std::string        oaicompat_cmpl_id;
 
     // realtime control (SERVER_TASK_TYPE_CONTROL)
-    std::string        control_action;
-    std::string        control_cmpl_id;
+    server_control_action control_action = SERVER_CONTROL_ACTION_NONE;
+    std::string           control_cmpl_id;
+    std::vector<float>    control_audio; // PCM F32 samples for SERVER_CONTROL_ACTION_AUDIO_APPEND
 
     // reported in generation_settings, parsing itself is owned by the chat session
     common_chat_format      chat_format      = COMMON_CHAT_FORMAT_CONTENT_ONLY;
@@ -226,6 +238,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
+    // used by SERVER_TASK_TYPE_TTS
+    mtmd_helper::gen_audio::inp tts_inp;
+
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
@@ -250,6 +265,7 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_TRANSCRIBE_RT:
                 return true;
             case SERVER_TASK_TYPE_DECISION:
                 return !decision.labels.empty();
@@ -262,6 +278,8 @@ struct server_task {
         switch (type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
+            case SERVER_TASK_TYPE_TTS:
+            case SERVER_TASK_TYPE_TRANSCRIBE_RT:
                 return true;
             default:
                 return false;
@@ -558,6 +576,16 @@ struct server_task_result_embd : server_task_result {
     json to_json_oaicompat();
 };
 
+struct server_task_result_tts : server_task_result {
+    std::string audio; // raw bytes for this chunk (WAV or PCM, per request's out_type)
+    int32_t     sample_rate = 0;
+    bool        final = false; // true for the last chunk of a request
+
+    virtual bool is_stop() override { return final; }
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_rerank : server_task_result {
     float score = -1e6;
 
@@ -668,9 +696,17 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Runtime identity of the saved SSD snapshot. Invalidate before changing KV or prompt metadata.
+    mutable uint64_t ssd_snapshot_id = 0;
+
+    void invalidate_ssd_snapshot() {
+        ssd_snapshot_id = 0;
+    }
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        invalidate_ssd_snapshot();
     }
 
     int n_tokens() const {
@@ -681,6 +717,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            ssd_snapshot_id,
         };
     }
 };
@@ -714,9 +751,12 @@ struct server_prompt_cache {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->ssd          = ssd;
+        this->ram_enabled  = limit_size_mib != 0;
     }
 
     std::list<server_prompt_cache_state> states;
+
+    bool ram_enabled = true;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

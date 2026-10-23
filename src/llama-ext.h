@@ -10,6 +10,16 @@
 #include <map>
 #include <vector>
 
+class llama_io_write_i;
+class llama_io_read_i;
+
+// Stream the same sequence-state format as get/set_data_ext, without a full host buffer.
+// The I/O object must bound all reads/writes. ON_DEVICE states are not supported.
+LLAMA_API size_t llama_state_seq_write(struct llama_context * ctx, llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+// On failure, the destination sequence is cleared. Returns bytes read, or 0 on failure.
+// io.has_invalid_data() distinguishes detected format errors from capacity or other runtime failures.
+LLAMA_API size_t llama_state_seq_read(struct llama_context * ctx, llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -121,6 +131,9 @@ enum llama_decision_order {
 };
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+
+// Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
+LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

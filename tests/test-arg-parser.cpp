@@ -182,6 +182,19 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        common_params cache_params;
+        assert(!cache_params.cache_ssd_streaming);
+        for (const std::string mode : {"buffered", "streaming"}) {
+            argv = {"binary_name", "--cache-ram", "0", "--cache-ssd-dir", "cache", "--cache-ssd-io", mode};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+            assert(cache_params.cache_ram_mib == 0 && cache_params.cache_ssd_dir == "cache");
+            assert(cache_params.cache_ssd_streaming == (mode == "streaming"));
+        }
+        argv = {"binary_name", "--cache-ssd-io", "invalid"};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value
@@ -304,6 +317,88 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_size == (size_t) 16 * 1024 * 1024);
+        assert(moe_params.moe_cache_per_device == false);
+        assert(moe_params.moe_cache_sizes[0] == 0);
+    }
+
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "16,32"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_per_device == true);
+        assert(moe_params.moe_cache_sizes[0] == (size_t) 16 * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes[1] == (size_t) 32 * 1024 * 1024);
+        assert(moe_params.moe_cache_size == (size_t) 48 * 1024 * 1024);
+    }
+
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "0,16"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_per_device == true);
+        assert(moe_params.moe_cache_sizes[0] == 0);
+        assert(moe_params.moe_cache_sizes[1] == (size_t) 16 * 1024 * 1024);
+        assert(moe_params.moe_cache_size == (size_t) 16 * 1024 * 1024);
+    }
+
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "16,foo"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    for (const char * value : {"", ",", "16,", ",16", "16,,32", "16/32", "16,-1", "16,2x", "2147483648"}) {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", value};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params moe_params;
+        std::string value = "1";
+        for (size_t i = 1; i < llama_max_devices(); ++i) {
+            value += ",1";
+        }
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", value};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_size == llama_max_devices() * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes[llama_max_devices() - 1] == 1024 * 1024);
+        argv.back() += ",1";
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "16,32"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        const auto cp = common_context_params_to_llama(moe_params);
+        assert(cp.moe_cache_split != nullptr && cp.moe_cache_split[1] == (size_t) 32 * 1024 * 1024);
+        const auto draft = common_base_params_to_speculative(moe_params);
+        assert(draft.moe_cache_size == 0 && !draft.moe_cache_per_device);
+        assert(common_context_params_to_llama(draft).moe_cache_split == nullptr);
+
+        argv.back() = "16";
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_size == (size_t) 16 * 1024 * 1024);
+        assert(!moe_params.moe_cache_per_device && moe_params.moe_cache_sizes[1] == 0);
+        assert(common_context_params_to_llama(moe_params).moe_cache_split == nullptr);
+
+        argv.back() = "0,0";
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_per_device && moe_params.moe_cache_size == 0);
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -353,6 +448,15 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    setenv("LLAMA_ARG_MOE_CACHE_MIB", "16,32", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_cache_per_device && params.moe_cache_sizes[1] == (size_t) 32 * 1024 * 1024);
+    argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!params.moe_cache_per_device && params.moe_cache_size == 0 && params.moe_cache_sizes[1] == 0);
+    unsetenv("LLAMA_ARG_MOE_CACHE_MIB");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

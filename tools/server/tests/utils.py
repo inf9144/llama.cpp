@@ -120,6 +120,7 @@ class ServerProcess:
     no_cache_idle_slots: bool = False
     cache_ssd_dir: str | None = None
     cache_ssd_size: int | None = None
+    cache_ssd_io: str | None = None
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
@@ -129,6 +130,7 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    llama_cache: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -147,7 +149,9 @@ class ServerProcess:
             **os.environ,
             "LLAMA_SERVER_DEBUG_FAKE_TIMING": "1",
         }
-        if "LLAMA_CACHE" not in os.environ:
+        if self.llama_cache is not None:
+            env["LLAMA_CACHE"] = self.llama_cache
+        elif "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
@@ -297,6 +301,8 @@ class ServerProcess:
             server_args.extend(["--cache-ssd-dir", self.cache_ssd_dir])
         if self.cache_ssd_size is not None:
             server_args.extend(["--cache-ssd-size", self.cache_ssd_size])
+        if self.cache_ssd_io is not None:
+            server_args.extend(["--cache-ssd-io", self.cache_ssd_io])
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:

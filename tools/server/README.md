@@ -80,7 +80,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
-| `--moe-cache-mib N` | GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)<br/>(env: LLAMA_ARG_MOE_CACHE_MIB) |
+| `--moe-cache-mib N0,N1,N2,...` | GPU cache size in MiB for the MoE experts kept in the CPU. a single value is split among the GPUs like the layers (--tensor-split). a comma-separated list sets each GPU's size in --device order; 0 disables that GPU's cache, unused budgets are not redistributed (default: 0, disabled)<br/>(env: LLAMA_ARG_MOE_CACHE_MIB) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
 | `-sm, --split-mode {none,layer,row,tensor}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)<br/>(env: LLAMA_ARG_SPLIT_MODE) |
@@ -210,6 +210,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--mcp-servers-json JSON` | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_JSON) |
 | `-ag, --agent, -no-ag, --no-agent` | whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_AGENT) |
 | `--ui, --webui, --no-ui, --no-webui` | whether to enable the Web UI (default: enabled)<br/>(env: LLAMA_ARG_UI) |
+| `--connect` | (experimental) open a peer-to-peer tunnel for server using llama-connect (default: disabled)<br/>(env: LLAMA_ARG_CONNECT) |
+| `--connect-code CODE` | manually specify a 40-character code for --connect (default: generate a new one for each run)<br/>(env: LLAMA_ARG_CONNECT_CODE) |
 | `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
 | `--rerank, --reranking` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)<br/>(env: LLAMA_API_KEY) |
@@ -237,7 +239,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--reasoning-effort LEVEL` | reasoning effort level given to the chat template: 'default' to keep the template default,<br/>or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)<br/>(env: LLAMA_ARG_REASONING_EFFORT) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
 | `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
-| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: enabled)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
+| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
 | `--skip-chat-parsing, --no-skip-chat-parsing` | force a pure content parser, even if a Jinja template is specified; model will output everything in the content section, including any reasoning and/or tool calls (default: disabled)<br/>(env: LLAMA_ARG_SKIP_CHAT_PARSING) |
@@ -406,6 +408,10 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 | Same machine | `--cors-origins localhost` (default once `--agent` is set) |
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
+
+### Running behind a proxy
+
+If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
 
 ## Build
 
@@ -796,6 +802,50 @@ curl http://127.0.0.1:8012/v1/rerank \
             "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China."
             ]
     }' | jq
+```
+
+### POST `/tts`: Generate speech audio from text
+
+Returns raw audio bytes (`audio/wav` by default) rather than JSON. For more info, see [tts/README.md](../tts/README.md)
+
+*Options:*
+
+`input`: The text to speak (alias: `prompt`).
+
+`lang`: Language code for the utterance (model-dependent, e.g. `en`, `zh`). Optional.
+
+`speaker_ref_b64`: Base64-encoded reference audio to clone the speaker's voice. Optional. Alternatively, upload the reference audio as a `speaker_ref` file field via `multipart/form-data` (see example below) - if both are provided, the uploaded file takes precedence.
+
+`top_k`, `top_p`: Sampling params for the acoustic code predictor. Optional, model-dependent defaults apply.
+
+`repeat_penalty`: Repetition penalty applied to the backbone sampler over the whole generation (default `1.05`). Without this, the backbone can loop and re-generate the same utterance.
+
+`seed`: RNG seed for both the backbone sampler and the codec/vocoder (`-1` = random, the default). Set to a fixed value for reproducible output.
+
+`n_predict`: Max number of audio frames to generate. Defaults to `512`; generation normally stops earlier once the model emits an end-of-speech token.
+
+`response_format`: `wav` (default) or `pcm` (raw `float32` little-endian mono samples, no header; the response `Content-Type` carries the sample rate, e.g. `audio/pcm;rate=24000;encoding=float;bits=32`).
+
+`stream`: If `true`, the response is streamed as audio becomes available instead of waiting for the full generation to finish. WAV streaming writes an RFC-noncompliant header with an unknown (`0xFFFFFFFF`) size field, since the final length isn't known up front; most players and decoders (ffmpeg, VLC, ...) handle this by reading until EOF.
+
+Note: it's highly recommended to always provide a speaker reference voice; otherwise, the model's performance may be degraded.
+
+*Examples:*
+
+```shell
+curl -X POST http://127.0.0.1:9931/tts \
+    -H "Content-Type: application/json" \
+    -d '{"input": "Hello, this is a test."}' \
+    -o output.wav
+```
+
+With a speaker reference uploaded as a file (`multipart/form-data`), instead of base64-encoding it into the JSON body:
+
+```shell
+curl -X POST http://127.0.0.1:9931/tts \
+    -F "input=Hello, this is a test." \
+    -F "speaker_ref=@/path/to/speaker-reference.wav;type=audio/wav" \
+    -o output.wav
 ```
 
 ### POST `/infill`: For code infilling.
@@ -1258,11 +1308,12 @@ Each object in `data` has an `architecture` object. It has two string arrays:
 - `input_modalities` lists what the model can read. It always has `text`, plus each media type that the model supports.
 - `output_modalities` lists what the model can produce.
 
-One output value is special:
+Some output values are special:
 
 | Value | Meaning |
 |---|---|
 | `decisions` | The model is a native decision model. Serve it with [`/v1/systemone`](#post-v1systemone-typesafe-compatible-system-one-api). |
+| `audio` | The model can generate speech. Serve it with [`/tts`](#post-tts-generate-speech-audio-from-text). A TTS-only model has `["audio"]` without `text`. |
 
 A language model that classifies with prompts does not get `decisions`. Only native decision models do.
 
@@ -1486,6 +1537,31 @@ Acts on an in-flight completion identified by its `id` (the `id` field streamed 
 **Response format**
 
 Returns a JSON object with a boolean `success` field, and an optional `message` field describing the reason when `success` is `false`.
+
+### WebSocket `/v1/realtime`: Realtime transcription
+
+Transcribes streamed audio, for models with a streaming audio encoder. Compatible with OAI `/v1/realtime` schema.
+
+Audio must be PCM16, mono, at the model sample rate. The sample rate is returned in `session.created` as `audio.input.format.rate`. Each `input_audio_buffer.append` carries a base64-encoded chunk of PCM16 samples.
+
+*Client events:*
+
+- `session.update`: accepted for compatibility, the server replies with `session.updated`
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: flushes the audio received so far, so the words still held back by the model's delay are produced. The server replies with `input_audio_buffer.committed` and starts a new item. With `"final": true`, the input ends instead and the last item is completed once the stream drains.
+- `input_audio_buffer.clear`: accepted for compatibility, audio already sent cannot be discarded
+
+Closing the websocket also ends the input.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `conversation.item.input_audio_transcription.delta`: `delta` holds the new text for `item_id`
+- `conversation.item.input_audio_transcription.completed`: `transcript` holds the full text of `item_id`
+- `input_audio_buffer.committed`: `item_id` of the committed item, `previous_item_id` of the item committed before it (`null` for the first one)
+- `error`: `error.message` describes the problem
+
+Note that words held back by the model's delay at the time of a commit are attributed to the next item.
 
 ### POST `/v1/responses`: OpenAI-compatible Responses API
 
@@ -1721,13 +1797,13 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1 and lfm2-d1-omni. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni and h2o-lightning. For laya, long questions and options are truncated to the token budget the model was trained with.
 
-For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. A server that runs clef only serves this endpoint, text generation is not available.
+For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. An h2o-lightning state longer than 32000 tokens keeps its first and last 16000 tokens. A server that runs clef only serves this endpoint, text generation is not available. A decision model that is also a text model, such as granite-switch, serves both and reports `["text", "decisions"]`.
 
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning) and its multimodal projector, see `--mmproj`.
 
 Images can be given in two ways, and both can be used in the same request:
 
@@ -1755,6 +1831,8 @@ All the images are placed before the state in the prompt, the ones from `files` 
 `usage`: `input_tokens` is the number of prompt tokens of all questions. `output_tokens` is always 0.
 
 The probabilities are scaled with the temperatures stored in the model file. They are not guaranteed to be calibrated for your data.
+
+For h2o-lightning, `score` questions can have 1 to 255 levels, and the `instructions` and `type` of a question can be left out (`choice` by default; `"instructions": null` is written as `null`).
 
 *Examples:*
 
@@ -1986,6 +2064,8 @@ For **GET** endpoints (`/props`, `/metrics`, etc.) The router uses the `model` q
 GET /props?model=ggml-org%2Fgemma-3-4b-it-GGUF%3AQ4_K_M
 ```
 
+For the **WebSocket** endpoint (`/v1/realtime`) The router also uses the `model` query parameter.
+
 By default, the model will be loaded automatically if it's not loaded. To disable this, add `--no-models-autoload` when starting the server. Additionally, you can include `?autoload=true|false` in the query param to control this behavior per-request.
 
 ### GET `/models`: List available models
@@ -2021,7 +2101,7 @@ Note:
     - If a model is not running, it will be added or updated according to the source
 2. When the model is loaded, the info from `/v1/models` is forwarded to router's `/v1/models`. This includes metadata about the model and the runtime instance.
 
-Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
+Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata, plus `audio` when the projector file can generate speech. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
 
 ```json
 {
@@ -2102,6 +2182,32 @@ Note: for "downloading" state, there can be multiple files be downloading in par
     }
   }
 }
+```
+
+A download that never finished (paused or interrupted) is listed under a separate
+"incomplete" status, without an instance: posting the model to `/models` again resumes it
+from the files already on disk, and `DELETE /models` drops its partial files.
+
+```json
+"status": {
+  "value": "incomplete",
+  "args": []
+}
+```
+
+Cached models and incomplete downloads carry the sidecar kinds they have on disk
+(`mmproj`, `mtp`, `dflash`, `eagle3`, `dspark`), resolved the way `-hf` loads them:
+
+```json
+"sidecars": ["mmproj", "mtp"]
+```
+
+A cached model whose download of more sidecars never finished also lists the kinds not on
+disk yet: posting the model with them resumes them, and `DELETE /models` with `&sidecar={kind}`
+drops their partial files.
+
+```json
+"incomplete_sidecars": ["mtp"]
 ```
 
 ### POST `/models/load`: Load a model
@@ -2223,7 +2329,7 @@ Example events:
 
 Trigger a new download (non-blocking), the progress can be tracked via SSE endpoint `/models/sse`
 
-To cancel model downloading, send an event to `/models/unload`
+To pause a download, send an event to `/models/unload`: it keeps its partial files and is listed as "incomplete" until it is posted again. To cancel it and drop its files, use `DELETE /models`.
 
 Download procedure:
 - Send POST request to `/models`
@@ -2236,8 +2342,13 @@ Payload:
 ```json
 {
   "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "sidecars": ["mmproj", "mtp"]
 }
 ```
+
+`sidecars` lists the sidecar kinds pulled with the model, picked by the server the way `-hf` picks them: `mmproj`, and the draft heads `mtp`, `dflash`, `eagle3` and `dspark`. It defaults to `["mmproj"]`, as `-hf` does.
+
+Posting a model that is already in the cache and not running downloads the sidecars it lacks and keeps the files already on disk.
 
 Response (download is started in the background):
 
@@ -2264,6 +2375,10 @@ Response (error, cannot start the download):
 IMPORTANT: only model stored in cache can be deleted. You cannot delete models in a preset.
 
 Model name must be passed via query param: `?model={name}`
+
+To remove one sidecar of a cached model and keep the model, add `&sidecar={kind}` (`mmproj`, `mtp`, `dflash`, `eagle3` or `dspark`); the model must not be running.
+
+Deleting a model keeps the files another cached quant of the repo still loads, such as an mmproj named after the deleted quant, and the partial files another download still writes. A sidecar deleted on its own goes for every quant that shares it.
 
 If delete success, it will send an SSE event of type `model_remove`
 
@@ -2309,12 +2424,25 @@ Note that the following endpoints are exempt from being considered as incoming t
 
 The RAM prompt cache (see `--cache-ram`) can be extended with a persistent second tier on disk. States that are evicted from the RAM cache, as well as the active slots on a controlled shutdown, are written to a directory on SSD and survive server restarts. This is useful when several long-running agents (for example a multi-agent coding setup) each hold a large context and the RAM cache regularly evicts states that are needed again later, so that a full prefill can be avoided on restore.
 
-The SSD tier is disabled by default. When it is not configured, the server behavior is unchanged. It requires `--cache-ram` to be enabled.
+The SSD tier is disabled by default. When it is not configured, the server behavior is unchanged. It can be used with or without the RAM tier: `--cache-ram 0 --cache-ssd-dir PATH` keeps snapshots only on SSD. The token index and active context checkpoints still use RAM.
 
 ### Parameters
 
 - `--cache-ssd-dir PATH`: directory for the SSD tier. Created if it does not exist.
 - `--cache-ssd-size N`: maximum size of the SSD tier in MiB per model (default: 0, no limit). Eviction is LRU. The limit applies to each model's subdirectory, so the total on disk can be larger when several models are cached.
+- `--cache-ssd-io MODE`: `buffered` (default) captures and restores each SSD snapshot through a full host-memory buffer. `streaming` transfers the main and draft state in blocks through a host buffer of at most 64 MiB per transfer. Both modes read and write the same cache format and can share a cache directory. The setting also applies to active-slot saves on shutdown and sleep. Existing RAM snapshots are written from their buffers in either mode.
+
+For SSD-only storage with bounded transfer buffers:
+
+```sh
+llama-server -m /path/to/model.gguf \
+  --cache-ram 0 \
+  --cache-ssd-dir /path/to/ssd-cache \
+  --cache-ssd-size 450000 \
+  --cache-ssd-io streaming
+```
+
+Streaming removes the additional full-snapshot host buffer. It does not remove active checkpoints, token metadata, backend staging allocations, or the operating system's file cache. Restored checkpoints remain in RAM. With a nonzero RAM tier, retaining a snapshot there still requires its full RAM allocation.
 
 ### How it works
 
@@ -2322,6 +2450,7 @@ The SSD tier is disabled by default. When it is not configured, the server behav
 - **Restore without a redundant RAM copy.** When a SSD entry wins, its state is loaded directly into the active slot. The SSD copy is kept as a recovery point until a newer state replaces it; the normal RAM eviction flow handles the RAM tier separately.
 - **Compatibility fingerprint.** Each entry stores a fingerprint of the loaded model and the relevant KV/context configuration: target model dimensions, `ftype`, parameter and file size, file modification time, the draft model identity (for speculative decoding), the effective RoPE configuration (base, scale, scaling type) and YaRN overrides, KV cache data types, `--swa-full`, per-slot context size, flash attention and unified KV settings, the base LoRA adapters (path and scale), plus the state format version. Snapshots are stored in a per-model subdirectory (named by a hash of the fingerprint), so switching models never collides. An entry whose fingerprint does not match the currently loaded model is not offered as a candidate, but it is kept on disk so that switching back to that model reuses its cache again. Corrupt or truncated files are removed. Note that the fingerprint covers the base LoRA adapters loaded at startup; per-request LoRA adapters are not part of it, so a state saved under one per-request adapter set is not automatically excluded for a request with a different one (the same limitation applies to the RAM tier).
 - **Atomic writes.** Each entry is written to a `.tmp` file, verified, and then renamed into place. A trailing total-size field guards against truncated writes, so a previous valid snapshot is preserved until its successor is fully published. Leftover `.tmp` files are cleaned up on startup.
+- **Failed restores.** Both modes validate the container layout before applying the main and draft state. A failed restore clears the destination sequence in both contexts and discards its prompt metadata, so the server can prefill again. Other sequences are preserved.
 
 ### Observing hits, misses, and eviction
 
