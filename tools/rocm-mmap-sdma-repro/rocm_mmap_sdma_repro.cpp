@@ -26,6 +26,7 @@
 namespace {
 
 constexpr size_t kTensorBytes = 321126400;  // blk.43.ffn_up_exps.weight: 512 * 627200
+constexpr size_t kExpertBytes = 627200;
 struct Chunk { size_t offset; size_t bytes; };
 // Exactly 59 offset/length pairs from a failing blk.43.ffn_up_exps.weight upload
 // trace. Gaps, 512-byte extras and chunk lengths are intentional.
@@ -79,6 +80,21 @@ uint64_t parse_number(const std::string & input) {
 }
 enum class Mode { direct, malloc_staging, pinned_staging };
 enum class Sync { each, batch };
+enum class Pattern { recorded, rotate, random };
+const char * pattern_name(Pattern p) {
+    switch (p) {
+        case Pattern::recorded: return "recorded";
+        case Pattern::rotate: return "rotate";
+        case Pattern::random: return "random";
+    }
+    return "?";
+}
+uint64_t mix64(uint64_t z) {
+    z += 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
 const char * mode_name(Mode mode) {
     switch (mode) {
         case Mode::direct: return "direct";
@@ -97,7 +113,24 @@ struct Options {
     bool trace = false;
     bool pretouch = false;
     bool map_whole = false;
+    Pattern pattern = Pattern::recorded;
+    size_t source_span = kTensorBytes;
+    uint64_t seed = 0x31c0ffeeULL;
 };
+// Keep the captured copy sizes/destination offsets, vary just the HIP host sources.
+size_t source_offset(const Options & opt, int device, int iteration, size_t index, const Chunk & chunk) {
+    if (opt.pattern == Pattern::recorded) return chunk.offset;
+    const size_t positions = (opt.source_span - chunk.bytes)/kExpertBytes + 1;
+    uint64_t expert;
+    if (opt.pattern == Pattern::rotate) {
+        expert = chunk.offset/kExpertBytes + static_cast<uint64_t>(iteration)*37 +
+                 static_cast<uint64_t>(device)*53;
+    } else {
+        expert = mix64(opt.seed ^ (static_cast<uint64_t>(device) << 50) ^
+                       (static_cast<uint64_t>(iteration) << 20) ^ static_cast<uint64_t>(index));
+    }
+    return static_cast<size_t>(expert % positions)*kExpertBytes;
+}
 void usage(const char * program) {
     std::cout << "Usage: " << program << " [options]\n"
               << "  --mode direct|malloc|pinned  HIP source memory (default direct)\n"
@@ -105,7 +138,11 @@ void usage(const char * program) {
               << "  --devices 0,1             HIP device indices to use concurrently (default 0,1)\n"
               << "  --iterations N            Complete 59-copy rounds per device (default 20)\n"
               << "  --model-file PATH         Read-only GGUF/blob file instead of sparse temp file\n"
-              << "  --map window|whole        mmap only tensor window or entire file (default window)\n"
+              << "  --map window|whole        mmap only source window or entire file (default window)\n"
+              << "  --pattern recorded|rotate|random  Source expert selection (default recorded)\n"
+              << "  --source-span-mib N        Source range in MiB starting at --file-offset\n"
+              << "                            (default 321126400 bytes; set 1024 for wider churn)\n"
+              << "  --seed N                  Random-pattern seed, decimal or 0xhex\n"
               << "  --file-offset N           Byte offset of tensor within file; decimal or 0xhex\n"
               << "                            (default 0xd40 for synthetic file)\n"
               << "  --trace                   Log each upload source range and successful HIP sync\n"
@@ -161,6 +198,19 @@ Options parse(int argc, char ** argv) {
             else throw std::runtime_error("Invalid --map: " + v);
         }
         else if (arg == "--file-offset") opt.file_offset = parse_number(value());
+        else if (arg == "--source-span-mib") {
+            const uint64_t mib = parse_number(value());
+            if (!mib || mib > SIZE_MAX/(1024ULL*1024ULL))
+                throw std::runtime_error("--source-span-mib out of range");
+            opt.source_span = static_cast<size_t>(mib * 1024ULL * 1024ULL);
+        } else if (arg == "--seed") opt.seed = parse_number(value());
+        else if (arg == "--pattern") {
+            const auto v = value();
+            if (v == "recorded") opt.pattern = Pattern::recorded;
+            else if (v == "rotate") opt.pattern = Pattern::rotate;
+            else if (v == "random") opt.pattern = Pattern::random;
+            else throw std::runtime_error("Invalid --pattern: " + v);
+        }
         else if (arg == "--trace") opt.trace = true;
         else if (arg == "--pretouch") opt.pretouch = true;
         else throw std::runtime_error("Unknown option: " + arg);
@@ -179,11 +229,11 @@ struct SourceMapping {
         if (page <= 0) throw std::runtime_error("sysconf page size failed");
         const uint64_t aligned = opt.map_whole ? 0 : opt.file_offset / static_cast<uint64_t>(page) * static_cast<uint64_t>(page);
         const uint64_t delta = opt.file_offset - aligned;
-        if (delta > SIZE_MAX - kTensorBytes) throw std::runtime_error("Mapping length overflow");
-        const size_t window_bytes = static_cast<size_t>(delta) + kTensorBytes;
+        if (delta > SIZE_MAX - opt.source_span) throw std::runtime_error("Mapping length overflow");
+        const size_t window_bytes = static_cast<size_t>(delta) + opt.source_span;
         map_bytes = window_bytes;
         if (aligned > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
-            opt.file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - kTensorBytes)
+            opt.file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - opt.source_span)
             throw std::runtime_error("File offset too large");
         if (opt.model_file.empty()) {
             char tmp[] = "/tmp/rocm-mmap-sdma-XXXXXX";
@@ -191,16 +241,16 @@ struct SourceMapping {
             if (fd < 0) throw std::runtime_error("mkstemp failed: " + std::string(std::strerror(errno)));
             unlink(tmp);
             synthetic = true;
-            // Sparse file: does not write 306 MiB to disk.
-            if (ftruncate(fd, static_cast<off_t>(opt.file_offset + kTensorBytes)) != 0)
+            // Sparse file: does not write the source span to disk.
+            if (ftruncate(fd, static_cast<off_t>(opt.file_offset + opt.source_span)) != 0)
                 throw std::runtime_error("ftruncate failed: " + std::string(std::strerror(errno)));
         } else {
             fd = open(opt.model_file.c_str(), O_RDONLY);
             if (fd < 0) throw std::runtime_error("Cannot open --model-file: " + std::string(std::strerror(errno)));
             struct stat st = {};
             if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
-            if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) < opt.file_offset + kTensorBytes)
-                throw std::runtime_error("Model file too small for offset + 321126400 bytes");
+            if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) < opt.file_offset + opt.source_span)
+                throw std::runtime_error("Model file too small for offset + source span");
             if (opt.map_whole) {
                 if (static_cast<uint64_t>(st.st_size) > SIZE_MAX)
                     throw std::runtime_error("Model file too large to mmap");
@@ -210,9 +260,9 @@ struct SourceMapping {
         // For the sparse synthetic file, the whole-file and window sizes coincide
         // except for the unaligned file offset. Preserve an exact full-file VMA.
         if (synthetic && opt.map_whole) {
-            if (opt.file_offset > SIZE_MAX - kTensorBytes)
+            if (opt.file_offset > SIZE_MAX - opt.source_span)
                 throw std::runtime_error("Synthetic mapping overflow");
-            map_bytes = static_cast<size_t>(opt.file_offset) + kTensorBytes;
+            map_bytes = static_cast<size_t>(opt.file_offset) + opt.source_span;
         }
         mapping = mmap(nullptr, map_bytes, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(aligned));
         if (mapping == MAP_FAILED) throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
@@ -260,7 +310,8 @@ void worker(int dev, const Options & opt, const uint8_t * source, std::atomic<in
         if (opt.sync == Sync::batch && opt.mode != Mode::direct) outstanding.reserve(kChunks.size());
         for (size_t i = 0; i < kChunks.size(); ++i) {
             const Chunk chunk = kChunks[i];
-            const uint8_t * original = source + chunk.offset;
+            const size_t src_offset = source_offset(opt, dev, iteration, i, chunk);
+            const uint8_t * original = source + src_offset;
             const void * hip_source = original;
             void * stage = nullptr;
             if (opt.mode == Mode::malloc_staging) {
@@ -274,10 +325,10 @@ void worker(int dev, const Options & opt, const uint8_t * source, std::atomic<in
                 hip_source = stage;
             }
             if (opt.trace) {
-                logf("COPY BEGIN dev=%d iter=%d chunk=%zu mode=%s src=%p src_end=%p hip_src=%p dst=%p size=%zu offset=%zu",
-                     dev, iteration, i, mode_name(opt.mode), static_cast<const void *>(original),
-                     static_cast<const void *>(original + chunk.bytes), hip_source,
-                     static_cast<void *>(dst + chunk.offset), chunk.bytes, chunk.offset);
+                logf("COPY BEGIN dev=%d iter=%d chunk=%zu pattern=%s mode=%s src=%p src_end=%p hip_src=%p dst=%p size=%zu src_offset=%zu dst_offset=%zu",
+                     dev, iteration, i, pattern_name(opt.pattern), mode_name(opt.mode),
+                     static_cast<const void *>(original), static_cast<const void *>(original + chunk.bytes),
+                     hip_source, static_cast<void *>(dst + chunk.offset), chunk.bytes, src_offset, chunk.offset);
             }
             HIP_CHECK(hipMemcpyAsync(dst + chunk.offset, hip_source, chunk.bytes, hipMemcpyHostToDevice, stream));
             if (opt.sync == Sync::each) {
@@ -304,7 +355,11 @@ void worker(int dev, const Options & opt, const uint8_t * source, std::atomic<in
     HIP_CHECK(hipFree(result));
     HIP_CHECK(hipFree(dst));
     HIP_CHECK(hipStreamDestroy(stream));
-    logf("WORKER PASS dev=%d", dev);
+    uint64_t per_round = 0;
+    for (const Chunk & c : kChunks) per_round += c.bytes;
+    logf("WORKER PASS dev=%d copies=%llu transferred=%.2f GiB", dev,
+         static_cast<unsigned long long>(kChunks.size())*opt.iterations,
+         static_cast<double>(per_round)*opt.iterations/(1024.0*1024.0*1024.0));
 }
 
 } // namespace
@@ -312,6 +367,8 @@ void worker(int dev, const Options & opt, const uint8_t * source, std::atomic<in
 int main(int argc, char ** argv) {
     try {
         const Options opt = parse(argc, argv);
+        if (opt.source_span < kTensorBytes)
+            throw std::runtime_error("Source span must be at least 321126400 bytes");
         SourceMapping mapping(opt);
         for (const Chunk & c : kChunks) {
             if (c.offset > kTensorBytes || c.bytes > kTensorBytes - c.offset)
@@ -325,15 +382,16 @@ int main(int argc, char ** argv) {
         }
         if (opt.pretouch) {
             volatile uint8_t sum = 0;
-            for (size_t i = 0; i < kTensorBytes; i += 4096) sum ^= mapping.src[i];
-            sum ^= mapping.src[kTensorBytes - 1];
+            for (size_t i = 0; i < opt.source_span; i += 4096) sum ^= mapping.src[i];
+            sum ^= mapping.src[opt.source_span - 1];
             logf("PRETOUCH DONE checksum=%u", static_cast<unsigned>(sum));
         }
-        logf("CONFIG mode=%s sync=%s iterations=%d devices=%zu mapping=%s map_scope=%s file_offset=0x%llx map_bytes=%zu span=%zu src=%p chunks=%zu",
-             mode_name(opt.mode), opt.sync == Sync::each ? "each" : "batch", opt.iterations,
+        logf("CONFIG mode=%s sync=%s pattern=%s seed=%llu iterations=%d devices=%zu mapping=%s map_scope=%s file_offset=0x%llx map_bytes=%zu source_span=%zu src=%p chunks=%zu",
+             mode_name(opt.mode), opt.sync == Sync::each ? "each" : "batch",
+             pattern_name(opt.pattern), static_cast<unsigned long long>(opt.seed), opt.iterations,
              opt.devices.size(), mapping.synthetic ? "synthetic-file-backed" : "model-file-backed",
              opt.map_whole ? "whole" : "window", static_cast<unsigned long long>(opt.file_offset),
-             mapping.map_bytes, kTensorBytes,
+             mapping.map_bytes, opt.source_span,
              static_cast<const void *>(mapping.src), kChunks.size());
 
         std::atomic<int> ready{0};
