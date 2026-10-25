@@ -479,6 +479,57 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// Diagnostic only: fingerprints of the tensors used when the current graph
+// allocation plan was reserved. Enabled by GGML_GALLOCR_IDENTITY_DIAG=1.
+// These hashes do NOT affect allocator decisions.
+static bool ggml_gallocr_identity_diag_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * value = getenv("GGML_GALLOCR_IDENTITY_DIAG");
+        enabled = value != NULL && strcmp(value, "1") == 0;
+    }
+    return enabled == 1;
+}
+
+static uint64_t ggml_gallocr_identity_hash_bytes(uint64_t h, const void * data, size_t size) {
+    const unsigned char * p = (const unsigned char *) data;
+    for (size_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t ggml_gallocr_identity_hash_tensor(const struct ggml_tensor * t) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    if (t == NULL) {
+        return ggml_gallocr_identity_hash_bytes(h, "null", 4);
+    }
+    // Semantic/layout fingerprint rather than a raw pointer comparison:
+    // graph tensor pointers are normally recreated between evaluations.
+    h = ggml_gallocr_identity_hash_bytes(h, t->name, strlen(t->name));
+    h = ggml_gallocr_identity_hash_bytes(h, &t->op, sizeof(t->op));
+    h = ggml_gallocr_identity_hash_bytes(h, &t->type, sizeof(t->type));
+    h = ggml_gallocr_identity_hash_bytes(h, t->ne, sizeof(t->ne));
+    h = ggml_gallocr_identity_hash_bytes(h, t->nb, sizeof(t->nb));
+    const bool is_view = t->view_src != NULL;
+    h = ggml_gallocr_identity_hash_bytes(h, &is_view, sizeof(is_view));
+    // For nodes, also capture immediate operand identity. An unchanged
+    // node name/op/layout can still have different graph dependencies.
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const struct ggml_tensor * src = t->src[j];
+        if (src == NULL) {
+            continue;
+        }
+        h = ggml_gallocr_identity_hash_bytes(h, &j, sizeof(j));
+        h = ggml_gallocr_identity_hash_bytes(h, src->name, strlen(src->name));
+        h = ggml_gallocr_identity_hash_bytes(h, &src->op, sizeof(src->op));
+        h = ggml_gallocr_identity_hash_bytes(h, &src->type, sizeof(src->type));
+        h = ggml_gallocr_identity_hash_bytes(h, src->ne, sizeof(src->ne));
+    }
+    return h;
+}
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -493,6 +544,15 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // Read-only diagnostic metadata, separate from the allocation plan.
+    uint64_t * diag_node_hashes;
+    uint64_t * diag_leaf_hashes;
+    int diag_nodes;
+    int diag_leafs;
+    uint64_t diag_reuses;
+    uint64_t diag_differences;
+    uint64_t diag_reserves;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -576,6 +636,8 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->diag_node_hashes);
+    free(galloc->diag_leaf_hashes);
     free(galloc);
 }
 
@@ -945,6 +1007,35 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // Record a new baseline only after a successful reserve of the plan.
+    // No allocation behaviour is modified by this diagnostic.
+    if (ggml_gallocr_identity_diag_enabled()) {
+        if (galloc->diag_nodes != graph->n_nodes) {
+            free(galloc->diag_node_hashes);
+            galloc->diag_node_hashes = graph->n_nodes ?
+                (uint64_t *) malloc((size_t) graph->n_nodes * sizeof(uint64_t)) : NULL;
+            GGML_ASSERT(graph->n_nodes == 0 || galloc->diag_node_hashes != NULL);
+            galloc->diag_nodes = graph->n_nodes;
+        }
+        if (galloc->diag_leafs != graph->n_leafs) {
+            free(galloc->diag_leaf_hashes);
+            galloc->diag_leaf_hashes = graph->n_leafs ?
+                (uint64_t *) malloc((size_t) graph->n_leafs * sizeof(uint64_t)) : NULL;
+            GGML_ASSERT(graph->n_leafs == 0 || galloc->diag_leaf_hashes != NULL);
+            galloc->diag_leafs = graph->n_leafs;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            galloc->diag_node_hashes[i] = ggml_gallocr_identity_hash_tensor(graph->nodes[i]);
+        }
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            galloc->diag_leaf_hashes[i] = ggml_gallocr_identity_hash_tensor(graph->leafs[i]);
+        }
+        ++galloc->diag_reserves;
+        if (galloc->diag_reserves == 1) {
+            GGML_LOG_INFO("[gallocr-identity] enabled: plan signatures captured (nodes=%d leafs=%d); logging only, allocator unchanged\n",
+                          graph->n_nodes, graph->n_leafs);
+        }
+    }
     return true;
 }
 
@@ -1050,7 +1141,53 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    const bool plan_invalid = ggml_gallocr_needs_realloc(galloc, graph);
+
+    if (!plan_invalid && ggml_gallocr_identity_diag_enabled() &&
+        galloc->diag_node_hashes != NULL && galloc->diag_nodes == graph->n_nodes &&
+        galloc->diag_leafs == graph->n_leafs) {
+        // The existing allocator accepted the old plan; check whether the
+        // graph identity/layout stayed stable too. This is intentionally
+        // passive: a mismatch is not proof of corruption, and cannot force
+        // a reallocation in the diagnostic configuration.
+        ++galloc->diag_reuses;
+        size_t n_changed = 0;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const uint64_t now = ggml_gallocr_identity_hash_tensor(graph->nodes[i]);
+            if (galloc->diag_node_hashes[i] != now) {
+                if (galloc->diag_differences < 16) {
+                    GGML_LOG_WARN("[gallocr-identity] reused plan differs node=%d tensor=%s old_sig=%016llx new_sig=%016llx\n",
+                                  i, graph->nodes[i]->name,
+                                  (unsigned long long) galloc->diag_node_hashes[i], (unsigned long long) now);
+                }
+                ++galloc->diag_differences;
+                ++n_changed;
+            }
+        }
+        if (galloc->diag_leaf_hashes != NULL) {
+            for (int i = 0; i < graph->n_leafs; ++i) {
+                const uint64_t now = ggml_gallocr_identity_hash_tensor(graph->leafs[i]);
+                if (galloc->diag_leaf_hashes[i] != now) {
+                    if (galloc->diag_differences < 16) {
+                        GGML_LOG_WARN("[gallocr-identity] reused plan differs leaf=%d tensor=%s old_sig=%016llx new_sig=%016llx\n",
+                                      i, graph->leafs[i]->name,
+                                      (unsigned long long) galloc->diag_leaf_hashes[i], (unsigned long long) now);
+                    }
+                    ++galloc->diag_differences;
+                    ++n_changed;
+                }
+            }
+        }
+        if (n_changed > 0) {
+            GGML_LOG_WARN("[gallocr-identity] reused plan had %zu identity/layout mismatches (reuse=%llu, total=%llu); diagnostic only\n",
+                          n_changed, (unsigned long long) galloc->diag_reuses, (unsigned long long) galloc->diag_differences);
+        } else if (galloc->diag_reuses == 1 || galloc->diag_reuses % 100 == 0) {
+            GGML_LOG_INFO("[gallocr-identity] reuse=%llu: signature check clean (reserves=%llu)\n",
+                          (unsigned long long) galloc->diag_reuses, (unsigned long long) galloc->diag_reserves);
+        }
+    }
+
+    if (plan_invalid) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
