@@ -76,8 +76,21 @@ set gguf /home/hausen/.cache/huggingface/hub/models--ukisai--Swift-1.5-Qwen3.8-F
 ./rocm_mmap_sdma_repro --model-file $gguf --file-offset 0x7c2331d40 --devices 0,1 --iterations 50 --mode direct --sync each --trace 2>&1 | tee rocm-gguf-direct.log
 ```
 
-The program maps only the 306-MiB tensor range, not the entire giant GGUF file.
-It uses the same 59 offsets/sizes observed in the failing llama.cpp run.
+By default the program maps only the 306-MiB tensor window, **not** the entire
+GGUF file. That differs from the original llama.cpp process, which held a
+multi-GiB file-backed VMA. To test whether the SVM mapping extent matters,
+add `--map whole` (this maps the **entire file as virtual address space**,
+not as fully resident RAM). With `--map window` the earlier behavior is
+preserved. Compare otherwise identical runs:
+
+```fish
+./rocm_mmap_sdma_repro --model-file $gguf --file-offset 0x7c2331d40 --map whole --devices 0,1 --iterations 50 --mode direct --sync each --trace 2>&1 | tee rocm-gguf-whole-direct.log
+./rocm_mmap_sdma_repro --model-file $gguf --file-offset 0x7c2331d40 --map whole --devices 0,1 --iterations 50 --mode malloc --sync each --trace 2>&1 | tee rocm-gguf-whole-malloc.log
+```
+
+The test uses the same 59 offsets/sizes observed in one failing llama.cpp
+run, **not** its dynamically changing expert selections over all inference
+steps.
 Copies go to `device_buffer + offset` on each device. The two HIP devices run
 concurrently in separate host threads. After each 59-copy round, a small HIP
 kernel reads from the GPU buffer.
@@ -106,8 +119,10 @@ changing only `--mode`:
   and completed sync; logs may become large.
 
 If `--sync each` does not reproduce, try `--sync batch` with larger iteration
-counts, and compare `--devices 0` vs `--devices 0,1`. Never compare differently
-configured workloads as an equivalent A/B result.
+counts, and compare `--devices 0` vs `--devices 0,1`. The `batch` variant
+changes the amount of overlapping HIP work and is **not** otherwise identical
+to the `each` run. Never compare differently configured workloads as an
+equivalent A/B result.
 
 **Warning:** Faulting GPU processes may be terminated, reset the ROCm context,
 and leave device state unhealthy until the process and/or driver recover.
