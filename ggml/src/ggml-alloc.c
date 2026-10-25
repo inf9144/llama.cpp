@@ -483,12 +483,10 @@ struct node_alloc {
 // allocation plan was reserved. Enabled by GGML_GALLOCR_IDENTITY_DIAG=1.
 // These hashes do NOT affect allocator decisions.
 static bool ggml_gallocr_identity_diag_enabled(void) {
-    static int enabled = -1;
-    if (enabled == -1) {
-        const char * value = getenv("GGML_GALLOCR_IDENTITY_DIAG");
-        enabled = value != NULL && strcmp(value, "1") == 0;
-    }
-    return enabled == 1;
+    // Checking the environment is cheap relative to graph hashing and avoids
+    // an unsynchronized function-static initialization across host threads.
+    const char * value = getenv("GGML_GALLOCR_IDENTITY_DIAG");
+    return value != NULL && strcmp(value, "1") == 0;
 }
 
 static uint64_t ggml_gallocr_identity_hash_bytes(uint64_t h, const void * data, size_t size) {
@@ -1179,8 +1177,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             }
         }
         if (n_changed > 0) {
-            GGML_LOG_WARN("[gallocr-identity] reused plan had %zu identity/layout mismatches (reuse=%llu, total=%llu); diagnostic only\n",
-                          n_changed, (unsigned long long) galloc->diag_reuses, (unsigned long long) galloc->diag_differences);
+            if (galloc->diag_differences == n_changed || galloc->diag_reuses % 100 == 0) {
+                GGML_LOG_WARN("[gallocr-identity] reused plan had %zu identity/layout mismatches (reuse=%llu, total=%llu); diagnostic only\n",
+                              n_changed, (unsigned long long) galloc->diag_reuses, (unsigned long long) galloc->diag_differences);
+            }
         } else if (galloc->diag_reuses == 1 || galloc->diag_reuses % 100 == 0) {
             GGML_LOG_INFO("[gallocr-identity] reuse=%llu: signature check clean (reserves=%llu)\n",
                           (unsigned long long) galloc->diag_reuses, (unsigned long long) galloc->diag_reserves);
