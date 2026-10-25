@@ -1626,7 +1626,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] build_graph BEGIN n=%u\n", ubatch.n_tokens);
+        }
         gf = model.build_graph(gparams);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] build_graph END n=%u ok=%d\n", ubatch.n_tokens, (int) (gf != nullptr));
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1636,7 +1642,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] alloc_graph BEGIN n=%u\n", ubatch.n_tokens);
+        }
+        const bool graph_allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] alloc_graph END n=%u ok=%d\n", ubatch.n_tokens, (int) graph_allocated);
+        }
+        if (!graph_allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1646,8 +1659,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (llama_rocm_checkpoint_deep_diag()) {
-        LLAMA_LOG_INFO("[rocm-ckpt-deep] graph ready n=%u reused=%d\n",
-                ubatch.n_tokens, (int) (gf_res_prev_active == res && res->can_reuse(gparams)));
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] graph ready n=%u\n", ubatch.n_tokens);
     }
     // set the input data for the input tensors
     {
