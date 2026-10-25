@@ -1646,9 +1646,14 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
 }
 
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // Temporary ROCm checkpoint diagnostics: identify the failing context independently.
+    COM_INF("[rocm-ckpt-diag] seq_rm target BEGIN seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    COM_INF("[rocm-ckpt-diag] seq_rm target END seq=%d\n", seq_id);
     if (ctx_dft) {
+        COM_INF("[rocm-ckpt-diag] seq_rm draft BEGIN seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
         common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        COM_INF("[rocm-ckpt-diag] seq_rm draft END seq=%d\n", seq_id);
     }
 }
 
