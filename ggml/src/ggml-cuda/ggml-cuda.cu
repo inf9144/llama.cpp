@@ -2671,9 +2671,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     // Both variants perform the same synchronous lifetime management after memcpyAsync.
     // GGML_ROCM_CKPT_PINNED_STAGE enables staging and preserves the existing experiment.
     // GGML_ROCM_CKPT_MALLOC_STAGE=1 switches just its allocation type to std::malloc.
+    // GGML_ROCM_CKPT_STAGE_DIRECT_SOURCE=1 with malloc staging uses the ORIGINAL
+    // host pointer for HIP while retaining the same malloc/memcpy/sync/free sequence.
     // GGML_ROCM_CKPT_PINNED_STAGE_TENSOR optionally restricts matched tensor names.
-    static const bool stage_enabled = ggml_cuda_env_flag("GGML_ROCM_CKPT_PINNED_STAGE");
-    static const bool stage_malloc  = ggml_cuda_env_flag("GGML_ROCM_CKPT_MALLOC_STAGE");
+    static const bool stage_enabled       = ggml_cuda_env_flag("GGML_ROCM_CKPT_PINNED_STAGE");
+    static const bool stage_malloc        = ggml_cuda_env_flag("GGML_ROCM_CKPT_MALLOC_STAGE");
+    static const bool stage_direct_source = ggml_cuda_env_flag("GGML_ROCM_CKPT_STAGE_DIRECT_SOURCE");
     static const char * stage_filter = getenv("GGML_ROCM_CKPT_PINNED_STAGE_TENSOR");
     if (stage_enabled && size > 0 &&
         (stage_filter == nullptr || stage_filter[0] == 0 || std::strstr(tensor->name, stage_filter) != nullptr)) {
@@ -2687,12 +2690,15 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         }
 
         std::memcpy(staged, data, size);
-        GGML_LOG_INFO("[rocm-ckpt-stage] BEGIN mode=%s tensor=%s original=%p staged=%p dst=%p offset=%zu size=%zu\n",
-                stage_malloc ? "malloc" : "pinned", tensor->name, data, staged, tensor->data, offset, size);
-        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, staged, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        const bool use_original = stage_malloc && stage_direct_source;
+        const void * hip_source = use_original ? data : staged;
+        const char * mode = use_original ? "malloc-control-original" : (stage_malloc ? "malloc" : "pinned");
+        GGML_LOG_INFO("[rocm-ckpt-stage] BEGIN mode=%s tensor=%s original=%p staged=%p hip_source=%p dst=%p offset=%zu size=%zu\n",
+                mode, tensor->name, data, staged, hip_source, tensor->data, offset, size);
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, hip_source, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
         GGML_LOG_INFO("[rocm-ckpt-stage] END mode=%s tensor=%s staged=%p size=%zu\n",
-                stage_malloc ? "malloc" : "pinned", tensor->name, staged, size);
+                mode, tensor->name, staged, size);
 
         if (stage_malloc) {
             std::free(staged);
