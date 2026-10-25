@@ -266,3 +266,37 @@ and surrounding graph/split messages before drawing conclusions.
 
 This optional check is independent of `GGML_ROCM_CKPT_PINNED_STAGE` and
 the HIP test program, and is not intended for production.
+
+## Experiment: force re-reservation on graph signature change
+
+For A/B testing ggml-org/llama.cpp#28448, branch
+`experiments/gallocr-identity-force-realloc` (based on
+`diagnostics/rocm-checkpoint-fault`) adds:
+
+```fish
+set -x GGML_GALLOCR_IDENTITY_FORCE_REALLOC 1
+set -x GGML_GALLOCR_IDENTITY_DIAG 1
+```
+
+Rebuild `llama-server` after switching branches and run **the same prompt**
+with direct GGUF mmap-to-HIP copies (no malloc or pinned staging).
+The existing graph size check stays unchanged. If the optional node or leaf
+fingerprint check finds a difference at a reused plan position, the helper
+returns **false** (meaning *not safe to reuse*), `ggml_gallocr_needs_realloc`
+returns **true**, and the normal multi-backend scheduler synchronizes and
+reserves a fresh graph plan. Search for:
+
+```text
+[gallocr-identity] FORCE REALLOC tensor=...
+[gallocr-identity] FORCE REALLOC leaf=...
+```
+
+The switch is **off by default**; with it unset, this branch retains the
+passive behaviour from the diagnostics branch. Turn off via
+`set -e GGML_GALLOCR_IDENTITY_FORCE_REALLOC`.
+
+**Caution:** This intentionally over-invalidates the plan on any semantic
+identity/shape/layout signature mismatch, including changes that might be
+entirely safe to reuse. It is an experiment, not an upstream-ready allocator
+fix. Some performance cost, extra allocation, or memory pressure is expected;
+a successful or failing run alone is not proof of root cause.
