@@ -344,3 +344,27 @@ hypotheses.
 
 The HIP pool event query uses the ROCm-native `hipEventQuery` and
 `hipErrorNotReady` names (fixed after the first build failure).
+
+### Quiet logs while benchmarking generation
+
+The checkpoint and sequence diagnostics in `tools/server/server-context.cpp`
+and `common/common.cpp` used to emit INFO messages for every decode call.
+They are **disabled by default** on this branch. To restore those detailed
+messages for troubleshooting, set `LLAMA_ROCM_CKPT_DIAG_LOG=1` before launch.
+This switch only controls `[rocm-ckpt-diag]` logging; optional synchronizations
+remain controlled separately by `LLAMA_ROCM_CKPT_DIAG_SYNC=1`.
+
+With `GGML_ROCM_MALLOC_STAGE_POOL_TRACE` unset, pool statistics now print
+once after the first copy and then every 65,536 pooled copies (rather than
+every 4,096). Regular llama.cpp `slot print_timing` token/s and prompt
+timing statistics are unchanged.
+
+```fish
+set -e LLAMA_ROCM_CKPT_DIAG_LOG
+set -e LLAMA_ROCM_CKPT_DIAG_SYNC
+set -e GGML_ROCM_MALLOC_STAGE_POOL_TRACE
+# Keep GGML_ROCM_MALLOC_STAGE_POOL=1 and the other desired workaround flags.
+```
+
+An already running server continues to use the previously built logging
+code: pull, rebuild and restart to activate the quieter defaults.
