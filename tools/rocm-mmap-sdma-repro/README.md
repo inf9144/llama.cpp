@@ -227,3 +227,42 @@ Do not run with valuable unsaved GPU work in progress.
 The goal is to determine whether the fault exists in standalone HIP, and only
 then narrow ROCclr/ROCR/AMDKFD ownership. It is **not** established that the
 previously fixed KFD bug is present again.
+
+## Optional llama.cpp allocator check for ggml issue #28448
+
+The independent HIP reproducer (this directory) does **not** use ggml or
+the graph allocator, so the observed GPU fault cannot require that code path.
+However, a separate issue might affect the full llama.cpp model inference:
+https://github.com/ggml-org/llama.cpp/issues/28448
+
+On the diagnostic branch, `ggml/src/ggml-alloc.c` implements an optional,
+**logging-only** graph-plan fingerprint check. Enable it on a freshly rebuilt
+llama-server:
+
+```fish
+set -x GGML_GALLOCR_IDENTITY_DIAG 1
+# Run the normal ROCm llama-server command, with all staging controls disabled
+# if you wish to observe the original failure.
+```
+
+Expected log prefixes:
+
+- `[gallocr-identity] enabled`: captured the first reserved plan.
+- `[gallocr-identity] reuse=N: signature check clean`: a previously reserved
+  plan was reused with matching names, operations, types, shapes, strides,
+  view status, and immediate input identities.
+- `[gallocr-identity] reused plan differs`: fingerprint mismatch when the
+  allocator's existing size-based test still accepted the plan.
+- `[gallocr-identity] reused plan had N identity/layout mismatches`:
+  aggregate for that check. Only the first 16 detailed differences are printed.
+
+**Important:** A fingerprint difference is **not proof of invalid allocation
+or memory corruption**: some semantic changes are safe to reuse in the same
+memory layout. Conversely a clean signature cannot prove there are no bugs:
+the diagnostic intentionally does not inspect all lifetime, alias, pointer,
+or backend placement conditions. It does not force reallocation, move buffers,
+or change the allocator's acceptance criteria. Compare the reported positions
+and surrounding graph/split messages before drawing conclusions.
+
+This optional check is independent of `GGML_ROCM_CKPT_PINNED_STAGE` and
+the HIP test program, and is not intended for production.
