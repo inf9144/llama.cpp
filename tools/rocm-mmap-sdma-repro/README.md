@@ -138,6 +138,47 @@ If changing offsets still does not reproduce, compare `--sync batch` vs.
 scheduler upload events. This synthetic stress test deliberately does **not**
 reproduce the real MoE cache's SLRU eviction pattern or all GGUF tensors.
 
+## Confirmed standalone failure (2026-10-25)
+
+The initial fixed source-offset test passed 50 rounds on both devices,
+as did the 50-round whole-GGUF-mmap variant. The randomized-source variant
+**did trigger the same HSA page fault outside llama.cpp**, with parameters:
+
+```fish
+./rocm_mmap_sdma_repro \
+  --model-file $gguf --file-offset 0x7c2331d40 \
+  --map whole --source-span-mib 1024 \
+  --pattern random --seed 20261025 \
+  --devices 0,1 --iterations 250 --mode direct --sync each
+```
+
+Output (shortened):
+
+```text
+CONFIG mode=direct sync=each pattern=random seed=20261025 iterations=250 devices=2 mapping=model-file-backed map_scope=whole file_offset=0x7c2331d40 map_bytes=38842920384 source_span=1073741824 src=0x7efed4131d40 chunks=59
+READY dev=0 name=AMD Radeon RX 7900 XTX dst=0x7ef494000000
+READY dev=1 name=AMD Radeon RX 7800 XT dst=0x7ef480a00000
+ROUND PASS dev=0 iteration=1/250 mode=direct sync=each
+ROUND PASS dev=1 iteration=1/250 mode=direct sync=each
+ROUND PASS dev=0 iteration=5/250 mode=direct sync=each
+Memory access fault by GPU node-1 (...) on address 0x7efee47cb000. Reason: Page not present or supervisor privilege.
+SIGABRT
+```
+
+The failing address is 275354304 bytes (262.598 MiB) into the mapped source
+span. It is a **file-backed model mapping**, not a process heap allocation.
+That address overlaps several deterministically generated source ranges in
+different rounds; one plausible contemporaneous candidate is HIP worker 1,
+round 2, chunk 39 (13504 bytes into the source for that copy).
+This is **not an established offending transfer** because HSA faults may
+surface later than the copy that provoked them, and HSA node IDs are not
+necessarily HIP device ordinals.
+
+The randomized `malloc` control and single-GPU controls have **not** yet been
+reported. Do not claim a standalone direct-vs-malloc A/B result until those
+are run with identical flags. Before sending an upstream issue, capture
+matching `--trace` output and kernel `SDMA` fault details as well.
+
 ## A/B comparisons
 
 Repeat with **identical file, file offset, devices, iterations, sync mode**,
