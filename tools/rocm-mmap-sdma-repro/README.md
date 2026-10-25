@@ -266,3 +266,56 @@ and surrounding graph/split messages before drawing conclusions.
 
 This optional check is independent of `GGML_ROCM_CKPT_PINNED_STAGE` and
 the HIP test program, and is not intended for production.
+
+## Experimental performant malloc-staging workaround for llama-server
+
+Branch: `feature/rocm-malloc-stage-pool` (based on
+`diagnostics/rocm-checkpoint-fault`).
+
+Unlike the existing synchronous diagnostic `GGML_ROCM_CKPT_PINNED_STAGE`+
+`GGML_ROCM_CKPT_MALLOC_STAGE`, the new host staging path uses **ordinary
+anonymous malloc memory**, a **bounded per-backend reuse pool**, and one
+**HIP event per in-flight slot**. Host staging memory is not recycled until
+its stream copy has completed. Copies are enqueued on the original backend
+stream with no per-copy `hipStreamSynchronize` (unless a single copy exceeds
+the selected budget, or the pool is under memory pressure and must wait for
+a previously submitted transfer).
+
+In Fish, with all previous `GGML_ROCM_CKPT_*` staging switches disabled:
+
+```fish
+set -e GGML_ROCM_CKPT_PINNED_STAGE
+set -e GGML_ROCM_CKPT_MALLOC_STAGE
+set -e GGML_ROCM_CKPT_STAGE_DIRECT_SOURCE
+set -e GGML_ROCM_CKPT_PRETOUCH_HOST
+
+set -gx GGML_ROCM_MALLOC_STAGE_POOL 1
+set -gx GGML_ROCM_MALLOC_STAGE_POOL_MIB 512
+set -gx GGML_ROCM_MALLOC_STAGE_POOL_TENSOR ffn_
+```
+
+Rebuild `build-rocm/bin/llama-server` after switching to the branch. The
+`ffn_` filter is recommended initially because the original faults were
+associated with expert transfers. Remove the `TENSOR` variable to stage
+**all** `set_tensor_async` H2D calls. The pool budget is **per backend**;
+two GPUs may therefore reserve up to ~1024 MiB combined with the 512-MiB
+setting. The pool starts empty and grows as needed, with 64-KiB granularity.
+
+Optional `GGML_ROCM_MALLOC_STAGE_POOL_TRACE=1` logs individual transfers.
+By default the pool logs a summary at first use and every 4096 transfers:
+
+```text
+[rocm-malloc-pool] enabled dev=0 budget=512 MiB filter=ffn_
+[rocm-malloc-pool] copies=... reuses=... waits=... slots=... reserved=... MiB
+```
+
+This is **experimental**, not tested against physical ROCm hardware in the
+authoring environment. Compare correctness and throughput against the
+previous synchronous malloc-staging mode and Vulkan. An event only fences
+the anonymous-source buffer; it does not prevent unrelated driver/kernel
+faults. Bounded memory means the implementation can wait for completion
+under pressure, and fast asynchronous transfers are not guaranteed when
+ROCm internally stages pageable host buffers.
+
+Disable via `set -e GGML_ROCM_MALLOC_STAGE_POOL`. The original synchronous
+experiment flags remain available and unchanged.
