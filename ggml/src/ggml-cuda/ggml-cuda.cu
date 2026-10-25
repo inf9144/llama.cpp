@@ -2701,6 +2701,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         }
         return;
     }
+
+    // Diagnostic only: fault in the source pages on the CPU without changing the
+    // original host pointer handed to ROCm. This separates pageable source residency
+    // from an extra malloc/pinned staging allocation. No intermediate buffer is used.
+    static const bool pretouch_host = ggml_cuda_env_flag("GGML_ROCM_CKPT_PRETOUCH_HOST");
+    if (pretouch_host && size > 0 &&
+        (stage_filter == nullptr || stage_filter[0] == 0 || std::strstr(tensor->name, stage_filter) != nullptr)) {
+        const volatile unsigned char * src = static_cast<const volatile unsigned char *>(data);
+        volatile unsigned char checksum = 0;
+        constexpr size_t page_stride = 4096;
+        for (size_t i = 0; i < size; i += page_stride) {
+            checksum = static_cast<unsigned char>(checksum ^ src[i]);
+        }
+        checksum = static_cast<unsigned char>(checksum ^ src[size - 1]);
+        (void) checksum;
+        GGML_LOG_INFO("[rocm-ckpt-pretouch] tensor=%s src=%p size=%zu (original pointer unchanged)\n",
+                tensor->name, data, size);
+    }
 #endif // defined(GGML_USE_HIP)
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
