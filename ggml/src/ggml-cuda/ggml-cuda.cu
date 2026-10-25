@@ -812,10 +812,10 @@ struct ggml_rocm_malloc_stage_pool {
             if (!slot.in_flight) {
                 continue;
             }
-            const cudaError_t status = cudaEventQuery(slot.done);
-            if (status == cudaSuccess) {
+            const hipError_t status = hipEventQuery(slot.done);
+            if (status == hipSuccess) {
                 slot.in_flight = false;
-            } else if (status != cudaErrorNotReady) {
+            } else if (status != hipErrorNotReady) {
                 CUDA_CHECK(status);
             }
         }
