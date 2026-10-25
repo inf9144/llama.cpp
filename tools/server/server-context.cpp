@@ -2870,18 +2870,18 @@ private:
                 cur.pos_max, cur.n_tokens, slot.id);
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/pre-save");
 
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target save BEGIN\n");
+        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target save BEGIN\n");
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target save END bytes=%zu\n", cur.data_tgt.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-target-save");
 
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft save BEGIN\n");
+        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft save BEGIN\n");
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft save END bytes=%zu\n", cur.data_dft.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-draft-save");
 
         // stash the draft's speculative state with the checkpoint
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative save BEGIN\n");
+        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative save BEGIN\n");
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative save END bytes=%zu\n", cur.data_spec.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-spec-save");
@@ -4335,13 +4335,13 @@ private:
                                         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint restore BEGIN pos=%d n_tokens=%" PRId64 "\n",
                                                 it->pos_max, it->n_tokens);
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/pre-restore");
-                                        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target restore BEGIN\n");
+                                        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target restore BEGIN\n");
                                         const bool target_restored = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target restore END ok=%d\n", (int) target_restored);
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-target-restore");
                                         bool draft_restored = false;
                                         if (target_restored) {
-                                            SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft restore BEGIN\n");
+                                            SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft restore BEGIN\n");
                                             draft_restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                             SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft restore END ok=%d\n", (int) draft_restored);
                                             server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-draft-restore");
@@ -4360,7 +4360,7 @@ private:
                                         // restore the draft's speculative state
                                         SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative restore BEGIN bytes=%zu\n", it->data_spec.size());
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-                                        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative restore END\n");
+                                        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative restore END\n");
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-restore");
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
@@ -4781,7 +4781,7 @@ private:
             SRV_INF("[rocm-ckpt-diag] llama_process END ret=%d\n", ret);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
-                SRV_INF("[rocm-ckpt-diag] logits sync END\n");
+                SRV_INF("%s", "[rocm-ckpt-diag] logits sync END\n");
             }
             server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "decode/post-process");
         });
