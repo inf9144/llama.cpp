@@ -479,9 +479,15 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
-// Diagnostic only: fingerprints of the tensors used when the current graph
-// allocation plan was reserved. Enabled by GGML_GALLOCR_IDENTITY_DIAG=1.
-// These hashes do NOT affect allocator decisions.
+// Fingerprints of the tensors used when the current graph allocation plan
+// was reserved. The existing GGML_GALLOCR_IDENTITY_DIAG switch logs only.
+// GGML_GALLOCR_IDENTITY_FORCE_REALLOC=1 is an experimental opt-in that
+// invalidates a cached plan on a fingerprint mismatch.
+static bool ggml_gallocr_identity_force_realloc_enabled(void) {
+    const char * value = getenv("GGML_GALLOCR_IDENTITY_FORCE_REALLOC");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
 static bool ggml_gallocr_identity_diag_enabled(void) {
     // Checking the environment is cheap relative to graph hashing and avoids
     // an unsynchronized function-static initialization across host threads.
@@ -543,7 +549,7 @@ struct ggml_gallocr {
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 
-    // Read-only diagnostic metadata, separate from the allocation plan.
+    // Graph-plan fingerprint metadata, used for logging or opt-in invalidation.
     uint64_t * diag_node_hashes;
     uint64_t * diag_leaf_hashes;
     int diag_nodes;
@@ -1005,9 +1011,9 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
-    // Record a new baseline only after a successful reserve of the plan.
-    // No allocation behaviour is modified by this diagnostic.
-    if (ggml_gallocr_identity_diag_enabled()) {
+    // Record the new fingerprint baseline only after a successful reserve.
+    // In the default configuration this does not affect allocation behaviour.
+    if (ggml_gallocr_identity_diag_enabled() || ggml_gallocr_identity_force_realloc_enabled()) {
         if (galloc->diag_nodes != graph->n_nodes) {
             free(galloc->diag_node_hashes);
             galloc->diag_node_hashes = graph->n_nodes ?
@@ -1030,8 +1036,9 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         ++galloc->diag_reserves;
         if (galloc->diag_reserves == 1) {
-            GGML_LOG_INFO("[gallocr-identity] enabled: plan signatures captured (nodes=%d leafs=%d); logging only, allocator unchanged\n",
-                          graph->n_nodes, graph->n_leafs);
+            GGML_LOG_INFO("[gallocr-identity] enabled: plan signatures captured (nodes=%d leafs=%d); mode=%s\n",
+                          graph->n_nodes, graph->n_leafs,
+                          ggml_gallocr_identity_force_realloc_enabled() ? "force-realloc" : "logging-only");
         }
     }
     return true;
@@ -1083,7 +1090,8 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
-static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+static bool ggml_gallocr_node_needs_realloc(
+        ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc, const uint64_t * reserved_hash) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
@@ -1092,7 +1100,23 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return talloc->size_max >= node_size;
+    if (talloc->size_max < node_size) {
+        return false;
+    }
+
+    // This helper returns TRUE when the existing plan remains valid.
+    // Returning FALSE on a hash mismatch requests a fresh reservation via
+    // ggml_gallocr_needs_realloc() and the backend scheduler.
+    if (reserved_hash != NULL) {
+        const uint64_t current_hash = ggml_gallocr_identity_hash_tensor(node);
+        if (*reserved_hash != current_hash) {
+            GGML_LOG_WARN("[gallocr-identity] FORCE REALLOC tensor=%s stored_sig=%016llx current_sig=%016llx\n",
+                          node->name, (unsigned long long) *reserved_hash,
+                          (unsigned long long) current_hash);
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
@@ -1110,11 +1134,17 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
+    const bool identity_force = ggml_gallocr_identity_force_realloc_enabled() &&
+                                galloc->diag_node_hashes != NULL &&
+                                galloc->diag_nodes == graph->n_nodes &&
+                                galloc->diag_leafs == graph->n_leafs;
+
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
-        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+        const uint64_t * reserved_hash = identity_force ? &galloc->diag_node_hashes[i] : NULL;
+        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst, reserved_hash)) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -1126,7 +1156,8 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             if (src == NULL) {
                 continue;
             }
-            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+            // The node hash includes the identity of each immediate input.
+            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j], NULL)) {
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
@@ -1135,6 +1166,19 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         }
     }
 
+    // Leaf fingerprints are not covered by node-index signatures.
+    if (identity_force && galloc->diag_leaf_hashes != NULL) {
+        for (int i = 0; i < graph->n_leafs; ++i) {
+            const uint64_t current_hash = ggml_gallocr_identity_hash_tensor(graph->leafs[i]);
+            if (galloc->diag_leaf_hashes[i] != current_hash) {
+                GGML_LOG_WARN("[gallocr-identity] FORCE REALLOC leaf=%d tensor=%s stored_sig=%016llx current_sig=%016llx\n",
+                              i, graph->leafs[i]->name,
+                              (unsigned long long) galloc->diag_leaf_hashes[i],
+                              (unsigned long long) current_hash);
+                return true;
+            }
+        }
+    }
     return false;
 }
 
