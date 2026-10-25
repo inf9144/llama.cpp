@@ -81,6 +81,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -2664,6 +2665,28 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+#if defined(GGML_USE_HIP)
+    // Diagnostic only: copy model weights into HIP-allocated pinned memory before H2D DMA.
+    // Synchronize each staged transfer before freeing the pinned allocation.
+    // Restrict with GGML_ROCM_CKPT_PINNED_STAGE_TENSOR to limit diagnostic overhead.
+    static const bool stage_enabled = ggml_cuda_env_flag("GGML_ROCM_CKPT_PINNED_STAGE");
+    static const char * stage_filter = getenv("GGML_ROCM_CKPT_PINNED_STAGE_TENSOR");
+    if (stage_enabled && size > 0 &&
+        (stage_filter == nullptr || stage_filter[0] == 0 || std::strstr(tensor->name, stage_filter) != nullptr)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        void * staged = nullptr;
+        CUDA_CHECK(cudaMallocHost(&staged, size));
+        std::memcpy(staged, data, size);
+        GGML_LOG_INFO("[rocm-ckpt-stage] BEGIN tensor=%s original=%p staged=%p dst=%p offset=%zu size=%zu\n",
+                tensor->name, data, staged, tensor->data, offset, size);
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, staged, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        GGML_LOG_INFO("[rocm-ckpt-stage] END tensor=%s staged=%p size=%zu\n", tensor->name, staged, size);
+        CUDA_CHECK(cudaFreeHost(staged));
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
