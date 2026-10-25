@@ -292,6 +292,10 @@ set -e GGML_ROCM_CKPT_PRETOUCH_HOST
 set -gx GGML_ROCM_MALLOC_STAGE_POOL 1
 set -gx GGML_ROCM_MALLOC_STAGE_POOL_MIB 512
 set -gx GGML_ROCM_MALLOC_STAGE_POOL_TENSOR ffn_
+
+# Optional, independent ggml graph-plan identity re-reservation experiment:
+set -gx GGML_GALLOCR_IDENTITY_FORCE_REALLOC 1
+set -gx GGML_GALLOCR_IDENTITY_DIAG 1
 ```
 
 Rebuild `build-rocm/bin/llama-server` after switching to the branch. The
@@ -319,3 +323,24 @@ ROCm internally stages pageable host buffers.
 
 Disable via `set -e GGML_ROCM_MALLOC_STAGE_POOL`. The original synchronous
 experiment flags remain available and unchanged.
+
+### ggml allocator identity / forced graph plan invalidation
+
+This branch also contains the changes from
+`experiments/gallocr-identity-force-realloc`. When
+`GGML_GALLOCR_IDENTITY_FORCE_REALLOC=1` is set, graph reuse compares the
+node/leaf identity, operator, type, shape, strides, and immediate operand
+fingerprints captured by the last graph reservation. On a mismatch it
+returns "plan not reusable" and asks the multi-backend scheduler for a
+fresh reservation (messages are prefixed `[gallocr-identity] FORCE REALLOC`).
+The code uses the same signatures as the earlier diagnostic experiment.
+
+This is **off by default** and does not prove that an existing reused
+allocation would otherwise be invalid. It may cause needless graph
+re-reservations and performance regressions, but should not be necessary
+for the malloc pool itself. Our existing test with force-realloc **still
+hit the original ROCm GPU fault**; the two features address different
+hypotheses.
+
+The HIP pool event query uses the ROCm-native `hipEventQuery` and
+`hipErrorNotReady` names (fixed after the first build failure).
