@@ -47,8 +47,16 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// Temporary ROCm checkpoint diagnostics. Logging is always enabled in this diagnostic branch.
-// Optional synchronization is deliberately opt-in because it changes execution timing.
+// Temporary ROCm checkpoint diagnostics. Detailed BEGIN/END logs are opt-in:
+// LLAMA_ROCM_CKPT_DIAG_LOG=1. Optional synchronization remains separately opt-in
+// (LLAMA_ROCM_CKPT_DIAG_SYNC=1) because it changes execution timing.
+static bool server_rocm_ckpt_diag_log_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_ROCM_CKPT_DIAG_LOG");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 static bool server_rocm_ckpt_diag_sync_enabled() {
     const char * value = std::getenv("LLAMA_ROCM_CKPT_DIAG_SYNC");
     return value != nullptr && std::strcmp(value, "1") == 0;
@@ -60,14 +68,14 @@ static void server_rocm_ckpt_diag_sync(
         return;
     }
 
-    SRV_INF("[rocm-ckpt-diag] sync BEGIN %s\n", stage);
+    if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] sync BEGIN %s\n", stage);
     if (ctx_tgt != nullptr) {
         llama_synchronize(ctx_tgt);
     }
     if (ctx_dft != nullptr) {
         llama_synchronize(ctx_dft);
     }
-    SRV_INF("[rocm-ckpt-diag] sync END %s\n", stage);
+    if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] sync END %s\n", stage);
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -2866,26 +2874,26 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint BEGIN pos=%d n_tokens=%" PRId64 " id=%d\n",
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint BEGIN pos=%d n_tokens=%" PRId64 " id=%d\n",
                 cur.pos_max, cur.n_tokens, slot.id);
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/pre-save");
 
-        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target save BEGIN\n");
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target save BEGIN\n");
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target save END bytes=%zu\n", cur.data_tgt.size());
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target save END bytes=%zu\n", cur.data_tgt.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-target-save");
 
-        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft save BEGIN\n");
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft save BEGIN\n");
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft save END bytes=%zu\n", cur.data_dft.size());
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft save END bytes=%zu\n", cur.data_dft.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-draft-save");
 
         // stash the draft's speculative state with the checkpoint
-        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative save BEGIN\n");
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative save BEGIN\n");
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative save END bytes=%zu\n", cur.data_spec.size());
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative save END bytes=%zu\n", cur.data_spec.size());
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-spec-save");
-        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint END pos=%d n_tokens=%" PRId64 "\n",
+        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint END pos=%d n_tokens=%" PRId64 "\n",
                 cur.pos_max, cur.n_tokens);
 
         SLT_TRC(slot,
@@ -4332,18 +4340,18 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint restore BEGIN pos=%d n_tokens=%" PRId64 "\n",
+                                        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint restore BEGIN pos=%d n_tokens=%" PRId64 "\n",
                                                 it->pos_max, it->n_tokens);
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/pre-restore");
-                                        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target restore BEGIN\n");
+                                        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint target restore BEGIN\n");
                                         const bool target_restored = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target restore END ok=%d\n", (int) target_restored);
+                                        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint target restore END ok=%d\n", (int) target_restored);
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-target-restore");
                                         bool draft_restored = false;
                                         if (target_restored) {
-                                            SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft restore BEGIN\n");
+                                            if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint draft restore BEGIN\n");
                                             draft_restored = it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                            SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft restore END ok=%d\n", (int) draft_restored);
+                                            if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint draft restore END ok=%d\n", (int) draft_restored);
                                             server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-draft-restore");
                                         }
                                         if (!target_restored || !draft_restored) {
@@ -4358,9 +4366,9 @@ private:
 
                                     if (!do_reset) {
                                         // restore the draft's speculative state
-                                        SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative restore BEGIN bytes=%zu\n", it->data_spec.size());
+                                        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] checkpoint speculative restore BEGIN bytes=%zu\n", it->data_spec.size());
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-                                        SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative restore END\n");
+                                        if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "%s", "[rocm-ckpt-diag] checkpoint speculative restore END\n");
                                         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "checkpoint/post-restore");
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
@@ -4433,11 +4441,11 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    SLT_INF(slot, "[rocm-ckpt-diag] seq_rm BEGIN id=%d p0=%d cached=%d checkpoints=%zu\n",
+                    if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] seq_rm BEGIN id=%d p0=%d cached=%d checkpoints=%zu\n",
                             slot.id, p0, slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
                     server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "seq_rm/pre");
                     slot.mem.seq_rm(slot.id, p0, -1);
-                    SLT_INF(slot, "[rocm-ckpt-diag] seq_rm END id=%d p0=%d\n", slot.id, p0);
+                    if (server_rocm_ckpt_diag_log_enabled()) SLT_INF(slot, "[rocm-ckpt-diag] seq_rm END id=%d p0=%d\n", slot.id, p0);
                     server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "seq_rm/post");
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
@@ -4772,20 +4780,20 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
-        SRV_INF("[rocm-ckpt-diag] decode BEGIN off=%d n=%d output=%d\n", off, batch.view.size(), (int) has_output);
+        if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] decode BEGIN off=%d n=%d output=%d\n", off, batch.view.size(), (int) has_output);
         server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "decode/pre");
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            SRV_INF("[rocm-ckpt-diag] llama_process BEGIN off=%d n=%d\n", off, batch.view.size());
+            if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] llama_process BEGIN off=%d n=%d\n", off, batch.view.size());
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            SRV_INF("[rocm-ckpt-diag] llama_process END ret=%d\n", ret);
+            if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] llama_process END ret=%d\n", ret);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
-                SRV_INF("%s", "[rocm-ckpt-diag] logits sync END\n");
+                if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("%s", "[rocm-ckpt-diag] logits sync END\n");
             }
             server_rocm_ckpt_diag_sync(ctx_tgt, ctx_dft, "decode/post-process");
         });
-        SRV_INF("[rocm-ckpt-diag] decode END ret=%d\n", ret);
+        if (server_rocm_ckpt_diag_log_enabled()) SRV_INF("[rocm-ckpt-diag] decode END ret=%d\n", ret);
 
         if (ret != 0) {
             {
