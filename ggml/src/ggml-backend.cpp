@@ -1862,16 +1862,43 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// ROCm checkpoint fault diagnostics. Trace only when explicitly requested.
+static bool ggml_rocm_ckpt_split_trace() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_ROCM_CKPT_SPLIT_TRACE");
+        return env != NULL && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_rocm_ckpt_split_sync() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_ROCM_CKPT_SPLIT_SYNC");
+        return env != NULL && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const bool trace = ggml_rocm_ckpt_split_trace();
+    const bool sync  = ggml_rocm_ckpt_split_sync();
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (trace) {
+            const char * first = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "-";
+            const char * last  = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "-";
+            GGML_LOG_INFO("[rocm-ckpt-split] BEGIN id=%d/%d backend=%d:%s nodes=%d inputs=%d first=%s last=%s\n",
+                    split_id, sched->n_splits, split_backend_id, ggml_backend_name(split_backend),
+                    split->graph.n_nodes, split->n_inputs, first, last);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1887,17 +1914,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                if (trace) {
+                    GGML_LOG_INFO("[rocm-ckpt-split] copy BEGIN split=%d input=%d host_weight=0 tensor=%s bytes=%zu\n",
+                            split_id, input_id, split->inputs[input_id]->name, ggml_nbytes(split->inputs[input_id]));
+                }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                if (trace) {
+                    GGML_LOG_INFO("[rocm-ckpt-split] copy END split=%d input=%d\n", split_id, input_id);
+                }
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                if (trace) {
+                    GGML_LOG_INFO("[rocm-ckpt-split] copy BEGIN split=%d input=%d host_weight=1 tensor=%s bytes=%zu\n",
+                            split_id, input_id, split->inputs[input_id]->name, ggml_nbytes(split->inputs[input_id]));
+                }
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                if (trace) {
+                    GGML_LOG_INFO("[rocm-ckpt-split] copy END split=%d input=%d\n", split_id, input_id);
+                }
             }
         }
 
         if (!sched->callback_eval) {
+            if (trace) {
+                GGML_LOG_INFO("[rocm-ckpt-split] compute BEGIN split=%d backend=%s\n", split_id, ggml_backend_name(split_backend));
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (trace) {
+                GGML_LOG_INFO("[rocm-ckpt-split] compute RETURN split=%d status=%d (async)\n", split_id, (int) ec);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1935,12 +1982,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sync) {
+            if (trace) {
+                GGML_LOG_INFO("[rocm-ckpt-split] sync BEGIN split=%d backend=%s\n", split_id, ggml_backend_name(split_backend));
+            }
+            ggml_backend_synchronize(split_backend);
+            if (trace) {
+                GGML_LOG_INFO("[rocm-ckpt-split] sync END split=%d\n", split_id);
+            }
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
         prev_backend_id = split_backend_id;
+        if (trace) {
+            GGML_LOG_INFO("[rocm-ckpt-split] END split=%d\n", split_id);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
