@@ -402,17 +402,59 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
 
+// Trace exact host source ranges for async H2D uploads and optionally isolate one copy at a time.
+// The optional synchronization deliberately changes timing; leave it off for baseline traces.
+static bool ggml_rocm_ckpt_upload_trace() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_ROCM_CKPT_UPLOAD_TRACE");
+        return env != NULL && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_rocm_ckpt_upload_sync() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_ROCM_CKPT_UPLOAD_SYNC");
+        return env != NULL && strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    const bool trace = ggml_rocm_ckpt_upload_trace();
+    const bool sync = ggml_rocm_ckpt_upload_sync();
+    if (trace) {
+        GGML_LOG_INFO("[rocm-ckpt-upload] BEGIN backend=%s tensor=%s src=%p src_end=%p dst=%p offset=%zu size=%zu\n",
+                ggml_backend_name(backend), tensor->name,
+                data, (const void *) ((const uint8_t *) data + size), tensor->data, offset, size);
+    }
+
     if (backend->iface.set_tensor_async == NULL) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
+    }
+
+    if (trace) {
+        GGML_LOG_INFO("[rocm-ckpt-upload] RETURN backend=%s tensor=%s size=%zu\n",
+                ggml_backend_name(backend), tensor->name, size);
+    }
+    if (sync) {
+        if (trace) {
+            GGML_LOG_INFO("[rocm-ckpt-upload] sync BEGIN backend=%s tensor=%s\n",
+                    ggml_backend_name(backend), tensor->name);
+        }
+        ggml_backend_synchronize(backend);
+        if (trace) {
+            GGML_LOG_INFO("[rocm-ckpt-upload] sync END backend=%s tensor=%s\n",
+                    ggml_backend_name(backend), tensor->name);
+        }
     }
 }
 
