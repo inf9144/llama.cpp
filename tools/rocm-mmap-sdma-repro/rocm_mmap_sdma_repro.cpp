@@ -96,6 +96,7 @@ struct Options {
     uint64_t file_offset = 0xd40; // source address modulo 4 KiB in the observed trace
     bool trace = false;
     bool pretouch = false;
+    bool map_whole = false;
 };
 void usage(const char * program) {
     std::cout << "Usage: " << program << " [options]\n"
@@ -104,6 +105,7 @@ void usage(const char * program) {
               << "  --devices 0,1             HIP device indices to use concurrently (default 0,1)\n"
               << "  --iterations N            Complete 59-copy rounds per device (default 20)\n"
               << "  --model-file PATH         Read-only GGUF/blob file instead of sparse temp file\n"
+              << "  --map window|whole        mmap only tensor window or entire file (default window)\n"
               << "  --file-offset N           Byte offset of tensor within file; decimal or 0xhex\n"
               << "                            (default 0xd40 for synthetic file)\n"
               << "  --trace                   Log each upload source range and successful HIP sync\n"
@@ -152,6 +154,12 @@ Options parse(int argc, char ** argv) {
             if (!n || n > 1000000) throw std::runtime_error("--iterations out of range");
             opt.iterations = static_cast<int>(n);
         } else if (arg == "--model-file") opt.model_file = value();
+        else if (arg == "--map") {
+            const auto v = value();
+            if (v == "window") opt.map_whole = false;
+            else if (v == "whole") opt.map_whole = true;
+            else throw std::runtime_error("Invalid --map: " + v);
+        }
         else if (arg == "--file-offset") opt.file_offset = parse_number(value());
         else if (arg == "--trace") opt.trace = true;
         else if (arg == "--pretouch") opt.pretouch = true;
@@ -169,10 +177,11 @@ struct SourceMapping {
     explicit SourceMapping(const Options & opt) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page <= 0) throw std::runtime_error("sysconf page size failed");
-        const uint64_t aligned = opt.file_offset / static_cast<uint64_t>(page) * static_cast<uint64_t>(page);
+        const uint64_t aligned = opt.map_whole ? 0 : opt.file_offset / static_cast<uint64_t>(page) * static_cast<uint64_t>(page);
         const uint64_t delta = opt.file_offset - aligned;
         if (delta > SIZE_MAX - kTensorBytes) throw std::runtime_error("Mapping length overflow");
-        map_bytes = static_cast<size_t>(delta) + kTensorBytes;
+        const size_t window_bytes = static_cast<size_t>(delta) + kTensorBytes;
+        map_bytes = window_bytes;
         if (aligned > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
             opt.file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - kTensorBytes)
             throw std::runtime_error("File offset too large");
@@ -192,6 +201,18 @@ struct SourceMapping {
             if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
             if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) < opt.file_offset + kTensorBytes)
                 throw std::runtime_error("Model file too small for offset + 321126400 bytes");
+            if (opt.map_whole) {
+                if (static_cast<uint64_t>(st.st_size) > SIZE_MAX)
+                    throw std::runtime_error("Model file too large to mmap");
+                map_bytes = static_cast<size_t>(st.st_size);
+            }
+        }
+        // For the sparse synthetic file, the whole-file and window sizes coincide
+        // except for the unaligned file offset. Preserve an exact full-file VMA.
+        if (synthetic && opt.map_whole) {
+            if (opt.file_offset > SIZE_MAX - kTensorBytes)
+                throw std::runtime_error("Synthetic mapping overflow");
+            map_bytes = static_cast<size_t>(opt.file_offset) + kTensorBytes;
         }
         mapping = mmap(nullptr, map_bytes, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(aligned));
         if (mapping == MAP_FAILED) throw std::runtime_error("mmap failed: " + std::string(std::strerror(errno)));
@@ -308,10 +329,11 @@ int main(int argc, char ** argv) {
             sum ^= mapping.src[kTensorBytes - 1];
             logf("PRETOUCH DONE checksum=%u", static_cast<unsigned>(sum));
         }
-        logf("CONFIG mode=%s sync=%s iterations=%d devices=%zu mapping=%s file_offset=0x%llx span=%zu src=%p chunks=%zu",
+        logf("CONFIG mode=%s sync=%s iterations=%d devices=%zu mapping=%s map_scope=%s file_offset=0x%llx map_bytes=%zu span=%zu src=%p chunks=%zu",
              mode_name(opt.mode), opt.sync == Sync::each ? "each" : "batch", opt.iterations,
              opt.devices.size(), mapping.synthetic ? "synthetic-file-backed" : "model-file-backed",
-             static_cast<unsigned long long>(opt.file_offset), kTensorBytes,
+             opt.map_whole ? "whole" : "window", static_cast<unsigned long long>(opt.file_offset),
+             mapping.map_bytes, kTensorBytes,
              static_cast<const void *>(mapping.src), kChunks.size());
 
         std::atomic<int> ready{0};
