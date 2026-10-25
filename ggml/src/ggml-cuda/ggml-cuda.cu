@@ -876,7 +876,7 @@ struct ggml_rocm_malloc_stage_pool {
         if (trace) {
             GGML_LOG_INFO("[rocm-malloc-pool] copy=%" PRIu64 " size=%zu original=%p staged=%p dst=%p active_slots=%zu reserved=%.1f MiB\n",
                           copies, size, src, slot.data, dst, slots.size(), reserved_bytes / 1048576.0);
-        } else if (copies == 1 || copies % 4096 == 0) {
+        } else if (copies == 1 || copies % 65536 == 0) {
             GGML_LOG_INFO("[rocm-malloc-pool] copies=%" PRIu64 " reuses=%" PRIu64 " waits=%" PRIu64 " slots=%zu reserved=%.1f MiB\n",
                           copies, reuses, waits, slots.size(), reserved_bytes / 1048576.0);
         }
