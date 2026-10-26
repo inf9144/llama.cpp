@@ -3450,6 +3450,14 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+int32_t llama_model_n_layer_swa(const llama_model * model) {
+    int32_t n = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        n += model->hparams.is_swa(il);
+    }
+    return n;
+}
+
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;

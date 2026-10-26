@@ -74,6 +74,8 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+DFlash2 drafts whose layers all use sliding-window attention ingest only the last window of prompt positions during server prefill. Earlier positions cannot be attended to during generation. Mixed full/sliding attention drafts keep full ingestion. Set `LLAMA_DFLASH_INGEST_TAIL=0` to disable this optimization. Media position gaps inside the retained tail are filled as before; prompt-cache restores use the new request's prompt end position.
+
 See:
 
 - #22105

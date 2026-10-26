@@ -89,6 +89,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// Report the exclusive prompt end position before prefill, including media position advances.
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
