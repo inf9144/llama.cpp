@@ -393,10 +393,69 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// Reject every token of a verify batch, including its first token. The snapshot
+// at slot width must contain the state before that batch, for both SSM and conv.
+struct case_full_batch_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "full_rollback"; }
+    const char * description() const override {
+        return "rejecting an entire verify batch restores identical subsequent decode";
+    }
+    std::string skip_reason(model_run & mr) const override {
+        const auto reason = ctx_test::skip_reason(mr);
+        if (!reason.empty()) {
+            return reason;
+        }
+        char arch[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch, sizeof(arch));
+        const std::string name = arch;
+        return name == "qwen3next" || name == "qwen35" || name == "qwen35moe" || name == "qwen4exp"
+            ? std::string{} : "requires a Qwen GDN model";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        constexpr llama_pos prefix = 128;
+        for (uint32_t width = 1; width <= 8; ++width) {
+            ctx_opts opts;
+            opts.n_ctx = 512;
+            opts.n_batch = 256;
+            opts.n_ubatch = 128;
+            opts.n_seq_max = 1;
+            opts.n_rs_seq = 8;
+            auto rolled = mr.ctx(opts);
+            auto reference = mr.ctx(opts);
+            CTX_REQUIRE(rolled && reference, "could not create rollback contexts");
+            if (llama_n_rs_seq(rolled.get()) < width) {
+                return case_result::skip("snapshot depth is too small");
+            }
+            CTX_REQUIRE(decode_gen(rolled.get(), n_vocab, 0, 0, prefix) &&
+                        decode_gen(reference.get(), n_vocab, 0, 0, prefix), "prefill failed");
+            CTX_REQUIRE(decode_gen(rolled.get(), n_vocab, 0, prefix, prefix + width), "verify failed");
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(rolled.get()), 0, prefix, -1),
+                        "complete verify rollback was refused");
+            for (llama_pos pos = prefix; pos < prefix + 3; ++pos) {
+                const auto token = gen_token(n_vocab, 0, pos);
+                CTX_REQUIRE(decode_one(rolled.get(), token, pos) && decode_one(reference.get(), token, pos),
+                            "decode after rollback failed");
+                const auto * actual = llama_get_logits_ith(rolled.get(), 0);
+                const auto * expected = llama_get_logits_ith(reference.get(), 0);
+                CTX_REQUIRE(actual && expected, "missing logits after rollback");
+                const auto diff = compare_logits(actual, expected, n_vocab);
+                CTX_REQUIRE(diff.n_nan == 0 && diff.diff_max == 0.0f,
+                            "full rollback changed logits at width " + std::to_string(width) +
+                            " (max diff " + std::to_string(diff.diff_max) + ")");
+            }
+        }
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
+    cases.push_back(std::make_unique<case_full_batch_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 

@@ -13,6 +13,7 @@ struct llama_cparams {
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
+    uint32_t n_rs_batch;      // largest speculative verify batch per sequence
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
@@ -39,6 +40,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
+    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

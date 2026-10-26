@@ -1537,6 +1537,11 @@ static bool ggml_metal_supports_mul_mat_op(
 }
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
+    // This backend does not consume the compact KQ mask inputs.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
+
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;

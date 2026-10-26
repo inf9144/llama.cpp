@@ -13,6 +13,8 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-context.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -143,6 +145,7 @@ static void usage(char ** argv) {
     LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
     LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
     LOG("  --test-dflash-vision     Test DFlash2 drafting across M-RoPE image positions\n");
+    LOG("  --test-kq-derived       Compare compact mask inputs with the packed mask fill\n");
     LOG("  --test-dflash-tail       Test DFlash2 prompt tails, cache reuse and SWA guards\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -1896,6 +1899,84 @@ static int test_dflash_vision(size_t seed, float stdev, int tail_mode = -1) {
     return 0;
 }
 
+static int test_kq_derived(size_t seed, float stdev) {
+    auto meta = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
+    auto * model = model_and_ctx.first.get();
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    GGML_ASSERT(cpu);
+    int checked = 0;
+    for (auto swa : {LLAMA_SWA_TYPE_NONE, LLAMA_SWA_TYPE_STANDARD, LLAMA_SWA_TYPE_CHUNKED}) {
+        for (auto non_causal : {LLAMA_NON_CAUSAL_TYPE_ALL, LLAMA_NON_CAUSAL_TYPE_SWA_ONLY, LLAMA_NON_CAUSAL_TYPE_SWA_FULL}) {
+            llama_hparams hp = model->hparams;
+            hp.non_causal_type = non_causal;
+            llama_kv_cache cache(*model, hp, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
+                512, 2, 256, 8, swa, nullptr, nullptr, nullptr, nullptr);
+            llama_batch_allocr alloc(1);
+            const auto batch = [&](uint32_t tokens, uint32_t sequences) {
+                auto ub = alloc.ubatch_reserve(tokens, sequences);
+                ub.data->seq_id_data.resize(ub.n_tokens);
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    ub.data->seq_id_data[i] = i / tokens;
+                    ub.seq_id[i] = &ub.data->seq_id_data[i];
+                    ub.n_seq_id[i] = 1;
+                    ub.pos[i] = i % tokens;
+                }
+                return ub;
+            };
+            auto resident = batch(32, 2);
+            auto slot = cache.find_slot(resident, true);
+            GGML_ASSERT(!slot.empty());
+            cache.apply_ubatch(slot, resident);
+            GGML_ASSERT(cache.seq_rm(0, 5, 11));
+            auto query = batch(16, 1);
+            for (uint32_t i = 0; i < query.n_tokens; ++i) {
+                query.pos[i] = 24 + i;
+            }
+            GGML_ASSERT(cache.kq_mask_derivable(query));
+            ggml_init_params ip = {1024 * 1024, nullptr, true};
+            ggml_context_ptr ctx(ggml_init(ip));
+            ggml_tensor * mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, 512, 16, 1, 1);
+            ggml_tensor * cells = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 512);
+            ggml_tensor * lo = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 16);
+            ggml_tensor * hi = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 16);
+            ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), cpu.get()));
+            GGML_ASSERT(buffer);
+            for (bool causal : {false, true}) {
+                cache.set_input_kq_mask(mask, &query, causal);
+                cache.set_input_kq_derived(cells, lo, hi, &query, causal);
+                const auto * cp = static_cast<const int32_t *>(cells->data);
+                const auto * lp = static_cast<const int32_t *>(lo->data);
+                const auto * hp = static_cast<const int32_t *>(hi->data);
+                const auto * packed = static_cast<const ggml_fp16_t *>(mask->data);
+                for (int token = 0; token < 16; ++token) {
+                    for (int cell = 0; cell < 512; ++cell) {
+                        const bool visible = cp[cell] != INT32_MIN && cp[cell] >= lp[token] && cp[cell] <= hp[token];
+                        const float expected = ggml_fp16_to_fp32(packed[token * 512 + cell]);
+                        GGML_ASSERT((visible && expected == 0.0f) || (!visible && expected == -INFINITY));
+                    }
+                }
+                ++checked;
+            }
+            hp.use_alibi = true;
+            GGML_ASSERT(!cache.kq_mask_derivable(query));
+            hp.use_alibi = false;
+            query.n_tokens = 8;
+            GGML_ASSERT(!cache.kq_mask_derivable(query));
+            query.n_tokens = 16;
+            auto multi = batch(16, 2);
+            GGML_ASSERT(!cache.kq_mask_derivable(multi));
+            query.data->pos.resize(16 * 3);
+            query.pos = query.data->pos.data();
+            query.n_pos = 3;
+            query.pos[16] = query.pos[0] + 1;
+            GGML_ASSERT(!cache.kq_mask_derivable(query));
+        }
+    }
+    printf("derived kq mask: %d packed-fill comparisons passed (SWA, non-causal, holes and foreign cells)\n", checked);
+    return 0;
+}
+
 static int test_layer_inputs(size_t seed, float stdev) {
     auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
@@ -2099,6 +2180,7 @@ int main(int argc, char ** argv) {
     bool layer_inputs = false;
     bool dflash_vision = false;
     bool dflash_tail = false;
+    bool kq_derived = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2172,6 +2254,8 @@ int main(int argc, char ** argv) {
             layer_inputs = true;
         } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
             dflash_vision = true;
+        } else if (strcmp(argv[i], "--test-kq-derived") == 0) {
+            kq_derived = true;
         } else if (strcmp(argv[i], "--test-dflash-tail") == 0) {
             dflash_tail = true;
         } else {
@@ -2187,6 +2271,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (kq_derived) {
+            return test_kq_derived(seed, stdev);
+        }
         if (dflash_tail) {
             const char * tail_env = getenv("LLAMA_DFLASH_INGEST_TAIL");
             const int n_modes = tail_env && atoi(tail_env) == 0 ? 1 : 3;

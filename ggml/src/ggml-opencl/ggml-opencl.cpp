@@ -13958,6 +13958,11 @@ static ggml_backend_buffer_t ggml_backend_opencl_device_buffer_from_ptr(ggml_bac
 }
 
 static bool ggml_backend_opencl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // This backend does not consume the compact KQ mask inputs.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
+
     ggml_cl_init(dev);
     return ggml_opencl_supports_op(dev, op);
 }

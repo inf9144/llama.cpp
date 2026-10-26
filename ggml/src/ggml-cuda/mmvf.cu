@@ -11,12 +11,15 @@ static __global__ void mul_mat_vec_f(
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride) {
+        const int ids_stride, const int nrows) {
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
     const int row         = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -136,6 +139,7 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -244,6 +248,7 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
@@ -306,8 +311,26 @@ static __global__ void mul_mat_vec_f(
     }
 
     ggml_cuda_pdl_lc();
+    // multi-token: one cross-warp exchange for all columns instead of two barriers per column. Per column the
+    // arithmetic is unchanged: the warp butterfly, then warp 0 butterflies the per-warp sums (0 past nwarps).
+    constexpr bool batched_reduce = !has_fusion && ncols_dst > 1 && block_size > warp_size;
+    if constexpr (batched_reduce) {
+        __shared__ float buf_cols[ncols_dst][warp_size];
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            buf_cols[j][tid/warp_size] = sumf[j];
+        }
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[j] = warp_reduce_sum<warp_size>(tid < block_size/warp_size ? buf_cols[j][tid] : 0.0f);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < (batched_reduce ? 0 : ncols_dst); ++j) {
         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
 
         if constexpr (has_fusion) {
@@ -393,7 +416,11 @@ static void mul_mat_vec_f_switch_fusion(
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
 
-    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
+    dim3 grid = block_nums;
+    if (ggml_cuda_grid_stall_pad(grid, block_dims)) {
+        ++grid.x;
+    }
+    const ggml_cuda_kernel_launch_params launch_params = {grid, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if constexpr (ncols_dst == 1) {
@@ -401,7 +428,7 @@ static void mul_mat_vec_f_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums.x);
             return;
        }
     }
@@ -411,7 +438,7 @@ static void mul_mat_vec_f_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, block_nums.x);
 
 }
 

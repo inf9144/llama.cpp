@@ -1194,6 +1194,25 @@ struct ggml_cuda_device_info {
 
 const ggml_cuda_device_info & ggml_cuda_info();
 
+int ggml_cuda_get_device();
+
+// Avoid HIP dispatch sizes that stall before launch; callers must guard the extra block.
+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
+#if defined(GGML_USE_HIP)
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        return false;
+    }
+    const uint64_t nblocks = (uint64_t) grid.x * grid.y * grid.z;
+    const uint64_t nthreads = (uint64_t) block.x * block.y * block.z;
+    return nblocks > 0 && (nblocks % 256 == 0 || (nblocks * nthreads) % 65536 == 0);
+#else
+    GGML_UNUSED(grid);
+    GGML_UNUSED(block);
+    return false;
+#endif
+}
+
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 

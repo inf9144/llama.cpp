@@ -4428,6 +4428,11 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
 }
 
 static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // This backend does not consume the compact KQ mask inputs.
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && op->src[5]) {
+        return false;
+    }
+
     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
 
     ggml_tensor * src0 = op->src[0];

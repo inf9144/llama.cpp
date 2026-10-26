@@ -2530,6 +2530,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // kq mask derived from compact state: when cell_pos/tok_lo/tok_hi are given, the mask tensor
+    // may be NULL and each cell's value is derived in the kernel as
+    //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
+    // with cell_pos == INT32_MIN marking a cell that is always dropped (empty or foreign).
+    // cell_pos is I32[n_kv], tok_lo/tok_hi are I32[n_tps] - the same row order the mask would use.
+    GGML_API void ggml_flash_attn_ext_add_kq_derived(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cell_pos,
+            struct ggml_tensor * tok_lo,
+            struct ggml_tensor * tok_hi);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2668,6 +2679,9 @@ extern "C" {
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
+    //
+    // n_rs_batch is the largest per-seq batch that can be rolled back into (0 = unset). Backends
+    // with a chunked prefill kernel must keep batches up to this bound on the verify path.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2676,7 +2690,8 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            int64_t               n_rs_batch);
 
     // DSA lightning indexer
     //

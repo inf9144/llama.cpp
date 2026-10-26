@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmb.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2048,6 +2049,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_mmb_supported_mm(ctx.device, src0, src1, dst)) {
+        ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
+        return;
+    }
+#endif
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2146,6 +2154,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 }
             }
         }
+
+#if defined(GGML_USE_HIP)
+        if (ggml_cuda_mmb_supported_mmid(ctx.device, src0, src1, ids, dst)) {
+            ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
+            return;
+        }
+#endif
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
@@ -4409,6 +4424,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src0 = up->src[0];
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
+
+#if defined(GGML_USE_HIP)
+            if (op == GGML_OP_MUL_MAT_ID && ids &&
+                ggml_cuda_mmb_supported_glu(cuda_ctx->device, gate->src[0], up->src[0], src1, ids, glu)) {
+                ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count = 3;
+                break;
+            }
+#endif
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};

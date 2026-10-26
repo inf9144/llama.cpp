@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "gated-delta-net-mma.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
@@ -352,6 +353,44 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+    // A fixed sequential tail preserves every rollback snapshot and uses the same prefill math for K=1..16.
+    // Verify batches stay sequential even when a speculator can draft more tokens than the snapshot depth.
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int64_t verify_max = std::max<int64_t>(K, ggml_get_op_params_i32(dst, 1));
+    const int64_t prefix = ((n_tokens - std::max(16, K)) / 64) * 64;
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc) && !kda && n_seqs == 1 && n_tokens > verify_max && prefix >= 64 &&
+            (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+        ggml_cuda_pool_alloc<float> prefix_state(ctx.pool(), S_v * S_v * H);
+        bool launched = false;
+        if (S_v == 128) {
+            launched = ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, prefix_state.get(), prefix);
+        }
+        if (!launched) {
+            launched = ggml_cuda_op_gated_delta_net_chunked(ctx, dst, prefix_state.get(), prefix);
+        }
+        if (launched) {
+            const int64_t tail = n_tokens - prefix;
+            const float * qt = q_d + prefix * sq2;
+            const float * kt = k_d + prefix * sq2;
+            const float * vt = v_d + prefix * sv2;
+            const float * gt = g_d + prefix * sb2;
+            const float * bt = b_d + prefix * sb2;
+            float * out = dst_d + prefix * S_v * H;
+            if (keep_rs) {
+                launch_gated_delta_net<false, true>(qt, kt, vt, gt, bt, prefix_state.get(), out, state_d,
+                    S_v, H, tail, 1, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            } else {
+                launch_gated_delta_net<false, false>(qt, kt, vt, gt, bt, prefix_state.get(), out, state_d,
+                    S_v, H, tail, 1, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+            }
+            return;
+        }
+    }
+#endif
 
     {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
