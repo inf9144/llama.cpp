@@ -208,6 +208,8 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*n_prompt*/) {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1024,6 +1026,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // block-internal attention
     bool causal_attn = false;
 
+    int32_t ingest_window = 0;
+    std::vector<llama_pos> ingest_from;
+    std::vector<llama_pos> ingest_prompt_end;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1079,6 +1085,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        // DFlash uses a standard SWA mask, and KV injection projects each target row independently at every layer.
+        const char * tail_env = getenv("LLAMA_DFLASH_INGEST_TAIL");
+        const int32_t n_swa = llama_model_n_swa(model_dft);
+        if (is_dflash2 && (tail_env == nullptr || atoi(tail_env) != 0) && n_swa > 0 &&
+                llama_model_n_layer_swa(model_dft) == llama_model_n_layer(model_dft)) {
+            ingest_window = n_swa;
+        }
+        ingest_from.assign(n_seq, 0);
+        ingest_prompt_end.assign(n_seq, -1);
+
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
             const bool has_conf =
@@ -1093,6 +1109,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (ingest_window > 0) {
+            LOG_INF("%s: - prompt ingestion limited to the last %d positions (all draft layers use SWA)\n", __func__, ingest_window);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1181,16 +1200,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
+    void set_prompt_end(llama_seq_id seq_id, llama_pos n_prompt) override {
+        if (ingest_window > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            ingest_from[seq_id] = std::max<llama_pos>(0, n_prompt - ingest_window);
+            ingest_prompt_end[seq_id] = n_prompt;
+        }
+    }
+
+    void end_prompt(llama_seq_id seq_id) {
+        ingest_from[seq_id] = 0;
+        ingest_prompt_end[seq_id] = -1;
+    }
+
     bool fill_gap(llama_seq_id seq_id, llama_pos pos_end) {
         auto * ctx_dft = params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
         if (pos_max >= pos_end - 1) {
             return true;
         }
+        const llama_pos pos_start = std::max(pos_max + 1, ingest_from[seq_id]);
+        // Drop a stale cached prefix before jumping to the tail. Only M-RoPE gaps inside the tail need filling.
+        if (pos_max >= 0 && pos_max + 1 < pos_start && !llama_memory_seq_rm(mem_dft, seq_id, -1, -1)) {
+            return false;
+        }
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
-        LOG_DBG("%s: filling draft cache gap [%d, %d) for seq %d\n", __func__, pos_max + 1, pos_end, seq_id);
+        LOG_DBG("%s: filling draft cache gap [%d, %d) for seq %d\n", __func__, pos_start, pos_end, seq_id);
 
-        for (llama_pos pos = pos_max + 1; pos < pos_end;) {
+        for (llama_pos pos = pos_start; pos < pos_end;) {
             const int32_t n_chunk = std::min(n_ubatch, pos_end - pos);
             features_buf.assign((size_t) n_chunk * n_embd_enc, 0.0f);
             batch_inject.clear();
@@ -1240,6 +1277,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // Skip unused prompt rows before reading target features, whose getters synchronize the target.
+        bool any = false;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            while (i_batch_beg[seq_id] >= 0 && i_batch_beg[seq_id] <= i_batch_end[seq_id] &&
+                    batch_in.tokens[i_batch_beg[seq_id]].pos[0] < ingest_from[seq_id]) {
+                ++i_batch_beg[seq_id];
+            }
+            if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                i_batch_beg[seq_id] = -1;
+            }
+            any |= i_batch_beg[seq_id] >= 0;
+        }
+        if (!any) {
+            return true;
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
@@ -1253,6 +1306,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (!fill_gap(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0])) {
                 return false;
+            }
+            if (ingest_prompt_end[seq_id] >= 0 && batch_in.tokens[i_batch_end[seq_id]].pos[0] >= ingest_prompt_end[seq_id]) {
+                end_prompt(seq_id);
             }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
@@ -1332,6 +1388,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (!fill_gap(seq_id, n)) {
                 throw std::runtime_error("DFlash: failed to fill draft cache gap before drafting");
             }
+            end_prompt(seq_id);
 
             const int32_t n_draft = params.n_max;
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
@@ -2985,6 +3042,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_prompt_end(seq_id, n_prompt);
     }
 }
 
