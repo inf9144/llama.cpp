@@ -272,16 +272,26 @@ the HIP test program, and is not intended for production.
 Branch: `feature/rocm-malloc-stage-pool` (based on
 `diagnostics/rocm-checkpoint-fault`).
 
-Unlike the existing synchronous diagnostic `GGML_ROCM_CKPT_PINNED_STAGE`+
-`GGML_ROCM_CKPT_MALLOC_STAGE`, the new host staging path uses **ordinary
-anonymous malloc memory**, a **bounded per-backend reuse pool**, and one
-**HIP event per in-flight slot**. Host staging memory is not recycled until
-its stream copy has completed. Copies are enqueued on the original backend
-stream with no per-copy `hipStreamSynchronize` (unless a single copy exceeds
-the selected budget, or the pool is under memory pressure and must wait for
-a previously submitted transfer).
+The existing `GGML_ROCM_MALLOC_STAGE_POOL` switch enables a **bounded
+per-backend staging pool**. The pool now prefers `hipHostMalloc` pinned host
+memory so H2D transfers can overlap other work. If a pinned allocation fails,
+new slots fall back to ordinary pageable `malloc` memory and a warning is
+logged; existing pinned slots remain usable. The original file-backed mmap is
+read by the CPU into these buffers, and is never submitted as the HIP source
+on this path. The switch name and RAM budget remain unchanged.
 
-In Fish, with all previous `GGML_ROCM_CKPT_*` staging switches disabled:
+Each slot has a completion event and is reused only after its transfer has
+finished. Idle fits are reused without querying other events. Under pressure,
+the pool waits for the oldest submitted transfer and searches again before
+freeing a slot. Transfers larger than the budget are split into chunks of at
+most 64 MiB (or the budget, when smaller), with no oversized allocation or
+per-transfer stream synchronization. Pool pressure can still require an event
+wait before a chunk reuses its source buffer.
+
+The old synchronous diagnostic staging path still has precedence when its
+filter matches. Disable those staging switches when testing the pool:
+
+In Fish:
 
 ```fish
 set -e GGML_ROCM_CKPT_PINNED_STAGE
@@ -304,22 +314,31 @@ associated with expert transfers. Remove the `TENSOR` variable to stage
 **all** `set_tensor_async` H2D calls. The pool budget is **per backend**;
 two GPUs may therefore reserve up to ~1024 MiB combined with the 512-MiB
 setting. The pool starts empty and grows as needed, with 64-KiB granularity.
+The cap covers pinned and pageable pool buffers together, including chunks
+of oversized uploads.
 
 Optional `GGML_ROCM_MALLOC_STAGE_POOL_TRACE=1` logs individual transfers.
-By default the pool logs a summary at first use and every 4096 transfers:
+By default the pool logs a summary at first use and every 65,536 logical uploads:
 
 ```text
 [rocm-malloc-pool] enabled dev=0 budget=512 MiB filter=ffn_
-[rocm-malloc-pool] copies=... reuses=... waits=... slots=... reserved=... MiB
+[rocm-malloc-pool] copies=... reuses=... waits=... slots=... reserved=... MiB pinned=... MiB transfers=... queries=... chunked=...
 ```
 
 This is **experimental**, not tested against physical ROCm hardware in the
-authoring environment. Compare correctness and throughput against the
+authoring environment. Targeted host-only checks with simulated delayed HIP
+copies/events cover reuse after waits, submission order, allocation fallback,
+budgeted chunking, two streams and teardown; these do not validate HIP runtime
+behavior or performance. The checks use the production pool definition with
+AddressSanitizer and UndefinedBehaviorSanitizer. A HIP build and GPU validation
+remain for the target machine. Compare correctness and throughput against the
 previous synchronous malloc-staging mode and Vulkan. An event only fences
-the anonymous-source buffer; it does not prevent unrelated driver/kernel
+the staging-source buffer; it does not prevent unrelated driver/kernel
 faults. Bounded memory means the implementation can wait for completion
-under pressure, and fast asynchronous transfers are not guaranteed when
-ROCm internally stages pageable host buffers.
+under pressure, and fast asynchronous transfers are not guaranteed on the
+pageable allocation fallback. `pinned` reports pinned bytes within `reserved`,
+`transfers` counts submitted H2D chunks, and `chunked` counts logical uploads
+that exceeded the pool budget.
 
 Disable via `set -e GGML_ROCM_MALLOC_STAGE_POOL`. The original synchronous
 experiment flags remain available and unchanged.
