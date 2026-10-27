@@ -82,6 +82,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
