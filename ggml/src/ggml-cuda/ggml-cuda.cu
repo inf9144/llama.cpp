@@ -759,59 +759,54 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 #if defined(GGML_USE_HIP)
-// Experimental pool of ANONYMOUS, pageable malloc memory for ROCm H2D uploads.
-// A host slot is not reused until its HIP event signals completion. The
-// existing direct GGUF mmap H2D path is left untouched when the feature is off.
+// Bounded host staging for ROCm H2D uploads. Prefer pinned memory and keep
+// each slot alive until its transfer event completes.
 struct ggml_rocm_malloc_stage_slot {
     void * data = nullptr;
     size_t capacity = 0;
     cudaEvent_t done = nullptr;
+    uint64_t submitted = 0;
     bool in_flight = false;
+    bool pinned = false;
 };
 
 struct ggml_rocm_malloc_stage_pool {
     std::vector<ggml_rocm_malloc_stage_slot> slots;
     size_t reserved_bytes = 0;
+    size_t pinned_bytes = 0;
+    bool try_pinned = true;
     uint64_t copies = 0;
+    uint64_t transfers = 0;
     uint64_t reuses = 0;
     uint64_t waits = 0;
+    uint64_t queries = 0;
+    uint64_t chunked = 0;
 
     ~ggml_rocm_malloc_stage_pool() {
         for (auto & slot : slots) {
             if (slot.in_flight) {
                 CUDA_CHECK(cudaEventSynchronize(slot.done));
+                slot.in_flight = false;
             }
-            if (slot.done != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(slot.done));
-            }
-            std::free(slot.data);
+            release(slot);
         }
     }
 
-    void copy(cudaStream_t stream, void * dst, const void * src, size_t size, size_t limit_bytes, bool trace) {
-        constexpr size_t granularity = 64 * 1024;
-        const size_t capacity = size <= SIZE_MAX - (granularity - 1)
-            ? (size + granularity - 1) & ~(granularity - 1) : size;
-
-        // A transfer larger than the configured budget uses a temporary
-        // allocation and a one-off sync, rather than breaking the pool limit.
-        if (capacity > limit_bytes) {
-            void * staging = std::malloc(size);
-            GGML_ASSERT(staging != nullptr);
-            std::memcpy(staging, src, size);
-            CUDA_CHECK(cudaMemcpyAsync(dst, staging, size, cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::free(staging);
-            GGML_LOG_WARN("[rocm-malloc-pool] oversize transfer: %zu bytes (pool cap %zu), synchronized fallback\n",
-                          size, limit_bytes);
-            return;
+    void release(ggml_rocm_malloc_stage_slot & slot) {
+        GGML_ASSERT(!slot.in_flight);
+        CUDA_CHECK(cudaEventDestroy(slot.done));
+        if (slot.pinned) {
+            CUDA_CHECK(cudaFreeHost(slot.data));
+            pinned_bytes -= slot.capacity;
+        } else {
+            std::free(slot.data);
         }
+        reserved_bytes -= slot.capacity;
+    }
 
-        // A free slot is reusable only after its transfer has completed.
-        for (auto & slot : slots) {
-            if (!slot.in_flight) {
-                continue;
-            }
+    bool completed(ggml_rocm_malloc_stage_slot & slot) {
+        if (slot.in_flight) {
+            ++queries;
             const hipError_t status = hipEventQuery(slot.done);
             if (status == hipSuccess) {
                 slot.in_flight = false;
@@ -819,66 +814,125 @@ struct ggml_rocm_malloc_stage_pool {
                 CUDA_CHECK(status);
             }
         }
+        return !slot.in_flight;
+    }
 
-        // Best fit: avoid growing the pool when an existing slot fits.
-        size_t selected = slots.size();
-        for (size_t i = 0; i < slots.size(); ++i) {
-            if (!slots[i].in_flight && slots[i].capacity >= capacity &&
-                (selected == slots.size() || slots[i].capacity < slots[selected].capacity)) {
-                selected = i;
+    size_t acquire(size_t capacity, size_t limit_bytes) {
+        GGML_ASSERT(capacity <= limit_bytes);
+        for (;;) {
+            size_t selected = slots.size();
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (!slots[i].in_flight && slots[i].capacity >= capacity &&
+                    (selected == slots.size() || slots[i].capacity < slots[selected].capacity)) {
+                    selected = i;
+                }
             }
-        }
+            if (selected != slots.size()) {
+                ++reuses;
+                return selected;
+            }
 
-        if (selected != slots.size()) {
-            ++reuses;
-        } else {
-            // Evict idle slots as needed. If all are still in flight, wait for
-            // one completion instead of exceeding the RAM budget.
-            while (reserved_bytes > limit_bytes - capacity) {
-                size_t idle = slots.size();
-                for (size_t i = 0; i < slots.size(); ++i) {
-                    if (!slots[i].in_flight &&
-                        (idle == slots.size() || slots[i].capacity > slots[idle].capacity)) {
-                        idle = i;
+            // Query only potential reuse candidates; an idle fit needs no HIP calls.
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i].capacity >= capacity && completed(slots[i])) {
+                    ++reuses;
+                    return i;
+                }
+            }
+
+            if (reserved_bytes <= limit_bytes - capacity) {
+                ggml_rocm_malloc_stage_slot slot;
+                slot.capacity = capacity;
+                if (try_pinned) {
+                    const hipError_t status = hipHostMalloc(&slot.data, capacity, hipHostMallocDefault);
+                    if (status == hipSuccess) {
+                        slot.pinned = true;
+                    } else {
+                        // Avoid retrying a failed pin allocation for every new slot.
+                        try_pinned = false;
+                        slot.data = nullptr;
+                        (void) hipGetLastError();
+                        GGML_LOG_WARN("[rocm-malloc-pool] pinned allocation failed (%s); new slots use pageable RAM\n",
+                                      hipGetErrorString(status));
                     }
                 }
-                if (idle == slots.size()) {
-                    GGML_ASSERT(!slots.empty());
-                    CUDA_CHECK(cudaEventSynchronize(slots.front().done));
-                    slots.front().in_flight = false;
-                    ++waits;
-                    continue;
+                if (!slot.pinned) {
+                    slot.data = std::malloc(capacity);
+                    GGML_ASSERT(slot.data != nullptr);
                 }
-                CUDA_CHECK(cudaEventDestroy(slots[idle].done));
-                std::free(slots[idle].data);
-                reserved_bytes -= slots[idle].capacity;
-                slots.erase(slots.begin() + idle);
+                CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+                slots.push_back(slot);
+                reserved_bytes += capacity;
+                if (slot.pinned) {
+                    pinned_bytes += capacity;
+                }
+                return slots.size() - 1;
             }
 
-            ggml_rocm_malloc_stage_slot slot;
-            slot.data = std::malloc(capacity);
-            GGML_ASSERT(slot.data != nullptr);
-            slot.capacity = capacity;
-            CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
-            slots.push_back(slot);
-            reserved_bytes += capacity;
-            selected = slots.size() - 1;
+            // Reclaim undersized idle slots only when the budget requires it.
+            size_t idle = slots.size();
+            size_t oldest = slots.size();
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i].capacity < capacity) {
+                    completed(slots[i]);
+                }
+                if (!slots[i].in_flight) {
+                    if (idle == slots.size() || slots[i].capacity > slots[idle].capacity) {
+                        idle = i;
+                    }
+                } else if (oldest == slots.size() || slots[i].submitted < slots[oldest].submitted) {
+                    oldest = i;
+                }
+            }
+            if (idle != slots.size()) {
+                release(slots[idle]);
+                slots.erase(slots.begin() + idle);
+                continue;
+            }
+
+            GGML_ASSERT(oldest != slots.size());
+            CUDA_CHECK(cudaEventSynchronize(slots[oldest].done));
+            slots[oldest].in_flight = false;
+            ++waits;
+            // Search again before eviction: the completed slot may already fit.
         }
+    }
 
-        ggml_rocm_malloc_stage_slot & slot = slots[selected];
-        GGML_ASSERT(!slot.in_flight && slot.capacity >= size);
-        std::memcpy(slot.data, src, size);
-        CUDA_CHECK(cudaMemcpyAsync(dst, slot.data, size, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaEventRecord(slot.done, stream));
-        slot.in_flight = true;
+    void copy(cudaStream_t stream, void * dst, const void * src, size_t size, size_t limit_bytes, bool trace) {
+        if (size == 0) {
+            return;
+        }
+        constexpr size_t granularity = 64 * 1024;
+        constexpr size_t chunk_max = 64 * 1024 * 1024;
+        GGML_ASSERT(limit_bytes >= granularity && limit_bytes % granularity == 0);
+        GGML_ASSERT(limit_bytes <= SIZE_MAX - (granularity - 1));
+        const size_t chunk_limit = size > limit_bytes ? std::min(limit_bytes, chunk_max) : size;
+        if (size > limit_bytes) {
+            ++chunked;
+        }
+        for (size_t offset = 0; offset < size;) {
+            const size_t n = std::min(size - offset, chunk_limit);
+            const size_t capacity = (n + granularity - 1) & ~(granularity - 1);
+            const size_t selected = acquire(capacity, limit_bytes);
+            auto & slot = slots[selected];
+            GGML_ASSERT(!slot.in_flight && slot.capacity >= n);
+            std::memcpy(slot.data, (const char *) src + offset, n);
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst + offset, slot.data, n, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaEventRecord(slot.done, stream));
+            slot.in_flight = true;
+            slot.submitted = ++transfers;
+            if (trace) {
+                GGML_LOG_INFO("[rocm-malloc-pool] copy=%" PRIu64 " offset=%zu size=%zu original=%p staged=%p dst=%p pinned=%d slots=%zu reserved=%.1f MiB\n",
+                              copies + 1, offset, n, (const char *) src + offset, slot.data, (char *) dst + offset,
+                              int(slot.pinned), slots.size(), reserved_bytes / 1048576.0);
+            }
+            offset += n;
+        }
         ++copies;
-
-        if (trace) {
-            GGML_LOG_INFO("[rocm-malloc-pool] copy=%" PRIu64 " size=%zu original=%p staged=%p dst=%p active_slots=%zu reserved=%.1f MiB\n",
-                          copies, size, src, slot.data, dst, slots.size(), reserved_bytes / 1048576.0);
-        } else if (copies == 1 || copies % 65536 == 0) {
-            GGML_LOG_INFO("[rocm-malloc-pool] copies=%" PRIu64 " reuses=%" PRIu64 " waits=%" PRIu64 " slots=%zu reserved=%.1f MiB\n",
-                          copies, reuses, waits, slots.size(), reserved_bytes / 1048576.0);
+        if (!trace && (copies == 1 || copies % 65536 == 0)) {
+            GGML_LOG_INFO("[rocm-malloc-pool] copies=%" PRIu64 " reuses=%" PRIu64 " waits=%" PRIu64 " slots=%zu reserved=%.1f MiB pinned=%.1f MiB transfers=%" PRIu64 " queries=%" PRIu64 " chunked=%" PRIu64 "\n",
+                          copies, reuses, waits, slots.size(), reserved_bytes / 1048576.0, pinned_bytes / 1048576.0,
+                          transfers, queries, chunked);
         }
     }
 };
@@ -2841,9 +2895,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         return;
     }
 
-    // Optional bounded malloc staging. Unlike the earlier diagnostic mode,
-    // this path does not synchronize the entire stream on every H2D copy.
-    // Each reused slot is protected by a per-copy completion event.
+    // Bounded staging prefers pinned host memory, with pageable allocation fallback.
+    // Completion events protect slot reuse; oversize uploads use bounded chunks.
     static const bool malloc_pool_enabled = ggml_cuda_env_flag("GGML_ROCM_MALLOC_STAGE_POOL");
     static const int malloc_pool_mib = std::max(1, std::min(4096,
         ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL_MIB", 512)));
