@@ -19,8 +19,24 @@ This is a source port for review; GPU correctness and performance still require 
 * `n_rs_batch` carries the existing speculator's maximum verify width into the graph; it adds no CLI flag or environment variable. Verify batches up to this bound stay sequential. API callers leaving it zero use snapshot depth as the bound. Rebuild native API clients against the changed context-parameter struct and GDN operation signature.
 * MMB selects the actual `ctx.device`, requires contiguous operands, `K % 256 == 0`, `M % 128 == 0` and at least 512 activation rows/tokens. Routed descriptors stay within the stock IDs helper limits. Negative expert IDs leave zero output. Conversions and descriptors live only in the existing operation scratch pool.
 * Derived masks are probed automatically on a CUDA/ROCm device. Only single-stream, single-sequence prefill without ALiBi or nondegenerate M-RoPE is eligible. Meta devices, unsupported backends and other shapes keep packed masks. The graph reserves packed-mask fallback space where reachable. Vulkan and the other FA backends without compact-mask loaders explicitly reject derived-mask nodes.
-* All GDN rollback state, stock MoE caching, SSD prompt-cache, DFlash2 vision and tail-ingest interfaces are retained. No Stew MoE cache, slab allocator, dynamic VRAM budget or persistent conversion/staging cache is added.
+* All GDN rollback state, stock MoE caching, SSD prompt-cache, DFlash2 vision and tail-ingest interfaces are retained. No Stew MoE cache, slab allocator, dynamic VRAM budget or persistent conversion cache is added.
 * FA template instances are split by head/type or head/geometry. The generator is byte-reproducible (238 files) and emits matching extern declarations to avoid duplicate implicit kernel instantiations and bound compiler memory. WMMA device bodies for heads above 256 are discarded because the existing RDNA selector never uses them; the host launcher asserts that limit.
+
+## ROCm host staging pool
+
+The pool is enabled by default on ROCm/HIP with a 512 MiB budget per backend context and no tensor filter. No environment settings are required. It copies async host-to-device uploads into private pinned host buffers before submitting them to HIP. It reuses completed buffers, waits for the oldest submission under pressure, and splits uploads larger than the budget into chunks of at most 64 MiB. If a pinned allocation fails, subsequent allocations use pageable malloc buffers; existing pinned buffers remain usable. Completion events protect every buffer until its transfer finishes.
+
+Optional overrides:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GGML_ROCM_MALLOC_STAGE_POOL` | `1` | Set to `0` to disable staging. |
+| `GGML_ROCM_MALLOC_STAGE_POOL_MIB` | `512` | Host buffer budget per backend context, clamped to 1..4096 MiB. |
+| `GGML_ROCM_MALLOC_STAGE_POOL_TENSOR` | unset | Restrict staging to tensor names containing this substring. |
+
+For example, `set -gx GGML_ROCM_MALLOC_STAGE_POOL_TENSOR ffn_` restricts staging to FFN tensor names in fish. Remove that restriction with `set -eg GGML_ROCM_MALLOC_STAGE_POOL_TENSOR`. Synchronous uploads, 2-D uploads, device-to-device copies and other backends keep their existing paths. Configuration is read once per process.
+
+Only these three pool settings are supported. The production integration excludes the checkpoint diagnostics, GALLOCR identity/signature checks and invalidation workaround, upload controls, reproducer tool, trace switch and periodic pool statistics. Normal graph allocation recovery needed by embedding and vision paths is retained.
 
 ## Validation in this environment
 

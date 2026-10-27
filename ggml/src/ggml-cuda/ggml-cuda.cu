@@ -758,9 +758,167 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#if defined(GGML_USE_HIP)
+// Keep private host buffers alive until their HIP copy completion events signal.
+struct ggml_rocm_malloc_stage_slot {
+    void * data = nullptr;
+    size_t capacity = 0;
+    cudaEvent_t done = nullptr;
+    uint64_t submitted = 0;
+    bool in_flight = false;
+    bool pinned = false;
+};
+
+struct ggml_rocm_malloc_stage_pool {
+    std::vector<ggml_rocm_malloc_stage_slot> slots;
+    size_t reserved_bytes = 0;
+    bool try_pinned = true;
+    uint64_t submissions = 0;
+
+    ~ggml_rocm_malloc_stage_pool() {
+        for (auto & slot : slots) {
+            if (slot.in_flight) {
+                CUDA_CHECK(cudaEventSynchronize(slot.done));
+                slot.in_flight = false;
+            }
+            release(slot);
+        }
+    }
+
+    void release(ggml_rocm_malloc_stage_slot & slot) {
+        GGML_ASSERT(!slot.in_flight);
+        CUDA_CHECK(cudaEventDestroy(slot.done));
+        if (slot.pinned) {
+            CUDA_CHECK(cudaFreeHost(slot.data));
+        } else {
+            std::free(slot.data);
+        }
+        reserved_bytes -= slot.capacity;
+    }
+
+    bool completed(ggml_rocm_malloc_stage_slot & slot) {
+        if (slot.in_flight) {
+            const hipError_t status = hipEventQuery(slot.done);
+            if (status == hipSuccess) {
+                slot.in_flight = false;
+            } else if (status != hipErrorNotReady) {
+                CUDA_CHECK(status);
+            }
+        }
+        return !slot.in_flight;
+    }
+
+    size_t acquire(size_t capacity, size_t limit_bytes) {
+        GGML_ASSERT(capacity <= limit_bytes);
+        for (;;) {
+            size_t selected = slots.size();
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (!slots[i].in_flight && slots[i].capacity >= capacity &&
+                    (selected == slots.size() || slots[i].capacity < slots[selected].capacity)) {
+                    selected = i;
+                }
+            }
+            if (selected != slots.size()) {
+                return selected;
+            }
+
+            // Query only potential reuse candidates; an idle fit needs no HIP calls.
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i].capacity >= capacity && completed(slots[i])) {
+                    return i;
+                }
+            }
+
+            if (reserved_bytes <= limit_bytes - capacity) {
+                ggml_rocm_malloc_stage_slot slot;
+                slot.capacity = capacity;
+                if (try_pinned) {
+                    const hipError_t status = hipHostMalloc(&slot.data, capacity, hipHostMallocDefault);
+                    if (status == hipSuccess) {
+                        slot.pinned = true;
+                    } else {
+                        // Avoid retrying a failed pin allocation for every new slot.
+                        try_pinned = false;
+                        slot.data = nullptr;
+                        (void) hipGetLastError();
+                        GGML_LOG_WARN("[rocm-malloc-pool] pinned allocation failed (%s); new slots use pageable RAM\n",
+                                      hipGetErrorString(status));
+                    }
+                }
+                if (!slot.pinned) {
+                    slot.data = std::malloc(capacity);
+                    GGML_ASSERT(slot.data != nullptr);
+                }
+                CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
+                slots.push_back(slot);
+                reserved_bytes += capacity;
+                return slots.size() - 1;
+            }
+
+            // Reclaim undersized idle slots only when the budget requires it.
+            size_t idle = slots.size();
+            size_t oldest = slots.size();
+            for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i].capacity < capacity) {
+                    completed(slots[i]);
+                }
+                if (!slots[i].in_flight) {
+                    if (idle == slots.size() || slots[i].capacity > slots[idle].capacity) {
+                        idle = i;
+                    }
+                } else if (oldest == slots.size() || slots[i].submitted < slots[oldest].submitted) {
+                    oldest = i;
+                }
+            }
+            if (idle != slots.size()) {
+                release(slots[idle]);
+                slots.erase(slots.begin() + idle);
+                continue;
+            }
+
+            GGML_ASSERT(oldest != slots.size());
+            CUDA_CHECK(cudaEventSynchronize(slots[oldest].done));
+            slots[oldest].in_flight = false;
+            // Search again before eviction: the completed slot may already fit.
+        }
+    }
+
+    void copy(cudaStream_t stream, void * dst, const void * src, size_t size, size_t limit_bytes) {
+        if (size == 0) {
+            return;
+        }
+        constexpr size_t granularity = 64 * 1024;
+        constexpr size_t chunk_max = 64 * 1024 * 1024;
+        GGML_ASSERT(limit_bytes >= granularity && limit_bytes % granularity == 0);
+        GGML_ASSERT(limit_bytes <= SIZE_MAX - (granularity - 1));
+        const size_t chunk_limit = size > limit_bytes ? std::min(limit_bytes, chunk_max) : size;
+        for (size_t offset = 0; offset < size;) {
+            const size_t n = std::min(size - offset, chunk_limit);
+            const size_t capacity = (n + granularity - 1) & ~(granularity - 1);
+            const size_t selected = acquire(capacity, limit_bytes);
+            auto & slot = slots[selected];
+            GGML_ASSERT(!slot.in_flight && slot.capacity >= n);
+            std::memcpy(slot.data, (const char *) src + offset, n);
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst + offset, slot.data, n, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaEventRecord(slot.done, stream));
+            slot.in_flight = true;
+            slot.submitted = ++submissions;
+            offset += n;
+        }
+    }
+};
+#endif // defined(GGML_USE_HIP)
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if defined(GGML_USE_HIP)
+    if (rocm_malloc_stage_pool != nullptr) {
+        ggml_cuda_set_device(device);
+        delete rocm_malloc_stage_pool;
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2679,6 +2837,26 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+#if defined(GGML_USE_HIP)
+    static const bool malloc_pool_enabled = ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL", 1) != 0;
+    static const int malloc_pool_mib = std::max(1, std::min(4096,
+        ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL_MIB", 512)));
+    static const char * malloc_pool_filter = getenv("GGML_ROCM_MALLOC_STAGE_POOL_TENSOR");
+    if (malloc_pool_enabled && size > 0 &&
+        (malloc_pool_filter == nullptr || malloc_pool_filter[0] == 0 ||
+         std::strstr(tensor->name, malloc_pool_filter) != nullptr)) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        std::lock_guard<std::mutex> lock(cuda_ctx->rocm_malloc_stage_pool_mutex);
+        if (cuda_ctx->rocm_malloc_stage_pool == nullptr) {
+            cuda_ctx->rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
+        }
+        cuda_ctx->rocm_malloc_stage_pool->copy(cuda_ctx->stream(),
+            (char *) tensor->data + offset, data, size,
+            (size_t) malloc_pool_mib * 1024 * 1024);
+        return;
+    }
+#endif
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
