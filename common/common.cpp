@@ -20,6 +20,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1645,10 +1646,25 @@ void common_memory::init(llama_context * ctx_tgt, llama_context * ctx_dft) {
     this->ctx_dft = ctx_dft;
 }
 
+// Keep the verbose speculative/sequence diagnostics opt-in to avoid log spam
+// during token-by-token decode. Same switch as tools/server/server-context.cpp.
+static bool common_rocm_ckpt_diag_log_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_ROCM_CKPT_DIAG_LOG");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    // Temporary ROCm checkpoint diagnostics: identify the failing context independently.
+    if (common_rocm_ckpt_diag_log_enabled()) COM_INF("[rocm-ckpt-diag] seq_rm target BEGIN seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
     common_context_seq_rm(ctx_tgt, seq_id, p0, p1);
+    if (common_rocm_ckpt_diag_log_enabled()) COM_INF("[rocm-ckpt-diag] seq_rm target END seq=%d\n", seq_id);
     if (ctx_dft) {
+        if (common_rocm_ckpt_diag_log_enabled()) COM_INF("[rocm-ckpt-diag] seq_rm draft BEGIN seq=%d p0=%d p1=%d\n", seq_id, p0, p1);
         common_context_seq_rm(ctx_dft, seq_id, p0, p1);
+        if (common_rocm_ckpt_diag_log_enabled()) COM_INF("[rocm-ckpt-diag] seq_rm draft END seq=%d\n", seq_id);
     }
 }
 

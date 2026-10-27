@@ -1461,10 +1461,21 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#if defined(GGML_USE_HIP)
+struct ggml_rocm_malloc_stage_pool;
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+#if defined(GGML_USE_HIP)
+    // Experimental anonymous-memory staging pool. Per-backend synchronization
+    // protects host buffers until their HIP copy completion events signal.
+    ggml_rocm_malloc_stage_pool * rocm_malloc_stage_pool = nullptr;
+    std::mutex rocm_malloc_stage_pool_mutex;
+#endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

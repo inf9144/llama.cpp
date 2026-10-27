@@ -16,11 +16,22 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// Opt-in, low-level ROCm diagnostics for the checkpoint fault investigation.
+// Keep the normal execution path unchanged unless explicitly enabled.
+static bool llama_rocm_checkpoint_deep_diag() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_ROCM_CKPT_DIAG_DEEP");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 //
 // llama_context
@@ -1707,10 +1718,19 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] ubatch BEGIN n=%u mctx=%d\n", ubatch.n_tokens, (int) (mctx != nullptr));
+    }
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] memory apply BEGIN n=%u\n", ubatch.n_tokens);
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] memory apply END n=%u\n", ubatch.n_tokens);
     }
 
     const bool text_graph = ubatch.token && !ubatch.is_mixed() && gtype == ctx_type_to_graph_type(cparams.ctx_type);
@@ -1750,7 +1770,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] build_graph BEGIN n=%u\n", ubatch.n_tokens);
+        }
         gf = model.build_graph(gparams);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] build_graph END n=%u ok=%d\n", ubatch.n_tokens, (int) (gf != nullptr));
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1760,7 +1786,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] alloc_graph BEGIN n=%u\n", ubatch.n_tokens);
+        }
+        const bool graph_allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] alloc_graph END n=%u ok=%d\n", ubatch.n_tokens, (int) graph_allocated);
+        }
+        if (!graph_allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1769,17 +1802,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] graph ready n=%u\n", ubatch.n_tokens);
+    }
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
 
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] set_inputs BEGIN n=%u\n", ubatch.n_tokens);
+        }
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] set_inputs END n=%u\n", ubatch.n_tokens);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] graph_compute BEGIN n=%u\n", ubatch.n_tokens);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] graph_compute END n=%u status=%d\n", ubatch.n_tokens, (int) status);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2129,12 +2177,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] memory_update BEGIN n=%u\n", n_tokens_all);
+    }
     memory_update(false);
+    if (llama_rocm_checkpoint_deep_diag()) {
+        LLAMA_LOG_INFO("[rocm-ckpt-deep] memory_update END n=%u\n", n_tokens_all);
+    }
 
     llama_memory_context_ptr mctx;
 
     while (true) {
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] init_batch BEGIN n=%u ubatch=%u\n", n_tokens_all, cparams.n_ubatch);
+        }
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] init_batch END exists=%d status=%d\n",
+                    (int) (mctx != nullptr), mctx ? (int) mctx->get_status() : -1);
+        }
         if (!mctx) {
             return -2;
         }
@@ -2211,7 +2272,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] process_ubatch BEGIN n=%u prev=%" PRId64 "\n",
+                    ubatch.n_tokens, n_tokens_prev);
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (llama_rocm_checkpoint_deep_diag()) {
+            LLAMA_LOG_INFO("[rocm-ckpt-deep] process_ubatch END n=%u result=%d status=%d\n",
+                    ubatch.n_tokens, (int) (res != nullptr), (int) status);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
