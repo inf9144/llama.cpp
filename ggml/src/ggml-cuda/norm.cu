@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include <cstdint>
+#include <cstring>
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -383,6 +384,115 @@ static void group_norm_f32_cuda(
     }
 }
 
+// Adapted from Stew's narrow-row norm: eight independent wave32 rows per block.
+// Keep the current vector kernel's float4 sums and reduction tree, including its
+// second reduction for 129..256 columns. The older scalar tree is not equivalent.
+template <bool do_multiply, bool do_scale, bool do_gate>
+static __global__ void __launch_bounds__(256) rms_norm_rows_f32(
+        const float * x, const float * mul, const float * gate, float * dst,
+        const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t total_rows,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float scale_out) {
+    const int lane = threadIdx.x;
+    const int64_t g = int64_t(blockIdx.x)*blockDim.y + threadIdx.y;
+    if (g >= total_rows) {
+        return;
+    }
+    const int64_t row = g % nrows;
+    const int64_t channel = (g / nrows) % nchannels;
+    const int64_t sample = g / (nrows*nchannels);
+    const auto * x4 = (const float4 *) (x + sample*stride_sample + channel*stride_channel + row*stride_row);
+    auto * dst4 = (float4 *) (dst + g*ncols);
+    const auto * mul4 = (const float4 *) mul;
+    const auto * gate4 = (const float4 *) gate;
+    float4 xs[2];
+    float part[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        if (k == 0 || ncols > 128) {
+            const int col = lane + k*WARP_SIZE;
+            float sum = 0.0f;
+            if (col < ncols/4) {
+                xs[k] = x4[col];
+                sum += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+            }
+            part[k] = warp_reduce_sum(sum);
+        }
+    }
+    float sum = part[0];
+    if (ncols > 128) {
+        sum = lane == 0 ? part[0] : lane == 1 ? part[1] : 0.0f;
+        sum = warp_reduce_sum(sum);
+    }
+    const float scale = rsqrtf(sum / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int col = lane + k*WARP_SIZE;
+        if (col < ncols/4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            if constexpr (do_multiply) {
+                const float4 m = mul4[col];
+                r.x *= m.x; r.y *= m.y; r.z *= m.z; r.w *= m.w;
+            }
+            if constexpr (do_scale) {
+                r.x *= scale_out; r.y *= scale_out; r.z *= scale_out; r.w *= scale_out;
+            }
+            if constexpr (do_gate) {
+                const float4 z = gate4[g*(ncols/4) + col];
+                r.x *= 1.0f / (1.0f + expf(-z.x));
+                r.y *= 1.0f / (1.0f + expf(-z.y));
+                r.z *= 1.0f / (1.0f + expf(-z.z));
+                r.w *= 1.0f / (1.0f + expf(-z.w));
+            }
+            dst4[col] = r;
+        }
+    }
+}
+
+static bool rms_norm_rows_shape(const ggml_tensor * x, const ggml_tensor * mul, const float * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_0(cc) || ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32 ||
+            x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[0] < 32 || x->ne[0] > 256 || x->ne[0] % 32 != 0 ||
+            !ggml_cuda_is_aligned(x, 16) || ((uintptr_t) dst & 15) != 0) {
+        return false;
+    }
+    return !mul || (mul->type == GGML_TYPE_F32 && ggml_is_vector(mul) &&
+            mul->ne[0] == x->ne[0] && ggml_cuda_is_aligned(mul, 16));
+}
+
+template <bool do_multiply, bool do_scale, bool do_gate>
+static void rms_norm_rows_launch(const ggml_tensor * x, const ggml_tensor * mul, const ggml_tensor * gate,
+        float * dst, float eps, float scale_out, cudaStream_t stream) {
+    const int64_t rows = ggml_nrows(x);
+    const dim3 block(WARP_SIZE, 8);
+    const dim3 grid((unsigned) ((rows + block.y - 1)/block.y));
+    const ggml_cuda_kernel_launch_params lp{ grid, block, 0, stream };
+    ggml_cuda_kernel_launch(rms_norm_rows_f32<do_multiply, do_scale, do_gate>, lp,
+            (const float *) x->data, mul ? (const float *) mul->data : nullptr,
+            gate ? (const float *) gate->data : nullptr, dst, (int) x->ne[0], x->ne[1], x->ne[2], rows,
+            (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
+            (int64_t) (x->nb[3]/sizeof(float)), eps, scale_out);
+}
+
+bool ggml_cuda_op_rms_norm_mul_sigmoid_fused(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * norm, const ggml_tensor * mul, const ggml_tensor * sigmoid, ggml_tensor * dst) {
+    const auto * x = norm->src[0];
+    const auto * w = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+    const auto * gate = sigmoid->src[0];
+    if (!w || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
+            !((dst->src[0] == mul && dst->src[1] == sigmoid) || (dst->src[1] == mul && dst->src[0] == sigmoid)) ||
+            mul->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(x, dst) || !ggml_are_same_shape(gate, dst) ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(dst) ||
+            !ggml_cuda_is_aligned(gate, 16) || !rms_norm_rows_shape(x, w, (float *) dst->data)) {
+        return false;
+    }
+    float eps;
+    std::memcpy(&eps, norm->op_params, sizeof(eps));
+    rms_norm_rows_launch<true, false, true>(x, w, gate, (float *) dst->data, eps, 1.0f, ctx.stream());
+    return true;
+}
+
 #define RMS_NORM_LAUNCH(BLOCK_SIZE, VPT, VEC) \
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
@@ -422,6 +532,13 @@ static void rms_norm_f32_dispatch(
     if constexpr (do_add) {
         vec = vec && add_ncols_packed.z == (uint32_t) ncols
             && ggml_cuda_is_aligned(add_t, 16);
+    }
+
+    if constexpr (!do_add) {
+        if (vec && ggml_nrows(x_t) >= 4096 && rms_norm_rows_shape(x_t, mul_t, dst)) {
+            rms_norm_rows_launch<do_multiply, do_scale, false>(x_t, mul_t, nullptr, dst, eps, scale_out, stream);
+            return;
+        }
     }
 
     const int n4 = ncols / 4;

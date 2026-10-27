@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -446,7 +447,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, inpL);
 
     // the QSA layers share one set of k-pool inputs
-    // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
+    // the backend also supports QSA's four-head lightning indexer
     llm_graph_input_kpool * inp_kpool = nullptr;
     if (mctx_idx && hparams.indexer_kpool > 0) {
         inp_kpool = build_inp_kpool(mctx_hyb);
@@ -657,6 +658,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    // Keep the ROCm norm -> weight -> sigmoid -> multiply fusion adjacent.
+    auto * dev = layer >= 0 ? model.dev_layer(layer) : nullptr;
+    if (dev && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+        ggml_build_forward_expand(gf, gate);
+    }
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);

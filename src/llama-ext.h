@@ -115,6 +115,11 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// DFlash2 feature transfer. Unsupported devices/layouts retain the embedding input path.
+LLAMA_API bool llama_dflash_init_device_inputs(struct llama_context * draft, struct llama_context * target);
+LLAMA_API const std::vector<int32_t> & llama_dflash_device_rows(const struct llama_context * target);
+LLAMA_API int32_t llama_dflash_inject_device(struct llama_context * draft, const struct llama_batch_ext * batch);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

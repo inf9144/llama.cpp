@@ -144,6 +144,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
     LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
+    LOG("  --test-dflash-device-inputs  Compare device-gather and host DFlash2 injection\n");
     LOG("  --test-dflash-vision     Test DFlash2 drafting across M-RoPE image positions\n");
     LOG("  --test-kq-derived       Compare compact mask inputs with the packed mask fill\n");
     LOG("  --test-dflash-tail       Test DFlash2 prompt tails, cache reuse and SWA guards\n");
@@ -1594,6 +1595,131 @@ static void test_dflash_tail_equivalence(
     }
 }
 
+// Exercise device staging/gathers on the CPU backend as a numerical oracle. This
+// deliberately calls the internal staging method: automatic CPU use stays off.
+static int test_dflash_device_inputs(size_t seed, float stdev) {
+    auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false);
+    const int32_t layers[] = { 0, 1 };
+    gguf_set_arr_data(draft_meta.get(), "dflash.target_layers", GGUF_TYPE_INT32, layers, 2);
+    gguf_set_val_u32(draft_meta.get(), "dflash.block_size", 4);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_kernel_size", 3);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_group_size", 8);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_rank", 8);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_top_k", 2);
+    gguf_set_val_u32(draft_meta.get(), "tokenizer.ggml.mask_token_id", 127);
+    const bool swa[] = { true, true };
+    gguf_set_arr_data(draft_meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, swa, 2);
+    auto mp = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { nullptr };
+    mp.devices = devices;
+    mp.n_gpu_layers = 0;
+    tensor_data_params data = { seed, stdev };
+    llama_model_ptr target(llama_model_init_from_user(target_meta.get(), set_tensor_data, &data, mp));
+    llama_model_ptr draft(llama_model_init_from_user(draft_meta.get(), set_tensor_data, &data, mp));
+    GGML_ASSERT(target && draft);
+    const int width = llama_model_n_embd(target.get());
+    const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+
+    for (auto kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 256;
+        cp.n_batch = 32;
+        cp.n_ubatch = 4;
+        cp.n_seq_max = 2;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.type_k = cp.type_v = kv;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr tgt(llama_init_from_model(target.get(), cp));
+        GGML_ASSERT(tgt);
+        for (int lid : layers) {
+            llama_set_embeddings_layer_inp(tgt.get(), lid, true);
+        }
+        GGML_ASSERT(tgt->prepare_layer_inputs_device(cpu));
+        cp.n_ubatch = 16;
+        cp.ctx_other = tgt.get();
+        llama_context_ptr host(llama_init_from_model(draft.get(), cp));
+        llama_context_ptr device(llama_init_from_model(draft.get(), cp));
+        GGML_ASSERT(host && device);
+        GGML_ASSERT(!llama_dflash_init_device_inputs(device.get(), tgt.get()));
+        for (auto * ctx : { host.get(), device.get() }) {
+            llama_set_causal_attn(ctx, false);
+            llama_set_embeddings_nextn(ctx, true, false);
+        }
+        int pos = 0;
+        for (int count : { 7, 1, 4 }) {
+            common_batch in(tgt.get());
+            for (int i = 0; i < count; ++i) {
+                // Interleaving forces the recurrent target to reorder rows across ubatches.
+                for (int seq = 0; seq < 2; ++seq) {
+                    in.add(1 + i, pos + i, seq, true);
+                }
+            }
+            GGML_ASSERT(llama_process(tgt.get(), LLAMA_PROCESS_TYPE_DECODE, in.get()) == 0);
+            // Logits access must not destroy the independent device-row mapping.
+            GGML_ASSERT(llama_get_logits_ith(tgt.get(), 0));
+            const auto & rows = llama_dflash_device_rows(tgt.get());
+            GGML_ASSERT(rows.size() == (size_t) in.size());
+            common_batch dev_in(device.get());
+            common_batch host_in(host.get());
+            std::vector<float> features((size_t) in.size()*width*2);
+            for (int k = 0; k < 2; ++k) {
+                const float * extracted = llama_get_embeddings_layer_inp(tgt.get(), layers[k]);
+                std::vector<float> raw((size_t) in.size()*width);
+                ggml_backend_tensor_get(tgt->get_layer_input_device(layers[k]), raw.data(), 0, raw.size()*sizeof(float));
+                for (int i = 0; i < in.size(); ++i) {
+                    GGML_ASSERT(memcmp(extracted + (size_t) i*width, raw.data() + (size_t) rows[i]*width, width*sizeof(float)) == 0);
+                    std::memcpy(features.data() + (size_t) i*width*2 + k*width,
+                            extracted + (size_t) i*width, width*sizeof(float));
+                }
+            }
+            for (int i = 0; i < in.size(); ++i) {
+                const auto & tok = in.tokens[i];
+                dev_in.add(rows[i], tok.pos[0], tok.seq_id, false);
+                const llama_pos p[4] = { tok.pos[0], tok.pos[0], tok.pos[0], 0 };
+                host_in.add_embd({ features.data() + (size_t) i*width*2, 1, (size_t) width*2 }, p, tok.seq_id, false);
+            }
+            GGML_ASSERT(llama_dflash_inject_device(device.get(), dev_in.get()) == 0);
+            GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
+            GGML_ASSERT(llama_process(host.get(), LLAMA_PROCESS_TYPE_DECODE, host_in.get()) == 0);
+            pos += count;
+            for (int seq = 0; seq < 2; ++seq) {
+                const size_t bytes = llama_state_seq_get_size(host.get(), seq);
+                std::vector<uint8_t> a(bytes), b(bytes);
+                GGML_ASSERT(bytes && llama_state_seq_get_size(device.get(), seq) == bytes);
+                GGML_ASSERT(llama_state_seq_get_data(host.get(), a.data(), bytes, seq) == bytes);
+                GGML_ASSERT(llama_state_seq_get_data(device.get(), b.data(), bytes, seq) == bytes);
+                GGML_ASSERT(a == b);
+            }
+            // Alternate row-index injections and noise token batches of the same width.
+            std::vector<float> lattice[2];
+            int which = 0;
+            for (auto * ctx : { host.get(), device.get() }) {
+                common_batch noise(ctx);
+                for (int seq = 0; seq < 2; ++seq) {
+                    for (int i = 0; i < 4; ++i) {
+                        noise.add(i == 0 ? 1 : 127, pos + i, seq, false);
+                    }
+                }
+                GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, noise.get()) == 0);
+                const auto * embd = llama_get_embeddings_nextn(ctx);
+                GGML_ASSERT(embd);
+                lattice[which++].assign(embd, embd + 8*llama_model_n_embd_out(draft.get()));
+                for (int seq = 0; seq < 2; ++seq) {
+                    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), seq, pos, -1));
+                }
+            }
+            GGML_ASSERT(lattice[0] == lattice[1]);
+        }
+        common_batch invalid(device.get());
+        invalid.add(31, pos, 0, false);
+        GGML_ASSERT(llama_dflash_inject_device(device.get(), invalid.get()) == -1);
+        GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
+        printf("DFlash2 device/host inputs: permuted rows, chunking, K/V bytes, selector lattice and graph-mode transitions KV=%s passed\n", ggml_type_name(kv));
+    }
+    return 0;
+}
+
 static int test_dflash_vision(size_t seed, float stdev, int tail_mode = -1) {
     recovery_log log;
     auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
@@ -2178,6 +2304,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool graph_recovery = false;
     bool layer_inputs = false;
+    bool dflash_device_inputs = false;
     bool dflash_vision = false;
     bool dflash_tail = false;
     bool kq_derived = false;
@@ -2252,6 +2379,8 @@ int main(int argc, char ** argv) {
             graph_recovery = true;
         } else if (strcmp(argv[i], "--test-layer-inputs") == 0) {
             layer_inputs = true;
+        } else if (strcmp(argv[i], "--test-dflash-device-inputs") == 0) {
+            dflash_device_inputs = true;
         } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
             dflash_vision = true;
         } else if (strcmp(argv[i], "--test-kq-derived") == 0) {
@@ -2283,6 +2412,9 @@ int main(int argc, char ** argv) {
                 }
             }
             return 0;
+        }
+        if (dflash_device_inputs) {
+            return test_dflash_device_inputs(seed, stdev);
         }
         if (dflash_vision) {
             return test_dflash_vision(seed, stdev);

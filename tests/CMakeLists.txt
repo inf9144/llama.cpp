@@ -232,6 +232,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
     llama_test(test-llama-archs NAME test-qwen4exp-layer-inputs ARGS --test-layer-inputs -s 42)
+    llama_test(test-llama-archs NAME test-dflash-device-inputs ARGS --test-dflash-device-inputs -s 42)
     llama_test(test-llama-archs NAME test-dflash-vision ARGS --test-dflash-vision -s 42)
     llama_test(test-llama-archs NAME test-kq-derived ARGS --test-kq-derived -s 42)
     llama_test(test-llama-archs NAME test-dflash-tail ARGS --test-dflash-tail -s 42)

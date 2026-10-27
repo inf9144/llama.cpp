@@ -1161,7 +1161,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                     ext.y = ubatch.pos[i + ubatch.n_tokens];
                 }
 
-                const bool is_embd = !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
+                const bool is_embd = ubatch.token_is_feature_row || !ubatch.token || (ubatch.is_mixed() && ubatch.type[i]);
 
                 if (!is_embd) {
                     ext.tok = ubatch.token[i];
@@ -2041,7 +2041,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
     // do not encode the token order; resolve its predecessors by ubatch order instead
     // same for a mixed ubatch
-    const bool by_order = !ubatch.token || ubatch.is_mixed();
+    const bool by_order = ubatch.token_is_feature_row || !ubatch.token || ubatch.is_mixed();
 
     std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
     std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;

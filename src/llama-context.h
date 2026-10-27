@@ -17,6 +17,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_layer_inputs_device;
 class llama_batch_allocr;
 class llama_moe_cache;
 
@@ -120,6 +121,11 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    bool prepare_layer_inputs_device(ggml_backend_dev_t dev);
+    bool init_dflash_device_inputs(llama_context * target);
+    ggml_tensor * get_layer_input_device(uint32_t lid) const;
+    const std::vector<int32_t> & get_layer_input_device_rows() const;
+    int decode_device_inputs(const llama_batch_ext & batch);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -412,6 +418,8 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    // Staging for one target batch, released before the backends it uses.
+    std::unique_ptr<llama_layer_inputs_device> layer_inputs_device;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

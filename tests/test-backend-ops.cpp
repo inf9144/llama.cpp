@@ -4003,6 +4003,38 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// Narrow GDN heads: fused RMS + vector weight + sigmoid gate, including tails
+// and graphs where an observable intermediate must prevent fusion.
+struct test_rms_norm_gated : public test_case {
+    const int64_t cols;
+    const int64_t rows;
+    const bool strided;
+    const bool intermediate;
+
+    test_rms_norm_gated(int64_t cols, int64_t rows, bool strided = false, bool intermediate = false)
+        : cols(cols), rows(rows), strided(strided), intermediate(intermediate) {}
+
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_GATED"; }
+    std::string vars() override { return VARS_TO_STR4(cols, rows, strided, intermediate); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided ? 2*cols : cols, rows);
+        auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cols);
+        auto * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, rows);
+        // Use w and z before the norm, as the model's gate projection does.
+        a = ggml_add(ctx, a, ggml_mul(ctx, z, w));
+        if (strided) {
+            a = ggml_view_2d(ctx, a, cols, rows, a->nb[1], 0);
+        }
+        auto * norm = ggml_rms_norm(ctx, a, 1e-6f);
+        auto * weighted = ggml_mul(ctx, norm, w);
+        auto * gate = ggml_sigmoid(ctx, z);
+        auto * out = ggml_mul(ctx, weighted, gate);
+        return intermediate ? ggml_add(ctx, out, norm) : out;
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -11029,6 +11061,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
     // shapes below exceed the CUDA gridDim.y/gridDim.z limit of 65535 (#27901)
     test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f));
+    for (int64_t cols : { 32, 64, 96, 128, 160, 256 }) {
+        for (int64_t rows : { 1, 8, 4099 }) {
+            test_cases.emplace_back(new test_rms_norm_gated(cols, rows));
+        }
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {cols, 4099, 1, 1}));
+    }
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 3, 683, 2}));
+    test_cases.emplace_back(new test_rms_norm_gated(128, 4099, true));
+    test_cases.emplace_back(new test_rms_norm_gated(128, 8, false, true));
+
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));

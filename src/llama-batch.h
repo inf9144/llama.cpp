@@ -80,6 +80,9 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // Internal DFlash gather indices must retain embedding-input KV metadata.
+    bool token_is_feature_row = false;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -159,7 +162,8 @@ public:
     bool init(
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
-            bool output_all);
+            bool output_all,
+            bool token_is_feature_row = false);
 
     const llama_batch & get_batch() const;
 
@@ -253,6 +257,7 @@ private:
     std::vector<int32_t> out_ids;
 
     uint32_t n_used;
+    bool token_is_feature_row = false;
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;

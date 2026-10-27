@@ -4818,6 +4818,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    {
+        const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+        const int outputs[] = { i + 3 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, outputs, 1) &&
+                ggml_cuda_op_rms_norm_mul_sigmoid_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
+                    cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+            return 3;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;

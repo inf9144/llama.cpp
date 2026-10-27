@@ -28,9 +28,11 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,
-        bool output_all) {
+        bool output_all,
+        bool token_is_feature_row) {
     clear();
 
+    this->token_is_feature_row = token_is_feature_row;
     this->vocab        = &vocab;
     this->n_embd       = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
     this->n_embd_state = batch_inp.n_embd_state;
@@ -540,6 +542,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.type         =*/ nullptr,
         /*.decision_order =*/ nullptr,
         /*.data         =*/ std::move(udata),
+        /*.token_is_feature_row =*/ token_is_feature_row,
     };
 
     return res;
@@ -976,6 +979,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.token_is_feature_row =*/ token_is_feature_row,
     };
 
     if (debug > 0) {
