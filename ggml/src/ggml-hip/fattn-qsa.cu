@@ -175,6 +175,18 @@ bool ggml_cuda_qsa_select_supported(const ggml_tensor * dst) {
         dst->src[2]->type == GGML_TYPE_I32 && dst->src[3]->type == GGML_TYPE_I32;
 }
 
+bool ggml_cuda_qsa_select_uses_radix(int device, const ggml_tensor * dst) {
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return ggml_cuda_qsa_select_supported(dst) &&
+        (cc == GGML_CUDA_CC_RDNA3 || cc == GGML_CUDA_CC_RDNA3 + 1) &&
+        dst->src[2]->ne[0] == 4 && dst->src[0]->ne[0] == 512 && dst->src[3]->ne[0] == 3;
+#else
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#endif
+}
+
 void ggml_cuda_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     GGML_ASSERT(ggml_cuda_qsa_select_supported(dst));
@@ -193,10 +205,8 @@ void ggml_cuda_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         t->nb[0], t->nb[1], s->nb[0], s->nb[1], b->nb[0], b->nb[1], e->nb[0], e->nb[1],
     };
 #ifdef GGML_HIP_QSA_RADIX_AVAILABLE
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     // Promote the measured four-cell, 512-pool budget only; other shapes keep the original kernel.
-    if ((cc == GGML_CUDA_CC_RDNA3 || cc == GGML_CUDA_CC_RDNA3 + 1) &&
-            p.pool_size == 4 && p.n_top == 512 && e->ne[0] == 3) {
+    if (ggml_cuda_qsa_select_uses_radix(ctx.device, dst)) {
         const ggml_cuda_kernel_launch_params lp(dim3(dst->ne[1], 1, 1), dim3(256, 1, 1), 0, ctx.stream());
         ggml_cuda_kernel_launch(qsa_select_radix_kernel<2048>, lp, p);
         CUDA_CHECK(cudaGetLastError());

@@ -332,6 +332,15 @@ static void run_case(ggml_backend_t backend, int kv, int rows, int top_count, in
     QSA_HIP_CHECK(hipGetDeviceProperties(&prop, attr.device));
     GGML_ASSERT(prop.warpSize == 32 &&
         (strncmp(prop.gcnArchName, "gfx1100", 7) == 0 || strncmp(prop.gcnArchName, "gfx1101", 7) == 0));
+    using qsa_radix_fn = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
+    auto uses_radix = (qsa_radix_fn) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_hip_qsa_select_uses_radix");
+    GGML_ASSERT(uses_radix);
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
+    GGML_ASSERT(uses_radix(ggml_backend_get_device(backend), selected) == (top_count == 512));
+#else
+    GGML_ASSERT(!uses_radix(ggml_backend_get_device(backend), selected));
+#endif
     if (!printed_device) {
         int runtime;
         QSA_HIP_CHECK(hipRuntimeGetVersion(&runtime));

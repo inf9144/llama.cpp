@@ -855,11 +855,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             }
             return t->buffer && ggml_backend_dev_supports_buft(dev, ggml_backend_buffer_get_type(t->buffer));
         };
-        // Dense WMMA reuses K/V across prefill queries, so require more sparsity there.
-        // These conservative crossover ratios still need timings on each target GPU.
+        // Keep the conservative rule for selector builds and shapes outside the measured configuration.
         const int64_t ratio = n_tokens/k->ne[3] <= 8 ? 4 : 16;
         if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && cache_on_device(k) && cache_on_device(v) &&
-                k->ne[2] >= std::max<int64_t>(8192, ratio*inp_kpool->n_sel)) {
+                k->ne[2] >= 8192) {
             const bool v_trans = v->nb[1] > v->nb[2];
             k = ggml_permute(ctx0, k, 0, 2, 1, 3);
             v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -872,8 +871,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ggml_tensor * idx_probe = ggml_reshape_4d(ctx0, indices, indices->ne[0], q_probe->ne[1], 1, n_stream);
             ggml_tensor * probe = ggml_flash_attn_sparse(ctx0, q_probe, k, v, idx_probe, 1.0f);
             if (ggml_backend_dev_supports_op(dev, indices) && ggml_backend_dev_supports_op(dev, probe)) {
-                cb(indices, "indexer_sel_sparse", il);
-                return indices;
+                int64_t min_kv = std::max<int64_t>(8192, ratio*inp_kpool->n_sel);
+                using qsa_radix_fn = bool (*)(ggml_backend_dev_t, const ggml_tensor *);
+                auto uses_radix = (qsa_radix_fn) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_hip_qsa_select_uses_radix");
+                // Both GPUs and KV layouts win from 8K for decode/verify and 16K for larger batches.
+                if (uses_radix && uses_radix(dev, indices) && n_head == 24 && k->ne[2] == 2 && n_stream == 1) {
+                    min_kv = q_probe->ne[1] <= 8 ? 8192 : 16384;
+                }
+                if (k->ne[1] >= min_kv) {
+                    cb(indices, "indexer_sel_sparse", il);
+                    return indices;
+                }
             }
         }
     }

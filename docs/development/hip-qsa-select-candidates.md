@@ -109,3 +109,26 @@ The old fixture drew each visible score independently from 24-bit integers. Repl
 The fixture now uses a per-query shuffled permutation of unique F32-exact integer ranks. This removes the ambiguous input from the comparison; it does not change production Top-K, tie handling, QSA selection, attention, or the dispatch threshold. Mask/list comparisons and numerical/component checks remain strict. List mismatch diagnostics now report the device, KV length, width, layout, query row and first differing cell.
 
 Local validation: the test target builds, the existing CPU QSA reference test passes, and the ranked/permuted crossover smoke case still passes. The old failure's score cutoff was reproduced on the host; no GPU rerun is possible in this environment. The successful user numerical runs need not be repeated for this test-only fix. Rebuild `test-qsa-sparse` and rerun only the two `--crossover` commands above. The threshold remains unchanged until both complete with the corrected fixture.
+
+## Completed crossover calibration
+
+The corrected user logs `qsa-crossover-ROCm0(1).log` and `qsa-crossover-ROCm1(1).log` complete all 132 cases per GPU. All cell unions and component checks pass; maximum attention NMSE is 6.02304453e-5 on both GPUs (limit 5e-4). Earlier numerical logs establish exact decode/verify outputs.
+
+The automatic threshold is now 8192 KV cells for query widths 1-8 and 16384 for larger batches, restricted to the measured single-stream, 24-query-head/two-KV-head configuration with the actual radix selector. The backend exposes a read-only kernel capability through its existing procedure registry; the model and kernel launch share the same predicate. Builds without hipCUB, other budgets, head counts or stream counts retain the original ratio rule. No runtime switch or cache is added. Reservation and execution use the same graph decision.
+
+Worst median speedup across both GPUs and both layouts:
+
+| KV cells | Width 1-8 | Width 32 | Width 512 | Width 1024 |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 1.038x | 0.677x | 0.725x | 0.602x |
+| 12288 | 1.126x | 0.831x | 1.005x | 0.853x |
+| 16384 | 1.256x | 1.028x | 1.294x | 1.107x |
+| 24576 | 1.523x | 1.403x | 1.864x | 1.633x |
+| 32768 | 1.801x | 1.733x | 2.406x | 2.125x |
+| 49152 | 2.186x | 2.504x | 3.578x | 3.147x |
+
+These are complete score-to-attention graph medians, including Top-K, not end-to-end model throughput. All newly enabled measured cases improve median and p95. The narrowest gain is width 32 on gfx1101 at 16K (2.8% median). An existing eligible 12K decode-one XTX case has a slower sparse p95 (219.713 versus 136.327 us) despite a faster median; no universal tail-latency improvement is claimed. Intermediate query widths are interpolated by the two-band rule rather than individually calibrated.
+
+At 32K, measured compute buffers decrease by 28.06 MiB for width 512 and 56.05 MiB for width 1024. These are subgraph allocator differences, not full-process peak VRAM. Global packed-mask reservation protection is unchanged.
+
+CPU build and targeted reference tests are checked locally. The new HIP capability plumbing cannot be compiled here without the ROCm SDK; its GPU checks are included in `test-qsa-select`. Full-model acceptance, end-to-end speed and peak VRAM after the policy change remain local hardware checks.

@@ -29,7 +29,7 @@ Supported configurations:
 
 Each block handles one query and four query heads, with four Wave32 waves and 32 selected cells per iteration. Decode and verify widths 1-8 use exactly the same tile configuration and 16 KV partitions. Prefill uses the same indexed iteration with one partition per query/head group. Softmax maxima/sums, QK accumulators and the final partition combination use F32; Q conversion, probabilities and VKQ accumulation retain the existing tile kernel's FP16 arithmetic. This is not a claim of bitwise equivalence to the dense GPU kernel: compacting cells changes KV partition membership and accumulation order. Empty/invalid-only lists produce zero outputs.
 
-The model graph uses a conservative automatic crossover:
+The original fallback crossover remains:
 
 ```
 n_kv >= max(8192, n_sel * (queries_per_stream <= 8 ? 4 : 16))
@@ -101,3 +101,5 @@ Before merge, compare the base and candidate in separate fresh processes on the 
 ## Selection follow-up
 
 User GPU logs establish hipCUB radix as the exact and consistently faster selector on gfx1100/gfx1101. The measured 512-pool configuration now uses the same radix implementation in the backend and comparison runner. Attention arithmetic and crossover remain unchanged. The [selection results and crossover commands](hip-qsa-select-candidates.md) document the measured gains, narrow dispatch, local checks and the next boundary matrix. Subsequent user GPU numerical logs pass the promoted backend integration and exact decode/verify on both cards. The crossover fixture needed unique scores to avoid ambiguous independent Top-K cutoffs; its corrected matrix and production-model acceptance after promotion still need local confirmation.
+
+The completed hardware calibration uses 8192 cells for widths 1-8 and 16384 for larger batches in the measured radix, 24/2-head, single-stream configuration. Other configurations retain the fallback rule above. See the selection report for results and limitations.
