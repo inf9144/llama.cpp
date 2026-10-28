@@ -11,16 +11,6 @@
 
 namespace qsa_test {
 
-struct params {
-    const char * top;
-    const char * score;
-    const char * pools;
-    const char * tail;
-    int32_t * dst;
-    int n_top, n_pool, n_sel, pool_size, n_kv, sort_size;
-    size_t t0, t1, s0, s1, p0, p1, e0, e1;
-};
-
 QSA_TEST_HD inline int bound(const int32_t * values, int begin, int end, int32_t value, bool upper) {
     while (begin < end) {
         const int mid = begin + (end - begin)/2;

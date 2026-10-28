@@ -2,15 +2,7 @@
 
 #include "../ggml-cuda/fattn-tile.cuh"
 
-struct qsa_select_params {
-    const char * top;
-    const char * score;
-    const char * pools;
-    const char * tail;
-    int32_t * dst;
-    int n_top, n_pool, n_sel, pool_size, n_kv, sort_size;
-    size_t t0, t1, s0, s1, p0, p1, e0, e1;
-};
+#include "qsa-select.cuh"
 
 __launch_bounds__(256)
 static __global__ void qsa_select_kernel(const qsa_select_params p) {
@@ -200,6 +192,17 @@ void ggml_cuda_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_get_op_params_i32(dst, 0), sort_size,
         t->nb[0], t->nb[1], s->nb[0], s->nb[1], b->nb[0], b->nb[1], e->nb[0], e->nb[1],
     };
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    // Promote the measured four-cell, 512-pool budget only; other shapes keep the original kernel.
+    if ((cc == GGML_CUDA_CC_RDNA3 || cc == GGML_CUDA_CC_RDNA3 + 1) &&
+            p.pool_size == 4 && p.n_top == 512 && e->ne[0] == 3) {
+        const ggml_cuda_kernel_launch_params lp(dim3(dst->ne[1], 1, 1), dim3(256, 1, 1), 0, ctx.stream());
+        ggml_cuda_kernel_launch(qsa_select_radix_kernel<2048>, lp, p);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     const ggml_cuda_kernel_launch_params lp(dim3(dst->ne[1], 1, 1), dim3(256, 1, 1), (sort_size + 256)*sizeof(int32_t), ctx.stream());
     ggml_cuda_kernel_launch(qsa_select_kernel, lp, p);
     CUDA_CHECK(cudaGetLastError());

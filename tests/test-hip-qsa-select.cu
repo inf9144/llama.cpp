@@ -4,10 +4,7 @@
 #include "ggml-cpp.h"
 
 #include <hip/hip_runtime.h>
-#if __has_include(<hipcub/block/block_radix_sort.hpp>) && __has_include(<rocprim/block/block_radix_sort.hpp>)
-#include <hipcub/block/block_radix_sort.hpp>
-#define QSA_TEST_HIPCUB
-#endif
+#include "../ggml/src/ggml-hip/qsa-select.cuh"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +21,8 @@
 #define QSA_HIP_CHECK(expr) do { const hipError_t err = (expr); if (err != hipSuccess) { GGML_ABORT("%s: %s", #expr, hipGetErrorString(err)); } } while (0)
 
 namespace qsa_test {
+
+using params = qsa_select_params;
 
 // Frozen e7b431d selection kernel. The suite also compares it to the actual backend op.
 __launch_bounds__(256)
@@ -219,40 +218,8 @@ static __global__ void select_members(const params p, int members_size) {
     finish(p, a, b, members_size, offsets);
 }
 
-#ifdef QSA_TEST_HIPCUB
-template <int members_size>
-__launch_bounds__(256)
-static __global__ void select_radix(const params p) {
-    constexpr int items = members_size/256;
-    using sorter = hipcub::BlockRadixSort<uint32_t, 256, items>;
-    __shared__ union {
-        typename sorter::TempStorage sort;
-        int32_t values[members_size + 3];
-    } storage;
-    __shared__ int32_t merged[members_size + 3];
-    __shared__ int32_t offsets[8];
-    gather_members<false>(p, members_size, storage.values);
-    uint32_t keys[items];
-#pragma unroll
-    for (int i = 0; i < items; ++i) {
-        const int value = storage.values[threadIdx.x*items + i];
-        keys[i] = value == INT32_MAX ? p.n_kv : value;
-    }
-    __syncthreads();
-    // n_kv sorts after every valid cell; sorting only its significant bits is sufficient.
-    sorter(storage.sort).Sort(keys, 0, 32 - __clz((uint32_t) p.n_kv));
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < items; ++i) {
-        storage.values[threadIdx.x*items + i] = keys[i] >= uint32_t(p.n_kv) ? INT32_MAX : keys[i];
-    }
-    __syncthreads();
-    finish(p, storage.values, merged, members_size, offsets);
-}
-#endif
-
 static const char * names[] = {"e7b431d-bitonic", "members-bitonic-tail", "pool-merge-tail",
-#ifdef QSA_TEST_HIPCUB
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
     "hipcub-radix-tail",
 #endif
 };
@@ -271,10 +238,10 @@ static void launch(int candidate, const params p, int rows, hipStream_t stream) 
         case 2:
             hipLaunchKernelGGL((select_members<true>), dim3(rows), dim3(256), bytes, stream, p, members_size);
             break;
-#ifdef QSA_TEST_HIPCUB
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
         case 3:
             switch (members_size) {
-#define QSA_RADIX_CASE(n) case n: hipLaunchKernelGGL((select_radix<n>), dim3(rows), dim3(256), 0, stream, p); break
+#define QSA_RADIX_CASE(n) case n: hipLaunchKernelGGL((qsa_select_radix_kernel<n>), dim3(rows), dim3(256), 0, stream, p); break
                 QSA_RADIX_CASE(256);
                 QSA_RADIX_CASE(512);
                 QSA_RADIX_CASE(1024);
@@ -370,7 +337,7 @@ static void run_case(ggml_backend_t backend, int kv, int rows, int top_count, in
         QSA_HIP_CHECK(hipRuntimeGetVersion(&runtime));
         printf("device=%s arch=%s HIP=%d backend=%s baseline=e7b431d candidates=%zu hipcub=%s\n", prop.name,
             prop.gcnArchName, runtime, ggml_backend_name(backend), std::size(names),
-#ifdef QSA_TEST_HIPCUB
+#ifdef GGML_HIP_QSA_RADIX_AVAILABLE
             "available"
 #else
             "not installed (radix candidate skipped)"
@@ -503,7 +470,7 @@ static void run_case(ggml_backend_t backend, int kv, int rows, int top_count, in
             for (int i = 0; i < 10; ++i) { GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS); }
             backend_wall.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count()/10);
         }
-        printf("FRAMEWORK backend=%s kv=%d rows=%d layout=%s baseline_ggml_wall_us=%.3f\n", ggml_backend_name(backend),
+        printf("FRAMEWORK backend=%s kv=%d rows=%d layout=%s production_ggml_wall_us=%.3f\n", ggml_backend_name(backend),
             kv, rows, layout == 0 ? "linear" : "permuted", quantile(backend_wall, 0.5));
     } else {
         printf("CHECK kv=%d rows=%d top=%d layout=%d strided=%d: %zu candidates byte-exact against backend and std::sort, guards intact\n",
@@ -534,7 +501,7 @@ int gpu_suite(const char * backend_name) {
             run_case(backend.get(), 235520, rows, 512, layout, false, true, printed_device);
         }
     }
-    printf("QSA_SELECT candidate suite passed. Production selection and crossover remain at e7b431d.\n");
+    printf("QSA_SELECT candidate suite passed against the production backend (radix when eligible); crossover is unchanged.\n");
     return 0;
 }
 

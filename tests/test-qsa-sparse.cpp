@@ -4,6 +4,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -44,19 +45,26 @@ struct qsa_graph {
     ggml_context_ptr ctx = context();
     ggml_gallocr_ptr alloc;
     ggml_cgraph * graph;
+    ggml_tensor * ranked;
     ggml_tensor * selection;
     ggml_tensor * out;
 
     qsa_graph(ggml_backend_t backend, bool sparse, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
-            ggml_tensor * top, ggml_tensor * score, ggml_tensor * pools, ggml_tensor * tail) {
+            ggml_tensor * top, ggml_tensor * score, ggml_tensor * pools, ggml_tensor * tail, bool rank = false) {
         const int64_t kv = k->ne[1];
+        if (rank) {
+            // Give each alternative its own first node, hence its own HIP graph-cache key.
+            GGML_ASSERT(q->view_src);
+            q = ggml_view_4d(ctx.get(), q->view_src, q->ne[0], q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], q->view_offs);
+        }
+        ranked = rank ? ggml_top_k(ctx.get(), score, top->ne[0]) : top;
         if (sparse) {
-            selection = ggml_qsa_select(ctx.get(), top, score, pools, tail, kv);
+            selection = ggml_qsa_select(ctx.get(), ranked, score, pools, tail, kv);
             auto * idx = ggml_reshape_4d(ctx.get(), selection, selection->ne[0], q->ne[1], 1, q->ne[3]);
             out = ggml_flash_attn_sparse(ctx.get(), q, k, v, idx, 1.0f/16.0f);
         } else {
             auto * zeros = ggml_fill(ctx.get(), ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F16, kv), 0.0f);
-            selection = ggml_top_k_mask(ctx.get(), zeros, top, score, pools, tail);
+            selection = ggml_top_k_mask(ctx.get(), zeros, ranked, score, pools, tail);
             auto * mask = ggml_reshape_4d(ctx.get(), selection, kv, q->ne[1], 1, q->ne[3]);
             out = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f/16.0f, 0.0f, 0.0f);
             ggml_prec_set_acc(out, GGML_PREC_F32);
@@ -78,7 +86,79 @@ static double timed(ggml_backend_t backend, ggml_cgraph * graph) {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count()/10;
 }
 
-static void run_case(ggml_backend_t backend, int kv, int width, int top_count, int streams, bool strided, bool bench) {
+static double quantile(std::vector<double> samples, double q) {
+    std::sort(samples.begin(), samples.end());
+    return samples[std::min(samples.size() - 1, size_t(std::ceil(q*samples.size())) - 1)];
+}
+
+static void measure_crossover(ggml_backend_t backend, qsa_graph & dense, qsa_graph & sparse, int kv, int width, bool permuted) {
+    std::array<qsa_graph *, 2> branches = {&dense, &sparse};
+    std::array<std::array<ggml_cgraph *, 4>, 2> graphs;
+    std::array<std::vector<uint8_t>, 2> reference_selection, reference_output;
+    for (int b = 0; b < 2; ++b) {
+        auto * branch = branches[b];
+        reference_selection[b].resize(ggml_nbytes(branch->selection));
+        reference_output[b].resize(ggml_nbytes(branch->out));
+        ggml_backend_tensor_get(branch->selection, reference_selection[b].data(), 0, reference_selection[b].size());
+        ggml_backend_tensor_get(branch->out, reference_output[b].data(), 0, reference_output[b].size());
+        for (int stage = 0; stage < 3; ++stage) {
+            graphs[b][stage] = ggml_new_graph_custom(branch->ctx.get(), 64, false);
+        }
+        ggml_build_forward_expand(graphs[b][0], branch->ranked);
+        for (int i = 0; i < ggml_graph_n_nodes(branch->graph); ++i) {
+            auto * node = ggml_graph_node(branch->graph, i);
+            if (node != branch->ranked && node != branch->out) {
+                ggml_graph_add_node(graphs[b][1], node);
+            }
+        }
+        ggml_graph_add_node(graphs[b][2], branch->out);
+        graphs[b][3] = branch->graph;
+    }
+    std::array<std::array<std::vector<double>, 4>, 2> samples;
+    // Keep stages separate: partial and complete graphs can share the HIP graph-cache key.
+    // Rank before selection, then attention: the allocator can reuse Top-K storage for attention output.
+    for (int stage = 0; stage < 4; ++stage) {
+        for (int b = 0; b < 2; ++b) {
+            for (int i = 0; i < 5; ++i) {
+                GGML_ASSERT(ggml_backend_graph_compute(backend, graphs[b][stage]) == GGML_STATUS_SUCCESS);
+            }
+        }
+        for (int round = 0; round < 21; ++round) {
+            for (int j = 0; j < 2; ++j) {
+                const int b = (round + j)%2;
+                const auto start = std::chrono::steady_clock::now();
+                for (int i = 0; i < 5; ++i) {
+                    GGML_ASSERT(ggml_backend_graph_compute(backend, graphs[b][stage]) == GGML_STATUS_SUCCESS);
+                }
+                samples[b][stage].push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count()/5);
+            }
+        }
+        for (int b = 0; b < 2; ++b) {
+            auto check = [&](ggml_tensor * tensor, const std::vector<uint8_t> & expected) {
+                std::vector<uint8_t> actual(expected.size());
+                ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+                if (actual != expected) {
+                    GGML_ABORT("component graph mismatch: kv=%d width=%d path=%s stage=%d", kv, width, b ? "sparse" : "dense", stage);
+                }
+            };
+            if (stage == 1 || stage == 3) { check(branches[b]->selection, reference_selection[b]); }
+            if (stage == 2 || stage == 3) { check(branches[b]->out, reference_output[b]); }
+        }
+    }
+    for (int b = 0; b < 2; ++b) {
+        printf("CROSS backend=%s kv=%d width=%d layout=%s path=%s topk_us=%.3f select_us=%.3f attention_us=%.3f qsa_graph_us=%.3f qsa_p95_us=%.3f compute_buffer=%zu selection_bytes=%zu exact=1\n",
+            ggml_backend_name(backend), kv, width, permuted ? "permuted" : "linear", b ? "sparse" : "dense",
+            quantile(samples[b][0], 0.5), quantile(samples[b][1], 0.5), quantile(samples[b][2], 0.5),
+            quantile(samples[b][3], 0.5), quantile(samples[b][3], 0.95), ggml_gallocr_get_buffer_size(branches[b]->alloc.get(), 0),
+            ggml_nbytes(branches[b]->selection));
+    }
+    printf("CROSS_RESULT backend=%s kv=%d width=%d layout=%s sparse_speedup=%.4f\n", ggml_backend_name(backend), kv, width,
+        permuted ? "permuted" : "linear", quantile(samples[0][3], 0.5)/quantile(samples[1][3], 0.5));
+    fflush(stdout);
+}
+
+static void run_case(ggml_backend_t backend, int kv, int width, int top_count, int streams, bool strided, bool bench,
+        bool crossover = false, bool permuted = false) {
     auto inputs = context();
     const int rows = width*streams;
     const int n_pool = kv/4;
@@ -104,18 +184,22 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
     std::vector<float> score_data(n_pool*rows);
     std::vector<int32_t> pool_data(4*n_pool);
     std::vector<int32_t> tail_data(3*rows);
+    std::vector<int32_t> cells(kv);
+    for (int i = 0; i < kv; ++i) { cells[i] = i; }
+    if (permuted) { std::shuffle(cells.begin(), cells.end(), gen); }
     for (int p = 0; p < n_pool; ++p) {
         for (int i = 0; i < 4; ++i) {
             // Padded pools, sentinel/negative members, duplicate members and overlapping pools.
-            pool_data[4*p + i] = bench ? 4*p + i : p%13 == 0 || (p%19 == 0 && i == 3) ? kv :
+            pool_data[4*p + i] = bench ? cells[4*p + i] : p%13 == 0 || (p%19 == 0 && i == 3) ? kv :
                 p%17 == 0 ? -1 : (4*p + (i == 3 && p%7 == 0 ? 0 : i))%kv;
         }
     }
     set_rows(pools, pool_data);
-    qsa_graph dense(backend, false, q, k, v, top, score, pools, tail);
-    qsa_graph sparse(backend, true, q, k, v, top, score, pools, tail);
+    qsa_graph dense(backend, false, q, k, v, top, score, pools, tail, crossover);
+    qsa_graph sparse(backend, true, q, k, v, top, score, pools, tail, crossover);
     const bool supported = ggml_backend_supports_op(backend, sparse.out) && ggml_backend_supports_op(backend, sparse.selection);
     if (!supported) {
+        GGML_ASSERT(!crossover);
         printf("kv=%d width=%d: dense fallback (sparse dispatch not eligible)\n", kv, width);
         return;
     }
@@ -125,8 +209,10 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
     double max_nmse = 0.0;
     for (int state = 0; state < (bench ? 1 : 4); ++state) {
         for (int row = 0; row < rows; ++row) {
+            const int visible = kv - width + row + 1;
             for (int p = 0; p < n_pool; ++p) {
-                score_data[row*n_pool + p] = !bench && (p + row + state)%5 == 0 ? -INFINITY : float(p%19);
+                score_data[row*n_pool + p] = crossover ? (p < visible/4 ? float(gen()%0x1000000) : -INFINITY) :
+                    !bench && (p + row + state)%5 == 0 ? -INFINITY : float(p%19);
             }
             for (int i = 0; i < top_count; ++i) {
                 // Unordered, repeated picks; some are invalid or invisible for this query.
@@ -136,6 +222,12 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
             tail_data[3*row + 0] = (row*3 + state)%kv;
             tail_data[3*row + 1] = (row*3 + state)%kv;
             tail_data[3*row + 2] = kv;
+            if (crossover) {
+                for (int j = 0; j < 3; ++j) {
+                    const int logical = visible/4*4 + j;
+                    tail_data[3*row + j] = logical < visible ? cells[logical] : kv;
+                }
+            }
         }
         set_rows(top, top_data); set_rows(score, score_data); set_rows(tail, tail_data);
         GGML_ASSERT(ggml_backend_graph_compute(backend, dense.graph) == GGML_STATUS_SUCCESS);
@@ -198,7 +290,9 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
     }
     printf("kv=%d width=%d streams=%d strided=%d: mask union exact, attention max_abs=%.9g nmse=%.9g, decode/verify=%s\n",
         kv, width, streams, strided, max_abs, max_nmse, !bench && width <= 8 ? "exact" : "not checked");
-    if (bench) {
+    if (crossover) {
+        measure_crossover(backend, dense, sparse, kv, width, permuted);
+    } else if (bench) {
         for (auto * branch : {&dense, &sparse}) {
             auto * sel = ggml_new_graph_custom(branch->ctx.get(), 64, false);
             ggml_build_forward_expand(sel, branch->selection);
@@ -238,18 +332,36 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     const char * backend_name = "CPU";
     bool bench = false;
+    bool crossover = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--bench") == 0) { bench = true; }
+        else if (strcmp(argv[i], "--crossover") == 0) { crossover = true; }
         else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) { backend_name = argv[++i]; }
-        else { fprintf(stderr, "usage: %s [--backend CPU|ROCm0|ROCm1] [--bench]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s [--backend CPU|ROCm0|ROCm1] [--bench|--crossover]\n", argv[0]); return 1; }
     }
+    if (bench && crossover) { fprintf(stderr, "choose either --bench or --crossover\n"); return 1; }
     ggml_backend_ptr backend(ggml_backend_init_by_name(backend_name, nullptr));
     GGML_ASSERT(backend);
     if (ggml_backend_is_cpu(backend.get())) {
         ggml_backend_cpu_set_n_threads(backend.get(), 2);
         ggml_backend_cpu_set_use_ref(backend.get(), true);
     }
-    if (bench) {
+    printf("backend=%s device=%s\n", ggml_backend_name(backend.get()), ggml_backend_dev_description(ggml_backend_get_device(backend.get())));
+    if (crossover) {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        if (strcmp(ggml_backend_reg_name(reg), "ROCm") != 0) {
+            fprintf(stderr, "crossover calibration requires the ROCm backend\n");
+            return 1;
+        }
+        printf("Crossover: supplied indexer scores -> TOP_K -> mask/compact selection -> Q8_0 attention; 21 alternating samples, five synchronous calls/sample.\n");
+        for (int kv : {8192, 12288, 16384, 24576, 32768, 49152}) {
+            for (int width : {1, 2, 3, 4, 5, 6, 7, 8, 32, 512, 1024}) {
+                for (bool permuted : {false, true}) {
+                    run_case(backend.get(), kv, width, 512, 1, false, true, true, permuted);
+                }
+            }
+        }
+    } else if (bench) {
         for (int kv : {4096, 32768, 131072, 235520}) {
             for (int width : {1, 2, 3, 4, 5, 6, 7, 8, 512, 1024}) {
                 run_case(backend.get(), kv, width, 512, 1, false, true);

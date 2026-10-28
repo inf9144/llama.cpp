@@ -4,7 +4,7 @@ Starting point: the hardware-tested `e7b431d` on `feature/hip-qsa-sparse-attenti
 
 The user reports successful gfx1100/gfx1101 correctness, Vision, save/restore and rollback tests in the production model. At about 235K KV cells and decode width one, reported selection times are 144 us / 177 us, versus 50 us / 72 us for sparse attention. These are user measurements, not measurements from this build environment.
 
-This commit adds test-only selection candidates and a comparison runner. **Inference still uses the exact e7b431d selection kernel and crossover.** No candidate is promoted before both GPUs pass exact comparisons and show a speed improvement. Attention arithmetic, indexer, Top-K, cache layout and state handling are unchanged. Crossover calibration is deferred until the selection winner is established.
+The comparison runner was published at `4303b95` with inference still using e7b431d. The two GPU logs supplied on 2026-10-28 now establish `hipcub-radix-tail` as the winner, so the measured configuration uses it automatically. Attention arithmetic, indexer, Top-K, cache layout, state handling and the crossover are unchanged. The boundary matrix below is the next measurement step.
 
 ## Candidates
 
@@ -21,7 +21,7 @@ Every candidate sorts **cell values**, not pool IDs. No contiguous or monotone p
 
 The compaction computes per-thread counts over contiguous sorted spans, scans within logical Wave32 groups, then scans eight wave totals. It removes the original repeated block-wide scan barriers. The comparison covers both the tail-padding optimization and a change of sorting algorithm; it does not assume either is faster before timing.
 
-hipCUB is used only if its SDK header is present; otherwise the radix candidate is reported as unavailable. It is not a new required dependency. Its block radix API is documented in the [official hipCUB reference](https://rocm.docs.amd.com/projects/hipCUB/en/docs-5.6.0/.doxygen/docBin/html/classhipcub_1_1BlockRadixSort.html).
+hipCUB is used only if its SDK and rocPRIM headers are present; otherwise the production kernel remains bitonic and the radix candidate is unavailable. It is not a new required dependency. Its block radix API is documented in the [official hipCUB reference](https://rocm.docs.amd.com/projects/hipCUB/en/docs-5.6.0/.doxygen/docBin/html/classhipcub_1_1BlockRadixSort.html).
 
 ## Local validation
 
@@ -29,7 +29,7 @@ hipCUB is used only if its SDK header is present; otherwise the radix candidate 
 
 The GPU suite first runs 28 correctness cases with 1-1023 picked pools, widths 1/3/8, nonzero view offsets, strided rows, arbitrary cell permutations, overlapping/partial pools, duplicate picks/members/tails, invalid indices, invisible/NaN scores and empty selections. Every candidate is checked byte-for-byte against both the actual backend `QSA_SELECT` and an independent host `std::sort`/unique union. Guard regions detect writes outside the output. Captured candidates are checked again after graph execution.
 
-The comparison then uses 235520 KV cells, 512 pools, widths 1-8/32/512/1024 and both linear and permuted cell layouts. This is only the point-1 selection experiment; it does not add the point-2 context-boundary matrix yet.
+The comparison then uses 235520 KV cells, 512 pools, widths 1-8/32/512/1024 and both linear and permuted cell layouts. This command remains the point-1 selection comparison. The separate `--crossover` command below measures the requested context boundaries.
 
 ## Run on each GPU
 
@@ -43,16 +43,59 @@ build-rocm10/bin/test-qsa-select --backend ROCm1 > qsa-select-ROCm1.log 2>&1
 
 Run the two commands sequentially, without concurrent inference, and retain the complete logs. The program prints the actual device, gfx architecture, HIP runtime and available candidates; ROCm ordinal alone is not treated as evidence of a particular GPU.
 
-Each timing uses a graph containing 32 identical selection launches to avoid CPU enqueue gaps dominating a fast candidate. GPU event time and amortized graph wall time are reported separately. There are 21 samples per candidate; candidate order rotates between rounds. `gpu_median_us`, `gpu_p95_us`, `graph_wall_us` and speedup against the frozen baseline are printed. The standalone actual GGML operator's wall time is also reported as `baseline_ggml_wall_us`; it includes framework overhead and must not be confused with the event timing.
+Each timing uses a graph containing 32 identical selection launches to avoid CPU enqueue gaps dominating a fast candidate. GPU event time and amortized graph wall time are reported separately. There are 21 samples per candidate; candidate order rotates between rounds. `gpu_median_us`, `gpu_p95_us`, `graph_wall_us` and speedup against the frozen baseline are printed. The standalone actual GGML operator's wall time is also reported as `production_ggml_wall_us` (`baseline_ggml_wall_us` in the original uploaded logs); it includes framework overhead and must not be confused with the event timing.
 
 All numerical checks occur outside timed regions. The graph outputs are checked before collecting timing samples. These are selector measurements, **not** attention, complete QSA-subgraph or end-to-end inference timings. Point 2 must use the actual promoted kernel and measure the complete QSA subgraph at the requested context boundaries.
 
-## Promotion criteria and remaining work
+## Measured winner and production dispatch
 
-- Both physical GPUs must complete every exact-list and guard check, including captured execution.
-- Compare median and p95 against the original on both linear/permuted layouts and decode/verify/prefill widths. Do not promote a candidate on the strength of decode width one alone.
-- Select one simple variant with a consistent demonstrated gain; keep the old implementation for any unsupported shape if needed.
-- After promotion, rerun the existing GPU sparse-attention/Decode-Verify numerical checks and the production-model checks.
-- Only then extend the full QSA-subgraph benchmark to 8K/12K/16K/24K/32K/48K and calibrate the automatic crossover.
+Source: the complete user logs `qsa-select-ROCm0(2).log` and `qsa-select-ROCm1(2).log`, produced by the `4303b95` comparison runner. Both identify the physical GPU, report hipCUB available and finish successfully. Each passes 28 byte-exact correctness/guard cases and 22 timed configurations, including linear and fully permuted cell layouts. Radix beats every other candidate in both median and p95 in all 22 configurations on each GPU.
 
-This environment has neither ROCm SDK nor `/dev/kfd`. Host tests and the existing CPU QSA oracles can run here; the new HIP candidates cannot be compiled, validated or timed here. There are deliberately no invented speedup numbers or changed production thresholds.
+Representative GPU medians at 235520 KV cells and 512 picked pools, linear layout:
+
+| GPU | Query width | e7b431d bitonic (us) | Radix (us) | Selection speedup |
+| --- | ---: | ---: | ---: | ---: |
+| gfx1100 / RX 7900 XTX | 1 | 114.227 | 9.475 | 12.056x |
+| gfx1100 / RX 7900 XTX | 8 | 114.071 | 9.549 | 11.946x |
+| gfx1100 / RX 7900 XTX | 512 | 290.399 | 53.010 | 5.478x |
+| gfx1100 / RX 7900 XTX | 1024 | 525.565 | 90.116 | 5.832x |
+| gfx1101 / RX 7800 XT | 1 | 177.266 | 11.604 | 15.276x |
+| gfx1101 / RX 7800 XT | 8 | 175.956 | 11.639 | 15.118x |
+| gfx1101 / RX 7800 XT | 512 | 443.216 | 80.665 | 5.495x |
+| gfx1101 / RX 7800 XT | 1024 | 849.813 | 167.777 | 5.065x |
+
+Across all measured layouts and widths, selection speedups range from 4.940x to 12.067x on gfx1100 and from 4.646x to 15.335x on gfx1101. These are isolated selection timings, not model throughput or full QSA speedups.
+
+`ggml/src/ggml-hip/qsa-select.cuh` now holds the measured radix, tail merge and compaction implementation, shared by the backend and candidate runner. Production dispatch selects its 2048-member instantiation only on gfx1100/gfx1101, with four cells per pool, 512 picked pools and three tail slots. Other pool budgets/shapes/devices and builds without the headers retain the original bitonic implementation. The original attention kernels and model crossover are source-identical to e7b431d. No host synchronization, persistent scratch allocation, inference flag or cache is added. Sorting still uses actual cell addresses; neither pool order nor KV contiguity is assumed.
+
+Local validation after promotion: the CPU Release targets build, 160 host merge tests and all three targeted CTests (`test-qsa-select`, `test-qsa-sparse`, `test-qwen4exp-qsa-equivalence`) pass. Source comparisons verify that radix/compaction match the measured candidate and that fallback/attention code is unchanged. A small CPU smoke run also exercises the new component/complete-graph timing harness with ranked selections, causal tails and permuted cells; its times are not GPU performance results.
+
+This environment still has neither ROCm SDK nor `/dev/kfd`. The promoted backend integration has not been compiled or executed here on HIP. The supplied logs validate the candidate on both cards; a local rebuild and the existing sparse-attention oracle must check its integration and decode/verify again. Production-model DFlash acceptance after this promotion remains a local check, even though the index list is byte-identical and attention arithmetic is unchanged.
+
+## Crossover measurement after promotion
+
+Use the existing HIP build configuration and run sequentially without concurrent inference:
+
+```sh
+cmake --build build-rocm10 --target test-qsa-sparse test-qsa-select
+build-rocm10/bin/test-qsa-sparse --backend ROCm0 > qsa-numeric-ROCm0.log 2>&1
+build-rocm10/bin/test-qsa-sparse --backend ROCm1 > qsa-numeric-ROCm1.log 2>&1
+build-rocm10/bin/test-qsa-sparse --backend ROCm0 --crossover > qsa-crossover-ROCm0.log 2>&1
+build-rocm10/bin/test-qsa-sparse --backend ROCm1 --crossover > qsa-crossover-ROCm1.log 2>&1
+```
+
+`--crossover` is an option of the test binary only. It does not change inference dispatch. It covers 8192, 12288, 16384, 24576, 32768 and 49152 KV cells; widths 1-8, 32, 512 and 1024; linear and fully permuted cell layouts. Inputs use per-query causal pool visibility, distinct complete-pool and partial-tail handling, Q8_0 K/V, D=256 and GQA=24/2. Both alternatives compute their own real `TOP_K` from the same supplied indexer scores. Each case first checks exact selected sets and dense-versus-sparse output error.
+
+The `CROSS` records separate synchronous GGML wall times for:
+
+- `topk_us`: actual Top-K ranking, common to both alternatives.
+- `select_us`: compact index generation or the old zero-vector/mask producer, with ranking already available.
+- `attention_us`: attention with the selected indices or dense mask already available.
+- `qsa_graph_us` and `qsa_p95_us`: the complete score-to-attention graph, including Top-K, selection and attention, measured directly rather than summed from components.
+- `compute_buffer` and `selection_bytes`: actual GGML allocator requirement and selection tensor size for that branch. Input storage and private backend pool allocations are excluded; both alternatives coexist, so process VRAM is not an inference peak.
+
+There are 21 samples per stage, five synchronous evaluations per sample, and alternating dense/sparse order. Five warmup evaluations precede each stage. The alternatives have separate first tensor nodes to avoid colliding HIP graph-cache keys; partial/complete stages are measured separately and warmed again. Components run in dependency order, respecting allocator reuse of intermediate storage. After component and complete-graph timings, selection/output bytes must still match the original complete-graph results. Readback and numerical checks are outside timed regions.
+
+The shared Lightning Indexer scoring/projections, RoPE, KV writes, model layers, transfers between devices and DFlash are outside this synthetic timing. It includes the changed selection work and actual Top-K, but cannot establish end-to-end tokens/s, full-model acceptance or real peak VRAM. Keep the existing production-model checks for those claims.
+
+Return the four complete numerical/crossover logs from both GPUs. Use `CROSS_RESULT` (dense median divided by sparse median) together with p95 and both layouts to choose a simple conservative threshold. The current `max(8192, (width <= 8 ? 4 : 16)*n_sel)` rule remains unchanged until those data are available.
