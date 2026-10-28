@@ -97,3 +97,7 @@ build-rocm10/bin/test-qsa-sparse --backend ROCm1 --bench
 This covers KV lengths 4096, 32768, 131072 and 235520; widths 1-8, 512 and 1024. For each branch it reports selection/mask preparation, attention-only and combined QSA graph wall times, and that branch's allocated compute buffer. Indexer scoring and Top-K ranking are supplied as inputs and are excluded from these timings. The helper holds both references simultaneously, so process-level VRAM from this helper is not an inference peak measurement. A separate `test-backend-ops perf` filter for the two new ops provides the same shape matrix.
 
 Before merge, compare the base and candidate in separate fresh processes on the production model, using identical prompts, batches/ubatches, GPU split and fixed MoE-cache size. Record end-to-end prefill and generated tokens/s, accepted/proposed DFlash tokens, logits/error statistics, actual scheduler compute reservations, peak device memory, and any mid-run reallocation. Include long text, multimodal inputs, prompt-tail ingest, sequence edits, checkpoint/SSD-cache restore and rollback. The short-context crossover needs measured confirmation on both cards. These results must be added before asserting a performance or acceptance improvement.
+
+## Selection follow-up
+
+The hardware-tested e7b431d remains the inference baseline. The [selection candidate comparison](hip-qsa-select-candidates.md) documents the next test-only optimization round; candidate promotion and crossover calibration await measurements on both GPUs.
