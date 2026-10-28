@@ -70,7 +70,7 @@ Across all measured layouts and widths, selection speedups range from 4.940x to 
 
 Local validation after promotion: the CPU Release targets build, 160 host merge tests and all three targeted CTests (`test-qsa-select`, `test-qsa-sparse`, `test-qwen4exp-qsa-equivalence`) pass. Source comparisons verify that radix/compaction match the measured candidate and that fallback/attention code is unchanged. A small CPU smoke run also exercises the new component/complete-graph timing harness with ranked selections, causal tails and permuted cells; its times are not GPU performance results.
 
-This environment still has neither ROCm SDK nor `/dev/kfd`. The promoted backend integration has not been compiled or executed here on HIP. The supplied logs validate the candidate on both cards; a local rebuild and the existing sparse-attention oracle must check its integration and decode/verify again. Production-model DFlash acceptance after this promotion remains a local check, even though the index list is byte-identical and attention arithmetic is unchanged.
+This environment still has neither ROCm SDK nor `/dev/kfd`. The promoted backend integration has not been compiled or executed here on HIP. The supplied candidate logs validate the radix implementation on both cards. The subsequent `qsa-numeric-ROCm0.log` and `qsa-numeric-ROCm1.log` also validate the promoted backend integration: ten cases per GPU pass, including nine exact decode/verify cases at widths 1-8 and a strided two-stream case. Maximum NMSE is 7.91824e-6 on gfx1100 and 8.17522e-6 on gfx1101, below the 5e-4 bound. Production-model DFlash acceptance after promotion remains a local check, even though the index list is byte-identical and attention arithmetic is unchanged.
 
 ## Crossover measurement after promotion
 
@@ -84,7 +84,7 @@ build-rocm10/bin/test-qsa-sparse --backend ROCm0 --crossover > qsa-crossover-ROC
 build-rocm10/bin/test-qsa-sparse --backend ROCm1 --crossover > qsa-crossover-ROCm1.log 2>&1
 ```
 
-`--crossover` is an option of the test binary only. It does not change inference dispatch. It covers 8192, 12288, 16384, 24576, 32768 and 49152 KV cells; widths 1-8, 32, 512 and 1024; linear and fully permuted cell layouts. Inputs use per-query causal pool visibility, distinct complete-pool and partial-tail handling, Q8_0 K/V, D=256 and GQA=24/2. Both alternatives compute their own real `TOP_K` from the same supplied indexer scores. Each case first checks exact selected sets and dense-versus-sparse output error.
+`--crossover` is an option of the test binary only. It does not change inference dispatch. It covers 8192, 12288, 16384, 24576, 32768 and 49152 KV cells; widths 1-8, 32, 512 and 1024; linear and fully permuted cell layouts. Inputs use per-query causal pool visibility, distinct complete-pool and partial-tail handling, Q8_0 K/V, D=256 and GQA=24/2. Both alternatives compute their own real `TOP_K` from the same supplied indexer scores. Visible scores are shuffled unique integer ranks, exactly representable in F32; their separate RNG is unaffected by the cell permutation. This gives both alternatives the same unambiguous selected pool set while preserving unordered Top-K output. Each case first checks exact selected sets and dense-versus-sparse output error.
 
 The `CROSS` records separate synchronous GGML wall times for:
 
@@ -99,3 +99,13 @@ There are 21 samples per stage, five synchronous evaluations per sample, and alt
 The shared Lightning Indexer scoring/projections, RoPE, KV writes, model layers, transfers between devices and DFlash are outside this synthetic timing. It includes the changed selection work and actual Top-K, but cannot establish end-to-end tokens/s, full-model acceptance or real peak VRAM. Keep the existing production-model checks for those claims.
 
 Return the four complete numerical/crossover logs from both GPUs. Use `CROSS_RESULT` (dense median divided by sparse median) together with p95 and both layouts to choose a simple conservative threshold. The current `max(8192, (width <= 8 ? 4 : 16)*n_sel)` rule remains unchanged until those data are available.
+
+## Corrected crossover fixture
+
+The first two user crossover logs from `a1401d2` complete 85 configurations per GPU, then fail the selected-set comparison at 24576 KV cells, width 512, permuted layout. The separate numerical suites complete successfully on both GPUs.
+
+The old fixture drew each visible score independently from 24-bit integers. Replaying its host RNG reproduces one ambiguous cutoff in the failing case: query row 379 has 511 scores greater than 15355057 and two pools (577 and 1301) equal to it. Only one of those pools fits into the 512-pool budget. The existing GPU Top-K radix gather uses an atomic counter for equal-cutoff entries, so either tied pool is a valid result. Independently evaluating Top-K for dense and sparse therefore cannot require identical selected sets for these inputs. The old scalar CPU smoke case did not expose this larger fixture's tie.
+
+The fixture now uses a per-query shuffled permutation of unique F32-exact integer ranks. This removes the ambiguous input from the comparison; it does not change production Top-K, tie handling, QSA selection, attention, or the dispatch threshold. Mask/list comparisons and numerical/component checks remain strict. List mismatch diagnostics now report the device, KV length, width, layout, query row and first differing cell.
+
+Local validation: the test target builds, the existing CPU QSA reference test passes, and the ranked/permuted crossover smoke case still passes. The old failure's score cutoff was reproduced on the host; no GPU rerun is possible in this environment. The successful user numerical runs need not be repeated for this test-only fix. Rebuild `test-qsa-sparse` and rerun only the two `--crossover` commands above. The threshold remains unchanged until both complete with the corrected fixture.

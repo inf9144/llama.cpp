@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -184,6 +185,10 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
     std::vector<float> score_data(n_pool*rows);
     std::vector<int32_t> pool_data(4*n_pool);
     std::vector<int32_t> tail_data(3*rows);
+    std::mt19937 score_gen(0x51534b);
+    std::vector<int32_t> score_ranks(crossover ? n_pool : 0);
+    std::iota(score_ranks.begin(), score_ranks.end(), 0);
+    GGML_ASSERT(!crossover || n_pool <= (1 << 24));
     std::vector<int32_t> cells(kv);
     for (int i = 0; i < kv; ++i) { cells[i] = i; }
     if (permuted) { std::shuffle(cells.begin(), cells.end(), gen); }
@@ -210,8 +215,10 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
     for (int state = 0; state < (bench ? 1 : 4); ++state) {
         for (int row = 0; row < rows; ++row) {
             const int visible = kv - width + row + 1;
+            // Separate Top-K evaluations need an unambiguous cutoff; integer ranks are exact in F32.
+            if (crossover) { std::shuffle(score_ranks.begin(), score_ranks.end(), score_gen); }
             for (int p = 0; p < n_pool; ++p) {
-                score_data[row*n_pool + p] = crossover ? (p < visible/4 ? float(gen()%0x1000000) : -INFINITY) :
+                score_data[row*n_pool + p] = crossover ? (p < visible/4 ? float(score_ranks[p]) : -INFINITY) :
                     !bench && (p + row + state)%5 == 0 ? -INFINITY : float(p%19);
             }
             for (int i = 0; i < top_count; ++i) {
@@ -241,7 +248,12 @@ static void run_case(ggml_backend_t backend, int kv, int width, int top_count, i
             int next = 0;
             for (int cell = 0; cell < kv; ++cell) {
                 if (ggml_fp16_to_fp32(mask[row*kv + cell]) == 0.0f) {
-                    GGML_ASSERT(next < n_sel && selected[row*n_sel + next++] == cell);
+                    if (next >= n_sel || selected[row*n_sel + next] != cell) {
+                        GGML_ABORT("mask union mismatch: backend=%s kv=%d width=%d layout=%s row=%d slot=%d capacity=%d dense_cell=%d sparse_cell=%d",
+                            ggml_backend_name(backend), kv, width, permuted ? "permuted" : "linear", row, next, n_sel, cell,
+                            next < n_sel ? selected[row*n_sel + next] : -1);
+                    }
+                    ++next;
                 }
             }
             while (next < n_sel) { GGML_ASSERT(selected[row*n_sel + next++] == -1); }
