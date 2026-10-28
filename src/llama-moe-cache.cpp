@@ -1,3 +1,4 @@
+#include "llama-moe-measure.h"
 #include "llama-moe-cache.h"
 
 #include "llama-impl.h"
@@ -607,8 +608,13 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
+#ifdef LLAMA_MOE_MEASURE
+        const int64_t routing_start = ggml_time_us();
+#endif
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+
+        MOE_MEASURE(llama_moe_measure::routing(backend, l.experts.front(), ids.data(), ids.size(), l.slot_map->ne[1], ggml_time_us()-routing_start, g.slru.slot_map[il]));
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -621,12 +627,17 @@ struct llama_moe_cache::impl {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
+            MOE_MEASURE(llama_moe_measure::record r("bank", backend, w); r.out << ",\"expert_bytes\":" << expert_size);
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
+#ifdef LLAMA_MOE_MEASURE
+                const int64_t upload_start = ggml_time_us();
+#endif
                 ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                MOE_MEASURE(llama_moe_measure::transfer("admission_h2d", backend, w, fills[i].expert, n, n*expert_size, ggml_time_us()-upload_start));
                 bytes += n*expert_size;
                 i += n;
             }

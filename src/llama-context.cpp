@@ -1,3 +1,4 @@
+#include "llama-moe-measure.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -1899,6 +1900,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    MOE_MEASURE(llama_moe_measure::context = (uintptr_t) this; llama_moe_measure::tokens = ubatch.n_tokens; llama_moe_measure::graph_type = int(gtype));
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3230,11 +3232,16 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    MOE_MEASURE(llama_moe_measure::graph = ++llama_moe_measure::sequence; llama_moe_measure::record r("graph_begin"));
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+
+    MOE_MEASURE(for (const auto & b : backends) { llama_moe_measure::record r("reservation", b.get()); r.out << ",\"bytes\":" << ggml_backend_sched_get_buffer_size(sched.get(), b.get()); });
+
+    MOE_MEASURE(llama_moe_measure::flush());
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
@@ -3268,10 +3275,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
+    MOE_MEASURE(llama_moe_measure::record r("work_copy", backend, src);
+        r.out << ",\"split\":" << (uintptr_t) ggml_graph_node(graph, 0) << ",\"address\":" << (uintptr_t) dst->data << ",\"logical_bytes\":" << ggml_nbytes(dst)
+              << ",\"alloc_bytes\":" << ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(dst->buffer), dst)
+              << ",\"expert_bytes\":" << expert_size);
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+#ifdef LLAMA_MOE_MEASURE
+        const int64_t routing_start = ggml_time_us();
+#endif
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
+
+        MOE_MEASURE(std::vector<int32_t> logical_ids;
+            const int64_t wait_us = ggml_time_us() - routing_start;
+            for (int64_t row = 0; row < ids->ne[1]; ++row) {
+                for (int64_t col = 0; col < ids->ne[0]; ++col) {
+                    logical_ids.push_back(st.ids_data[row*ids->nb[1]/sizeof(int32_t) + col*ids->nb[0]/sizeof(int32_t)]);
+                }
+            }
+            llama_moe_measure::routing(backend, src, logical_ids.data(), logical_ids.size(), n_expert, wait_us));
 
         st.used.assign(n_expert, false);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
@@ -3299,13 +3322,21 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
         for (int64_t e = first; e <= last && lctx->moe_cache; ) {
+#ifdef LLAMA_MOE_MEASURE
+            const int64_t copy_start = ggml_time_us();
+#endif
             const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
             }
+            MOE_MEASURE(llama_moe_measure::transfer("d2d", backend, src, e, n, n*expert_size, ggml_time_us()-copy_start));
             if (next < e) {
+#ifdef LLAMA_MOE_MEASURE
+                const int64_t upload_start = ggml_time_us();
+#endif
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                MOE_MEASURE(llama_moe_measure::transfer("h2d", backend, src, next, e-next, (e-next)*expert_size, ggml_time_us()-upload_start));
             }
             e   += n;
             next = e;
@@ -3316,7 +3347,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
+#ifdef LLAMA_MOE_MEASURE
+            const int64_t upload_start = ggml_time_us();
+#endif
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            MOE_MEASURE(llama_moe_measure::transfer("h2d", backend, src, next, last+1-next, size, ggml_time_us()-upload_start));
         }
 
         first = last + 1;
