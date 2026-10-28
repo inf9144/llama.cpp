@@ -840,6 +840,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
+    // Probe the actual layer device and cache layout before omitting the dense mask.
+    // Other backends cannot silently treat sparse indices as an ordinary attention mask.
+    auto * dev = model.dev_layer(il);
+    if (dev && cparams.flash_attn && cparams.offload_kqv && !cparams.training &&
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+        const auto * attn = mctx_hyb->get_attn();
+        ggml_tensor * k = attn->get_k(ctx0, il);
+        ggml_tensor * v = attn->get_v(ctx0, il);
+        auto cache_on_device = [&](const ggml_tensor * t) {
+            while (t->view_src) {
+                t = t->view_src;
+            }
+            return t->buffer && ggml_backend_dev_supports_buft(dev, ggml_backend_buffer_get_type(t->buffer));
+        };
+        // Dense WMMA reuses K/V across prefill queries, so require more sparsity there.
+        // These conservative crossover ratios still need timings on each target GPU.
+        const int64_t ratio = n_tokens/k->ne[3] <= 8 ? 4 : 16;
+        if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 && cache_on_device(k) && cache_on_device(v) &&
+                k->ne[2] >= std::max<int64_t>(8192, ratio*inp_kpool->n_sel)) {
+            const bool v_trans = v->nb[1] > v->nb[2];
+            k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+            v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+            if (v_trans) {
+                v = ggml_transpose(ctx0, v);
+            }
+            const int64_t n_stream = k->ne[3];
+            ggml_tensor * indices = ggml_qsa_select(ctx0, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs, inp_kpool->n_kv);
+            ggml_tensor * q_probe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, hparams.n_embd_head_k(), n_tokens/n_stream, n_head, n_stream);
+            ggml_tensor * idx_probe = ggml_reshape_4d(ctx0, indices, indices->ne[0], q_probe->ne[1], 1, n_stream);
+            ggml_tensor * probe = ggml_flash_attn_sparse(ctx0, q_probe, k, v, idx_probe, 1.0f);
+            if (ggml_backend_dev_supports_op(dev, indices) && ggml_backend_dev_supports_op(dev, probe)) {
+                cb(indices, "indexer_sel_sparse", il);
+                return indices;
+            }
+        }
+    }
+
     // keep the cells of the live picked pools and the tail, -inf elsewhere
     // all retained cells are in the token's sequence, so the kq_mask is not needed
     if (cparams.fused_top_k_mask) {
@@ -908,7 +946,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     return sel;
 }
 
-// Dense GQA self-attention over the cells that the QSA mask keeps.
+// GQA attention over the QSA selection, using compact indices when the layer device supports them.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
@@ -947,17 +985,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    // the selection replaces the kq_mask and has the same shape
-    // it is not allocated without dense layers reading the kq_mask
-    const ggml_tensor * kq_mask = inp->get_kq_mask();
-    GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
-    cb(sel, "kq_mask_qsa", il);
-
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * cur;
+    if (sel->type == GGML_TYPE_I32) {
+        const bool v_trans = v->nb[1] > v->nb[2];
+        const int64_t n_stream = k->ne[3];
+        q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (v_trans) {
+            v = ggml_transpose(ctx0, v);
+        }
+        ggml_tensor * indices = ggml_reshape_4d(ctx0, sel, n_sel, q->ne[1], 1, n_stream);
+        cur = ggml_flash_attn_sparse(ctx0, q, k, v, indices, kq_scale);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        ggml_build_forward_expand(gf, cur);
+    } else {
+        GGML_ASSERT(ggml_are_same_shape(sel, inp->get_kq_mask()));
+        cb(sel, "kq_mask_qsa", il);
+        cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, n_sel, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

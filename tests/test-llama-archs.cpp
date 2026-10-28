@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "speculative.h"
@@ -2103,6 +2104,133 @@ static int test_kq_derived(size_t seed, float stdev) {
     return 0;
 }
 
+// Substitute the CPU sparse result at each QSA attention boundary, then compare full-model logits.
+// The production CPU graph keeps its dense fallback; this oracle needs no dispatch override.
+static int test_qsa_sparse(size_t seed, float stdev) {
+    auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
+    auto * model = model_and_ctx.first.get();
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    struct oracle {
+        ggml_backend_ptr cpu;
+        std::map<const ggml_tensor *, std::vector<int32_t>> indices;
+        int checks = 0;
+    };
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        oracle ref;
+        ref.cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        ggml_backend_cpu_set_n_threads(ref.cpu.get(), 2);
+        ggml_backend_cpu_set_use_ref(ref.cpu.get(), true);
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 256;
+        cp.n_batch = 32;
+        cp.n_ubatch = 8;
+        cp.n_seq_max = 2;
+        cp.kv_unified = true;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.type_k = cp.type_v = type;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr dense(llama_init_from_model(model, cp));
+        cp.cb_eval_user_data = &ref;
+        cp.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            const bool select = t->op == GGML_OP_TOP_K_MASK;
+            const bool attention = t->op == GGML_OP_FLASH_ATTN_EXT && t->src[3] && t->src[3]->op == GGML_OP_TOP_K_MASK;
+            if (ask || (!select && !attention)) { return select || attention; }
+            auto & ref = *static_cast<oracle *>(data);
+            ggml_context_ptr ctx(ggml_init({1024*1024, nullptr, true}));
+            auto alias = [&](ggml_tensor * src) {
+                auto * a = ggml_new_tensor(ctx.get(), src->type, 4, src->ne);
+                memcpy(a->nb, src->nb, sizeof(a->nb));
+                a->data = src->data;
+                a->buffer = src->buffer;
+                return a;
+            };
+            ggml_tensor * out;
+            ggml_backend_buffer_ptr idx_buffer;
+            if (select) {
+                out = ggml_qsa_select(ctx.get(), alias(t->src[1]), alias(t->src[2]), alias(t->src[3]), alias(t->src[4]), t->ne[0]);
+            } else {
+                auto it = ref.indices.find(t->src[3]);
+                GGML_ASSERT(it != ref.indices.end());
+                auto * q = t->src[0];
+                auto * idx = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, it->second.size()/(q->ne[1]*q->ne[3]), q->ne[1], 1, q->ne[3]);
+                idx_buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), ref.cpu.get()));
+                ggml_backend_tensor_set(idx, it->second.data(), 0, ggml_nbytes(idx));
+                float scale;
+                memcpy(&scale, t->op_params, sizeof(scale));
+                out = ggml_flash_attn_sparse(ctx.get(), alias(q), alias(t->src[1]), alias(t->src[2]), idx, scale);
+            }
+            auto * gf = ggml_new_graph_custom(ctx.get(), 32, false);
+            ggml_build_forward_expand(gf, out);
+            ggml_gallocr_ptr alloc(ggml_gallocr_new(ggml_backend_get_default_buffer_type(ref.cpu.get())));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), gf));
+            GGML_ASSERT(ggml_backend_graph_compute(ref.cpu.get(), gf) == GGML_STATUS_SUCCESS);
+            if (select) {
+                auto & idx = ref.indices[t];
+                idx.resize(ggml_nelements(out));
+                ggml_backend_tensor_get(out, idx.data(), 0, ggml_nbytes(out));
+                const auto * mask = static_cast<const ggml_fp16_t *>(t->data);
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    int64_t next = 0;
+                    for (int64_t cell = 0; cell < t->ne[0]; ++cell) {
+                        if (ggml_fp16_to_fp32(mask[row*t->ne[0] + cell]) == 0.0f) {
+                            GGML_ASSERT(next < out->ne[0] && idx[row*out->ne[0] + next++] == cell);
+                        }
+                    }
+                    while (next < out->ne[0]) { GGML_ASSERT(idx[row*out->ne[0] + next++] == -1); }
+                }
+            } else {
+                GGML_ASSERT(ggml_nbytes(out) == ggml_nbytes(t));
+                GGML_ASSERT(memcmp(out->data, t->data, ggml_nbytes(t)) == 0);
+                memcpy(t->data, out->data, ggml_nbytes(t));
+                ++ref.checks;
+            }
+            return true;
+        };
+        llama_context_ptr sparse(llama_init_from_model(model, cp));
+        GGML_ASSERT(dense && sparse);
+        auto step = [&](int count, int pos0, int pos1) {
+            for (auto * ctx : {dense.get(), sparse.get()}) {
+                common_batch batch(ctx);
+                for (int i = 0; i < count; ++i) {
+                    for (int seq = 0; seq < 2; ++seq) {
+                        const int pos = (seq == 0 ? pos0 : pos1) + i;
+                        batch.add((pos*17 + seq)%n_vocab, pos, seq, true);
+                    }
+                }
+                GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+            }
+            for (int i = 0; i < 2*count; ++i) {
+                GGML_ASSERT(memcmp(llama_get_logits_ith(dense.get(), i), llama_get_logits_ith(sparse.get(), i), n_vocab*sizeof(float)) == 0);
+            }
+        };
+        step(7, 0, 0);
+        std::vector<std::vector<uint8_t>> checkpoints;
+        for (auto * ctx : {dense.get(), sparse.get()}) {
+            std::vector<uint8_t> state(llama_state_get_size(ctx));
+            const size_t size = llama_state_get_data(ctx, state.data(), state.size());
+            GGML_ASSERT(size > 0);
+            state.resize(size);
+            checkpoints.push_back(std::move(state));
+        }
+        step(4, 7, 7);
+        int i = 0;
+        for (auto * ctx : {dense.get(), sparse.get()}) {
+            GGML_ASSERT(llama_state_set_data(ctx, checkpoints[i].data(), checkpoints[i].size()) == checkpoints[i].size());
+            ++i;
+        }
+        for (int pos = 7; pos < 15; ++pos) { step(1, pos, pos); }
+        for (auto * ctx : {dense.get(), sparse.get()}) {
+            GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1));
+        }
+        step(3, 15, 0);
+        GGML_ASSERT(ref.checks > 0);
+        printf("Qwen4Exp QSA sparse CPU oracle: KV=%s, %d attention checks, exact logits after sequence reset and checkpoint rollback\n",
+            ggml_type_name(type), ref.checks);
+    }
+    return 0;
+}
+
 static int test_layer_inputs(size_t seed, float stdev) {
     auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
@@ -2308,6 +2436,7 @@ int main(int argc, char ** argv) {
     bool dflash_vision = false;
     bool dflash_tail = false;
     bool kq_derived = false;
+    bool qsa_sparse = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2383,6 +2512,8 @@ int main(int argc, char ** argv) {
             dflash_device_inputs = true;
         } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
             dflash_vision = true;
+        } else if (strcmp(argv[i], "--test-qsa-sparse") == 0) {
+            qsa_sparse = true;
         } else if (strcmp(argv[i], "--test-kq-derived") == 0) {
             kq_derived = true;
         } else if (strcmp(argv[i], "--test-dflash-tail") == 0) {
@@ -2400,6 +2531,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (qsa_sparse) {
+            return test_qsa_sparse(seed, stdev);
+        }
         if (kq_derived) {
             return test_kq_derived(seed, stdev);
         }

@@ -432,10 +432,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // `KV` points at row 0 of the tile's column slice (i.e. a byte-addressed equivalent of the half2 call
 // above).  The staged values are identical to the F16 conversion's, so the rest of the kernel is
 // unchanged.
-template<ggml_type type_KV, int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+template<ggml_type type_KV, int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool indexed = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_native(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV,
-        const int stride_KV, const int el_off, const int i_sup) {
+        const int stride_KV, const int el_off, const int i_sup,
+        const int32_t * indices = nullptr, const int n_kv = 0) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
     constexpr int cpy_el = cpy_ne * 2;
@@ -470,8 +471,10 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_native(
                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
 
                     __align__(16) half2 tmp[cpy_ne];
-                    if (!oob_check || i < i_sup) {
-                        const char * const __restrict__ row = KV + (size_t) i*stride_KV;
+                    const int cell = indexed ? (i < i_sup ? indices[i] : -1) : i;
+                    const bool valid = indexed ? cell >= 0 && cell < n_kv : !oob_check || i < i_sup;
+                    if (valid) {
+                        const char * const __restrict__ row = KV + (size_t) cell*stride_KV;
                         const int el = el_off + 2*j;
                         ggml_cuda_fattn_dequantize_q8_0_chunk(row, el, tmp);
                     } else {
@@ -569,7 +572,7 @@ static __device__ __forceinline__ void flash_attn_tile_rescale_VKQ(T_acc * const
 
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_Q, typename T_KV, typename T_KV_tmp>
+    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool indexed = false, typename T_Q, typename T_KV, typename T_KV_tmp>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         T_Q        * const Q_tmp,
         const T_KV * const __restrict__ K_h2,
@@ -579,7 +582,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const int k_VKQ_sup,
         const int k_KQ_0,
         float * KQ_acc,
-        const fattn_kv_native_t kv_q8) {
+        const fattn_kv_native_t kv_q8, const int32_t * indices = nullptr, const int n_kv = 0) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -590,8 +593,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     // The native loader must agree with the allocation and launch policy.
     if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
         // V4: read and dequantize the raw quantized cache rows instead of an F16 staging copy.
-        flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-            (kv_q8.K + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
+        flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check, indexed>
+            (kv_q8.K + (indexed ? 0 : int64_t(k_VKQ_0)*kv_q8.stride_K), KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup,
+             indexed ? indices + k_VKQ_0 : nullptr, n_kv);
     } else {
         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
             (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
@@ -668,7 +672,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, ggml_type type_KV, typename T_Q, typename T_KV, typename T_KQ, typename T_acc, typename T_KV_tmp>
+    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool indexed = false, typename T_Q, typename T_KV, typename T_KQ, typename T_acc, typename T_KV_tmp>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_Q       * const Q_tmp,
         const T_KV * const __restrict__ K_h2,
@@ -689,7 +693,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0,
-        const fattn_kv_native_t kv_q8) {
+        const fattn_kv_native_t kv_q8, const int32_t * indices = nullptr, const int n_kv = 0) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -721,13 +725,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, indexed>(
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, indices, n_kv);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV, indexed>(
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, indices, n_kv);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -741,7 +745,21 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         // the per-iteration test makes the compiler rematerialize `derived` out of the parameter space
         // instead of keeping it in registers, and this kernel is register-bound by design.  Hoisting
         // it leaves the packed path's code generation as it was, so decode pays nothing.
-        if (derived.cell_pos != nullptr) {
+        if constexpr (indexed) {
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
+                const int i = i0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+                const int cell = i < k_VKQ_sup ? indices[k_VKQ_0 + i] : -1;
+                float & acc = KQ_acc[(i0/(np*warp_size))*cpw + jc0];
+#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+                acc *= 4.0f;
+#endif
+                if (cell < 0 || cell >= n_kv) {
+                    acc = -INFINITY;
+                }
+                KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], acc + FATTN_KQ_MAX_OFFSET);
+            }
+        } else if (derived.cell_pos != nullptr) {
             // The query token's visibility window, constant across the i loop below.  An empty or
             // foreign cell carries the INT32_MIN sentinel, which is below every tok_lo, so it falls
             // out of the compare and becomes -INFINITY exactly like the packed entry would.  The
@@ -864,8 +882,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
         if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
-            flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-                (kv_q8.V + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
+            flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check, indexed>
+                (kv_q8.V + (indexed ? 0 : int64_t(k_VKQ_0 + k0)*kv_q8.stride_V), KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0,
+                 indexed ? indices + k_VKQ_0 + k0 : nullptr, n_kv);
         } else {
             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
                 (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);

@@ -8961,7 +8961,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * indices = dst->op == GGML_OP_FLASH_ATTN_SPARSE ? dst->src[3] : nullptr;
+    const ggml_tensor * mask  = indices ? nullptr : dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
     const ggml_tensor * cell_pos = dst->src[5];
@@ -9078,7 +9079,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        const int32_t * selected = indices ? (const int32_t *) ((const char *) indices->data + iq1*indices->nb[1] + iq3*indices->nb[3]) : nullptr;
+        const int64_t n_cells = selected ? indices->ne[0] : ic_end;
+        for (int64_t is = selected ? 0 : ic_start; is < n_cells; ++is) {
+            const int64_t ic = selected ? selected[is] : is;
+            if (ic < 0 || ic >= nek1) {
+                continue;
+            }
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
                     (cell_pos ? slope*kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic, iq1) : 0.0f);
             if (mv == -INFINITY) {
@@ -9608,7 +9615,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = dst->op != GGML_OP_FLASH_ATTN_SPARSE && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9665,7 +9672,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = dst->op != GGML_OP_FLASH_ATTN_SPARSE && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -11764,6 +11771,42 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_qsa_select
+
+void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * pools = dst->src[2];
+    const ggml_tensor * tail  = dst->src[3];
+    const int32_t n_kv = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_top = top_k->ne[0]*pools->ne[0];
+
+    for (int64_t row = params->ith; row < dst->ne[1]; row += params->nth) {
+        int32_t * out = (int32_t *) ((char *) dst->data + row*dst->nb[1]);
+        for (int64_t i = 0; i < dst->ne[0]; ++i) {
+            int32_t cell = -1;
+            if (i < n_top) {
+                const int32_t p = *(const int32_t *) ((const char *) top_k->data + row*top_k->nb[1] + (i/pools->ne[0])*top_k->nb[0]);
+                if (p >= 0 && p < score->ne[0] &&
+                        *(const float *) ((const char *) score->data + row*score->nb[1] + p*score->nb[0]) > -INFINITY) {
+                    cell = *(const int32_t *) ((const char *) pools->data + p*pools->nb[1] + (i%pools->ne[0])*pools->nb[0]);
+                }
+            } else {
+                cell = *(const int32_t *) ((const char *) tail->data + row*tail->nb[1] + (i - n_top)*tail->nb[0]);
+            }
+            out[i] = cell >= 0 && cell < n_kv ? cell : INT32_MAX;
+        }
+        std::sort(out, out + dst->ne[0]);
+        int64_t count = 0;
+        for (int64_t i = 0; i < dst->ne[0]; ++i) {
+            if (out[i] != INT32_MAX && (count == 0 || out[i] != out[count - 1])) {
+                out[count++] = out[i];
+            }
+        }
+        std::fill(out + count, out + dst->ne[0], -1);
     }
 }
 

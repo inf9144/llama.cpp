@@ -131,3 +131,9 @@ Legend:
 |                            TRUNC | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
 |                            XIELU | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+## Native QSA in this fork
+
+`QSA_SELECT` forms a compact pool/tail union without a dense attention mask. `FLASH_ATTN_SPARSE` consumes per-query cell indices. The CPU backend provides reference implementations; HIP implements Q8_0 K/V, 256-element heads and GQA ratios divisible by four on gfx1100/gfx1101. CUDA, Vulkan and other backends retain the existing Qwen4Exp mask path. HIP execution and performance validation remain pending on physical hardware; no HIP support CSV is claimed from CPU results.
+
+See [the implementation and validation report](development/hip-qsa-sparse-attention.md).

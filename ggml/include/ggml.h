@@ -602,6 +602,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_QSA_SELECT,
+        GGML_OP_FLASH_ATTN_SPARSE,
+
         GGML_OP_COUNT,
     };
 
@@ -2511,6 +2514,28 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // QSA pool union, sorted by KV cell with duplicates removed and unused slots set to -1.
+    // top_k: I32[n_top, n_queries], score: F32[n_pool, n_queries],
+    // pools: I32[pool_size, n_pool], tail: I32[n_tail, n_queries].
+    // A pool is visible iff score > -INF; cells outside [0, n_kv) are discarded.
+    GGML_API struct ggml_tensor * ggml_qsa_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * pools,
+            struct ggml_tensor  * tail,
+            int32_t               n_kv);
+
+    // Same Q/K/V and output layout as FLASH_ATTN_EXT. No dense mask, bias, sinks or softcap.
+    // indices: I32[n_selected, q->ne[1], 1, q->ne[3]], unique cells or -1 padding per query.
+    GGML_API struct ggml_tensor * ggml_flash_attn_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            float                 scale);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

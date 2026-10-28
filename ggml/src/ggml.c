@@ -1108,9 +1108,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "QSA_SELECT",
+    "FLASH_ATTN_SPARSE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1226,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "qsa_select(top_k, score, pools, tail)",
+    "flash_attn_sparse(q, k, v, indices)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3311,6 +3315,7 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_SPARSE:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3355,6 +3360,7 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_SPARSE:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
@@ -5588,6 +5594,62 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[2] = v;
     result->src[3] = mask;
 
+    return result;
+}
+
+
+struct ggml_tensor * ggml_qsa_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * pools,
+        struct ggml_tensor  * tail,
+        int32_t               n_kv) {
+    GGML_ASSERT(n_kv > 0);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && score->type == GGML_TYPE_F32);
+    GGML_ASSERT(pools->type == GGML_TYPE_I32 && tail->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(top_k) && ggml_is_matrix(score));
+    GGML_ASSERT(ggml_is_matrix(pools) && ggml_is_matrix(tail));
+    GGML_ASSERT(score->ne[1] == top_k->ne[1] && tail->ne[1] == top_k->ne[1]);
+    GGML_ASSERT(pools->ne[1] == score->ne[0]);
+    GGML_ASSERT(pools->ne[0] > 0 && top_k->ne[0] > 0);
+    GGML_ASSERT(tail->ne[0] < INT32_MAX && top_k->ne[0] <= (INT32_MAX - tail->ne[0])/pools->ne[0]);
+
+    const int64_t n_sel = pools->ne[0]*top_k->ne[0] + tail->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, top_k->ne[1]);
+    result->op = GGML_OP_QSA_SELECT;
+    result->src[0] = top_k;
+    result->src[1] = score;
+    result->src[2] = pools;
+    result->src[3] = tail;
+    ggml_set_op_params_i32(result, 0, n_kv);
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * indices,
+        float                 scale) {
+    GGML_ASSERT(q->ne[1] > 0 && q->ne[2] > 0 && q->ne[3] > 0);
+    GGML_ASSERT(k->ne[1] > 0 && k->ne[2] > 0 && k->ne[3] > 0);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[1] == q->ne[1] && indices->ne[2] == 1 && indices->ne[3] == q->ne[3]);
+    GGML_ASSERT(indices->ne[0] > 0 && indices->ne[0] <= INT32_MAX && k->ne[1] <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, v->ne[0], q->ne[2], q->ne[1], q->ne[3]);
+    result->op = GGML_OP_FLASH_ATTN_SPARSE;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = indices;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 3, GGML_PREC_F32);
     return result;
 }
 

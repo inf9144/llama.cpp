@@ -8902,6 +8902,50 @@ struct test_flash_attn_ext : public test_case {
 };
 
 // large Q values, so the online softmax has to rescale the partial results
+struct test_flash_attn_sparse : public test_flash_attn_ext {
+    const int64_t selected;
+    const bool unsorted;
+    test_flash_attn_sparse(int64_t kv, int64_t nb, int64_t selected = 2051, bool unsorted = false,
+            bool permuted = true, int64_t streams = 1)
+        : test_flash_attn_ext(256, 256, 2, {12, streams}, kv, nb, false, false, 0, 0, GGML_PREC_F32,
+              GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, permuted ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3}),
+          selected(selected), unsorted(unsorted) {}
+
+    std::string vars() override { return test_flash_attn_ext::vars() + VAR_TO_STR(selected) + VAR_TO_STR(unsorted); }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*nh*nr23[0]*nb*(hsk + hsv)*selected*nr23[1];
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * base = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, selected, nb, 1, nr23[1]);
+        ggml_set_name(idx, "qsa_indices");
+        return ggml_flash_attn_sparse(ctx, base->src[0], base->src[1], base->src[2], idx, 1.0f/16.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * idx = ggml_get_tensor(ctx, "qsa_indices");
+        std::vector<int32_t> data(ggml_nelements(idx), -1);
+        std::mt19937 gen(0x514153);
+        for (int64_t row = 0; row < nb*nr23[1]; ++row) {
+            const int64_t count = row%7 == 6 ? 0 : selected - row%7;
+            for (int64_t i = 0; i < count; ++i) {
+                data[row*selected + i] = (i*kv/count + row)%kv;
+            }
+            if (row%3 == 1 && count > 1) {
+                data[row*selected + count - 1] = kv + 1;
+            }
+            if (unsorted) {
+                std::shuffle(data.begin() + row*selected, data.begin() + (row + 1)*selected, gen);
+            }
+        }
+        ggml_backend_tensor_set(idx, data.data(), 0, data.size()*sizeof(int32_t));
+    }
+};
+
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
 
@@ -9485,6 +9529,17 @@ struct test_top_k_mask : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+struct test_qsa_select : public test_top_k_mask {
+    test_qsa_select(int64_t kv = 4096, int64_t nb = 8, int64_t top = 512)
+        : test_top_k_mask(GGML_TYPE_F16, kv, 4, kv/4, top, 3, true, nb) {}
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * base = test_top_k_mask::build_graph(ctx);
+        return ggml_qsa_select(ctx, base->src[1], base->src[2], base->src[3], base->src[4], n_kv);
     }
 };
 
@@ -10271,6 +10326,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+
+    for (int width : {1, 2, 3, 4, 5, 6, 7, 8, 32}) {
+        test_cases.emplace_back(new test_qsa_select(4096, width));
+        test_cases.emplace_back(new test_flash_attn_sparse(16384, width));
+    }
+    test_cases.emplace_back(new test_qsa_select(256, 7, 16));
+    test_cases.emplace_back(new test_flash_attn_sparse(16384, 8, 2051, true, false, 2));
+    test_cases.emplace_back(new test_flash_attn_sparse(65536, 32, 2051, true));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
@@ -13332,6 +13395,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    for (int64_t kv : {4096, 32768, 131072, 235520}) {
+        for (int64_t width : {1, 2, 3, 4, 5, 6, 7, 8, 512, 1024}) {
+            test_cases.emplace_back(new test_qsa_select(kv, width));
+            test_cases.emplace_back(new test_flash_attn_sparse(kv, width));
         }
     }
 

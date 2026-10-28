@@ -26,6 +26,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-qsa.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -1128,9 +1129,15 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
-        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
-        : ggml_nbytes(tensor);
+    size_t size = ggml_nbytes(tensor);
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        size = ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor);
+    }
+#ifdef GGML_USE_HIP
+    if (tensor->op == GGML_OP_FLASH_ATTN_SPARSE) {
+        size = ggml_cuda_flash_attn_sparse_get_alloc_size(tensor);
+    }
+#endif
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -2752,6 +2759,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
+#ifdef GGML_USE_HIP
+        case GGML_OP_QSA_SELECT:
+            ggml_cuda_qsa_select(ctx, dst);
+            break;
+        case GGML_OP_FLASH_ATTN_SPARSE:
+            ggml_cuda_flash_attn_sparse(ctx, dst);
+            break;
+#endif
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -6324,6 +6339,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+#ifdef GGML_USE_HIP
+        case GGML_OP_QSA_SELECT:
+            return ggml_cuda_qsa_select_supported(op);
+        case GGML_OP_FLASH_ATTN_SPARSE:
+            return ggml_cuda_flash_attn_sparse_supported(dev_ctx->device, op);
+#endif
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
