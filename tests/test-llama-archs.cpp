@@ -16,6 +16,7 @@
 #include "../src/llama-memory.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-model.h"
+#include "../src/llama-moe-cache-policy.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -144,6 +145,8 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --test-graph-recovery    Test allocation recovery with small CPU models\n");
+    LOG("  --test-moe-cache-prefill Test RDNA3 cache locality, prefill logits and checkpoints\n");
+    LOG("  --test-moe-cache-policy  Test shared SLRU prefill admission and capacity bounds\n");
     LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
     LOG("  --test-dflash-device-inputs  Compare device-gather and host DFlash2 injection\n");
     LOG("  --test-dflash-vision     Test DFlash2 drafting across M-RoPE image positions\n");
@@ -2231,6 +2234,244 @@ static int test_qsa_sparse(size_t seed, float stdev) {
     return 0;
 }
 
+static int test_moe_cache_policy(size_t seed) {
+    GGML_ASSERT(!moe_cache_fits(0, 2, 512, 1024));
+    GGML_ASSERT(!moe_cache_fits(1024, 0, 512, 1024));
+    GGML_ASSERT(!moe_cache_fits(1, 513, 512, 1024));
+    GGML_ASSERT(moe_cache_fits(32, 2, 512, 64));
+    GGML_ASSERT(!moe_cache_fits(33, 2, 512, 64));
+    GGML_ASSERT(moe_cache_fits(INT64_MAX, 10, 512, 512));
+    GGML_ASSERT(!moe_cache_fits(INT64_MAX, 10, 512, 511));
+
+    moe_cache_slru cache;
+    constexpr int layers = 3, experts = 16, slots = 20;
+    std::vector<std::vector<int32_t>> maps(layers, std::vector<int32_t>(experts, -1));
+    cache.init(layers, experts, slots);
+    for (int il = 0; il < layers; ++il) { cache.slot_map[il] = maps[il].data(); }
+    std::vector<moe_cache_slru::fill> fills;
+    size_t hits = 0;
+    int32_t decode[] = {1, 4, 1};
+    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 0 && fills.size() == 2);
+    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 2 && fills.empty());
+    const auto protected_slots = std::vector<int32_t>{maps[0][1], maps[0][4]};
+    int32_t prefill[] = {4, 2, 2, 7, 1};
+    GGML_ASSERT(cache.plan(1, prefill, 5, fills, hits, false) && fills.size() == 4);
+    GGML_ASSERT(cache.plan(1, prefill, 5, fills, hits, false) && hits == 4 && fills.empty());
+    GGML_ASSERT(cache.n_protected == 2);
+    for (auto slot : protected_slots) { GGML_ASSERT(cache.is_protected[slot]); }
+    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 2);
+
+    std::mt19937 gen(seed);
+    for (int step = 0; step < 2000; ++step) {
+        const int il = gen() % layers;
+        const bool promote = step % 3 == 0;
+        std::vector<int32_t> ids(1 + gen() % 128);
+        for (auto & id : ids) { id = gen() % experts; }
+        const auto before = maps[il];
+        std::vector<bool> selected(experts, false);
+        for (auto id : ids) { selected[id] = true; }
+        size_t expected_hits = 0;
+        for (int e = 0; e < experts; ++e) { expected_hits += selected[e] && before[e] >= 0; }
+        GGML_ASSERT(cache.plan(il, ids.data(), ids.size(), fills, hits, promote));
+        GGML_ASSERT(hits == expected_hits);
+        std::vector<bool> filled(experts, false);
+        for (const auto & fill : fills) {
+            GGML_ASSERT(selected[fill.expert] && before[fill.expert] < 0 && !filled[fill.expert]);
+            GGML_ASSERT(maps[il][fill.expert] == fill.slot);
+            filled[fill.expert] = true;
+        }
+        for (int l = 0; l < layers; ++l) {
+            for (int e = 0; e < experts; ++e) {
+                const int slot = maps[l][e];
+                if (slot >= 0) { GGML_ASSERT(slot < slots && cache.key_of[slot] == l*experts + e); }
+                if (l == il && selected[e]) {
+                    GGML_ASSERT(slot >= 0);
+                    GGML_ASSERT(before[e] < 0 ? filled[e] : slot == before[e]);
+                }
+            }
+        }
+        int protected_count = 0, listed = 0;
+        std::vector<bool> visited(slots, false);
+        for (int segment = 0; segment < 2; ++segment) {
+            int prev = -1;
+            for (int slot = cache.head[segment]; slot >= 0; slot = cache.next[slot]) {
+                GGML_ASSERT(slot < slots && !visited[slot]);
+                GGML_ASSERT(cache.prev[slot] == prev && cache.is_protected[slot] == bool(segment));
+                const int key = cache.key_of[slot];
+                if (key >= 0) { GGML_ASSERT(maps[key / experts][key % experts] == slot); }
+                visited[slot] = true;
+                prev = slot;
+                ++listed;
+                protected_count += segment;
+            }
+            GGML_ASSERT(prev == cache.tail[segment]);
+        }
+        GGML_ASSERT(listed == slots && protected_count == cache.n_protected && protected_count <= slots/2);
+    }
+    cache.seen_gen = UINT32_MAX;
+    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits, false) && cache.seen_gen == 1);
+    moe_cache_slru tiny;
+    tiny.init(1, experts, 2);
+    std::vector<int32_t> tiny_map(experts, -1);
+    tiny.slot_map[0] = tiny_map.data();
+    int32_t excessive[] = {0, 1, 2};
+    GGML_ASSERT(!tiny.plan(0, excessive, 3, fills, hits, false));
+    GGML_ASSERT(std::all_of(tiny_map.begin(), tiny_map.end(), [](int32_t slot) { return slot == -1; }));
+    printf("MoE cache policy: capacity bounds, prefill probation, pinned selections and 2000 mixed plans passed\n");
+    return 0;
+}
+
+static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_backend) {
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto dev = ggml_backend_dev_get(i);
+        if (target_backend && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) { continue; }
+        auto reg = ggml_backend_dev_backend_reg(dev);
+        using supports_fn = bool (*)(ggml_backend_dev_t);
+        auto supports = reg ? (supports_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_cache_supports_prefill") : nullptr;
+        if (supports && supports(dev)) { devices.push_back(dev); }
+    }
+    const bool cpu_fixture = devices.empty();
+    if (cpu_fixture) {
+        devices.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        GGML_ASSERT(devices.back());
+        printf("No supported RDNA3 HIP device: check the CPU fixture; GPU cache execution is SKIPPED\n");
+    }
+    devices.resize(std::min<size_t>(devices.size(), 2));
+    auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    gguf_set_val_u32(meta.get(), "qwen4exp.expert_count", 16);
+    gguf_set_val_u32(meta.get(), "qwen4exp.expert_feed_forward_length", 512);
+    ggml_context_ptr types(ggml_init({16*ggml_tensor_overhead(), nullptr, true}));
+    for (int il = 0; il < 2; ++il) {
+        for (const char * bank : {"gate_up", "down"}) {
+            const bool down = strcmp(bank, "down") == 0;
+            auto * t = ggml_new_tensor_3d(types.get(), GGML_TYPE_Q8_0, down ? 512 : 256, down ? 256 : 1024, 16);
+            ggml_format_name(t, "blk.%d.ffn_%s_exps.weight", il, bank);
+            gguf_add_tensor(meta.get(), t);
+        }
+    }
+    const llama_model_tensor_buft_override overrides[] = {
+        { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() }, { nullptr, nullptr },
+    };
+    auto mp = llama_model_default_params();
+    auto terminated = devices;
+    terminated.push_back(nullptr);
+    mp.devices = terminated.data();
+    mp.n_gpu_layers = cpu_fixture ? 0 : 999;
+    mp.tensor_buft_overrides = overrides;
+    mp.progress_callback = silent_model_load_progress;
+    tensor_data_params data = {seed, stdev};
+    auto fill = [](ggml_tensor * t, void * userdata) {
+        if (t->type != GGML_TYPE_Q8_0) { set_tensor_data(t, userdata); return; }
+        std::vector<float> values(ggml_nelements(t));
+        fill_normal(values, t->name, *static_cast<tensor_data_params *>(userdata));
+        std::vector<uint8_t> quantized(ggml_nbytes(t));
+        GGML_ASSERT(ggml_quantize_chunk(t->type, values.data(), quantized.data(), 0, ggml_nrows(t), t->ne[0], nullptr) == quantized.size());
+        ggml_backend_tensor_set(t, quantized.data(), 0, quantized.size());
+    };
+    llama_model_ptr model(llama_model_init_from_user(meta.get(), fill, &data, mp));
+    GGML_ASSERT(model);
+    struct capture {
+        llama_context * ctx = nullptr;
+        const llama_model * model = nullptr;
+        bool prefill = false;
+        bool check_locality = true;
+        int cached = 0;
+        int fallback = 0;
+    };
+    // Compare the same GPU model with and without caching, with equal and small/zero budgets.
+    for (int config = 0; config < (cpu_fixture ? 1 : 3); ++config) {
+        std::vector<size_t> budgets(llama_max_devices(), 0);
+        for (size_t i = 0; i < devices.size(); ++i) { budgets[i] = cpu_fixture ? 0 : 8*1024*1024; }
+        if (config == 1) { budgets[devices.size() - 1] = 4*1024*1024; }
+        if (config == 2) { budgets[0] = 0; }
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 2048;
+        cp.n_batch = cp.n_ubatch = 1024;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        // Observe both contexts at the same operation boundaries.
+        cp.cb_eval = [](ggml_tensor * t, bool ask, void * userdata) {
+            if (ask) { return t->op == GGML_OP_MUL_MAT_ID; }
+            auto & cap = *static_cast<capture *>(userdata);
+            if (cap.check_locality && cap.prefill && t->ne[2] > moe_cache_max_batch) {
+                const char * name = t->src[0]->name;
+                const char * block = strstr(name, "blk.");
+                int il = -1;
+                GGML_ASSERT(block && sscanf(block, "blk.%d.", &il) == 1);
+                if (strncmp(name, "moe_cache.", 10) == 0) {
+                    auto backend = ggml_backend_sched_get_tensor_backend(cap.ctx->get_sched(), t);
+                    GGML_ASSERT(backend && ggml_backend_get_device(backend) == cap.model->dev_layer(il));
+                    ++cap.cached;
+                } else {
+                    ++cap.fallback;
+                }
+            }
+            return true;
+        };
+        capture cap;
+        cap.model = model.get();
+        cap.check_locality = !cpu_fixture;
+        // Reference placement follows the stock scheduler and is not constrained by cache ownership.
+        auto reference_cp = cp;
+        reference_cp.cb_eval = [](ggml_tensor * t, bool ask, void *) {
+            return ask ? t->op == GGML_OP_MUL_MAT_ID : true;
+        };
+        llama_context_ptr reference(llama_init_from_model(model.get(), reference_cp));
+        cp.cb_eval_user_data = &cap;
+        cp.moe_cache_split = budgets.data();
+        llama_context_ptr actual(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(actual && reference);
+        cap.ctx = actual.get();
+        const auto actual_memory = actual->memory_breakdown();
+        const auto reference_memory = reference->memory_breakdown();
+        for (size_t i = 0; i < devices.size(); ++i) {
+            auto buft = ggml_backend_dev_buffer_type(devices[i]);
+            const size_t allocated = actual_memory.at(buft).context - reference_memory.at(buft).context;
+            GGML_ASSERT(allocated <= budgets[i]);
+        }
+        llama_pos pos = 0, ref_pos = 0;
+        double worst_nmse = 0;
+        auto step = [&](int tokens) {
+            cap.prefill = tokens > moe_cache_max_batch;
+            const auto expected = recovery_decode(reference.get(), ref_pos, tokens, tokens, false, false);
+            const auto result = recovery_decode(actual.get(), pos, tokens, tokens, false, false);
+            const auto error = nmse(expected, result);
+            GGML_ASSERT(std::isfinite(error) && error < 5e-4);
+            worst_nmse = std::max(worst_nmse, error);
+        };
+        step(64);
+        std::vector<std::vector<uint8_t>> checkpoint;
+        for (auto * ctx : {reference.get(), actual.get()}) {
+            std::vector<uint8_t> state(llama_state_get_size(ctx));
+            const size_t size = llama_state_get_data(ctx, state.data(), state.size());
+            GGML_ASSERT(size > 0);
+            state.resize(size);
+            checkpoint.push_back(std::move(state));
+        }
+        for (int width : {1, 4, 8}) { step(width); }
+        int index = 0;
+        for (auto * ctx : {reference.get(), actual.get()}) {
+            const auto & state = checkpoint[index++];
+            GGML_ASSERT(llama_state_set_data(ctx, state.data(), state.size()) == state.size());
+        }
+        pos = ref_pos = 64;
+        step(8);
+        for (int width : {512, 1024}) {
+            for (auto * ctx : {reference.get(), actual.get()}) { llama_memory_clear(llama_get_memory(ctx), true); }
+            pos = ref_pos = 0;
+            step(width);
+            step(4);
+        }
+        const bool any_budget = std::any_of(budgets.begin(), budgets.end(), [](size_t b) { return b != 0; });
+        GGML_ASSERT(!any_budget || config != 0 || cap.cached > 0);
+        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, fallback=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
+            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.fallback, worst_nmse);
+    }
+    return 0;
+}
+
 static int test_layer_inputs(size_t seed, float stdev) {
     auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(meta.get(), nullptr, seed, stdev, {});
@@ -2437,6 +2678,8 @@ int main(int argc, char ** argv) {
     bool dflash_tail = false;
     bool kq_derived = false;
     bool qsa_sparse = false;
+    bool moe_cache_policy = false;
+    bool moe_cache_prefill = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2512,6 +2755,10 @@ int main(int argc, char ** argv) {
             dflash_device_inputs = true;
         } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
             dflash_vision = true;
+        } else if (strcmp(argv[i], "--test-moe-cache-prefill") == 0) {
+            moe_cache_prefill = true;
+        } else if (strcmp(argv[i], "--test-moe-cache-policy") == 0) {
+            moe_cache_policy = true;
         } else if (strcmp(argv[i], "--test-qsa-sparse") == 0) {
             qsa_sparse = true;
         } else if (strcmp(argv[i], "--test-kq-derived") == 0) {
@@ -2531,6 +2778,12 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
+        if (moe_cache_prefill) {
+            return test_moe_cache_prefill(seed, stdev, target_backend);
+        }
+        if (moe_cache_policy) {
+            return test_moe_cache_policy(seed);
+        }
         if (qsa_sparse) {
             return test_qsa_sparse(seed, stdev);
         }

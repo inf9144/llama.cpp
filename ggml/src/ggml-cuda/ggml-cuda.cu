@@ -6523,6 +6523,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 #if defined(GGML_USE_HIP)
+static bool ggml_backend_hip_moe_cache_supports_prefill(ggml_backend_dev_t dev) {
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    const auto & info = ggml_cuda_info().devices[ctx->device];
+    return GGML_CUDA_CC_IS_RDNA3_0(info.cc) && info.warp_size == 32;
+}
+
 static bool ggml_backend_hip_qsa_select_uses_radix(ggml_backend_dev_t dev, const ggml_tensor * op) {
     const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
     return op && op->op == GGML_OP_QSA_SELECT && ggml_cuda_qsa_select_uses_radix(ctx->device, op);
@@ -6550,6 +6556,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_get_features;
     }
 #if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_hip_moe_cache_supports_prefill") == 0) {
+        return (void *) ggml_backend_hip_moe_cache_supports_prefill;
+    }
     if (strcmp(name, "ggml_backend_hip_qsa_select_uses_radix") == 0) {
         return (void *) ggml_backend_hip_qsa_select_uses_radix;
     }

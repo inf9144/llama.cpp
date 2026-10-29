@@ -5821,6 +5821,44 @@ struct test_mul_mat_id_glu : public test_mul_mat_id {
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_GLU"; }
 };
 
+// Shared cache banks include slots from other layers and cross the MMB scan boundary.
+struct test_moe_cache_bank : public test_mul_mat_id {
+    const bool glu;
+
+    test_moe_cache_bank(ggml_type type, int slots, int tokens, bool broadcast, bool glu = false)
+        : test_mul_mat_id(type, GGML_TYPE_F32, slots, 4, broadcast, 128, tokens, 256), glu(glu) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MOE_CACHE_BANK"; }
+    std::string vars() override { return test_mul_mat_id::vars() + ",glu=" + std::to_string(glu); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * up = test_mul_mat_id::build_graph(ctx);
+        if (!glu) { return up; }
+        auto * gate_weights = ggml_dup_tensor(ctx, up->src[0]);
+        ggml_set_name(gate_weights, "gate_weights");
+        auto * gate = ggml_mul_mat_id(ctx, gate_weights, up->src[1], up->src[2]);
+        return ggml_swiglu_split(ctx, gate, up);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        auto * ids = ggml_get_tensor(ctx, "ids");
+        std::vector<int32_t> data(ggml_nelements(ids), 0);
+        for (int64_t row = 0; row < ids->ne[1]; ++row) {
+            auto * dst = data.data() + row*ids->ne[0];
+            const int e = 1 + (row*37) % (n_mats - 2);
+            dst[0] = n_mats - 1;
+            dst[1] = e;
+            dst[2] = 0;
+            dst[3] = 1 + e % (n_mats - 2);
+        }
+        ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+    }
+
+    void reinit_perf_iter(ggml_context *) override {}
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11681,6 +11719,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, true, 128, 512, 512));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, false, 128, 512, 512, 0, false, true));
     }
+
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_Q8_0, 1024, 512, true));
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_Q8_0, 1025, 512, true));
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_Q8_0, 3202, 512, true));
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_IQ3_S, 3202, 1024, false));
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_Q8_0, 1025, 512, true, true));
+    test_cases.emplace_back(new test_moe_cache_bank(GGML_TYPE_IQ3_S, 3202, 512, true, true));
 
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
     // and 1024 at the LLAMA_MAX_EXPERTS limit

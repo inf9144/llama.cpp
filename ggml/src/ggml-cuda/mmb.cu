@@ -809,21 +809,29 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
     const int e = threadIdx.x;
     for (int i = e; i < nbig_max;   i += blockDim.x) desc_big[i]   = UINT32_MAX;
     for (int i = e; i < nsmall_max; i += blockDim.x) desc_small[i] = UINT32_MAX;
-    int cnt = (e < E) ? bounds[e + 1] - bounds[e] : 0;
-    const bool big = cnt >= thresh;
-    const int tb = big ? (cnt + BN_BIG - 1) / BN_BIG : 0;
-    const int ts = big ? 0 : (cnt + BN_SMALL - 1) / BN_SMALL;
-    sb[e] = tb; ss[e] = ts;
-    __syncthreads();
-    for (int off = 1; off < 1024; off <<= 1) {
-        const int vb = (e >= off) ? sb[e - off] : 0, vs = (e >= off) ? ss[e - off] : 0;
+    int carry_big = 0, carry_small = 0;
+    // Cache banks can span several layers; scan them in fixed-size blocks.
+    for (int base = 0; base < E; base += 1024) {
+        const int expert = base + e;
+        const int cnt = expert < E ? bounds[expert + 1] - bounds[expert] : 0;
+        const bool big = cnt >= thresh;
+        const int tb = big ? (cnt + BN_BIG - 1) / BN_BIG : 0;
+        const int ts = big ? 0 : (cnt + BN_SMALL - 1) / BN_SMALL;
+        sb[e] = tb; ss[e] = ts;
         __syncthreads();
-        sb[e] += vb; ss[e] += vs;
+        for (int off = 1; off < 1024; off <<= 1) {
+            const int vb = e >= off ? sb[e - off] : 0, vs = e >= off ? ss[e - off] : 0;
+            __syncthreads();
+            sb[e] += vb; ss[e] += vs;
+            __syncthreads();
+        }
+        const int bb = carry_big + sb[e] - tb, bs = carry_small + ss[e] - ts;
+        for (int jt = 0; jt < tb; ++jt) { const int idx = bb + jt; if (idx < nbig_max)   desc_big[idx]   = (uint32_t) expert | ((uint32_t) jt << 16); }
+        for (int jt = 0; jt < ts; ++jt) { const int idx = bs + jt; if (idx < nsmall_max) desc_small[idx] = (uint32_t) expert | ((uint32_t) jt << 16); }
+        carry_big += sb[1023];
+        carry_small += ss[1023];
         __syncthreads();
     }
-    const int bb = sb[e] - tb, bs = ss[e] - ts;
-    for (int jt = 0; jt < tb; ++jt) { const int idx = bb + jt; if (idx < nbig_max)   desc_big[idx]   = (uint32_t)e | ((uint32_t)jt << 16); }
-    for (int jt = 0; jt < ts; ++jt) { const int idx = bs + jt; if (idx < nsmall_max) desc_small[idx] = (uint32_t)e | ((uint32_t)jt << 16); }
 }
 
 } // namespace
@@ -858,7 +866,7 @@ bool ggml_cuda_mmb_supported_mm(int device, const ggml_tensor * w, const ggml_te
 }
 
 bool ggml_cuda_mmb_supported_mmid(int device, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, const ggml_tensor * dst) {
-    if (!mmb_weight_supported(device, w) || w->type == GGML_TYPE_BF16 || w->ne[3] != 1 || w->ne[2] < 1 || w->ne[2] > 1024 ||
+    if (!mmb_weight_supported(device, w) || w->type == GGML_TYPE_BF16 || w->ne[3] != 1 || w->ne[2] < 1 || w->ne[2] > 32768 ||
         x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
         !ggml_is_contiguous(x) || !ggml_is_contiguous(dst) || ids->nb[0] != sizeof(int32_t) ||
         ids->nb[1] % sizeof(int32_t) != 0 || ids->nb[1] / sizeof(int32_t) > INT32_MAX) {

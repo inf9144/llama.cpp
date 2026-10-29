@@ -230,6 +230,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
 
+    llama_test(test-llama-archs NAME test-moe-cache-policy ARGS --test-moe-cache-policy -s 42)
+    llama_test(test-llama-archs NAME test-moe-cache-prefill ARGS --test-moe-cache-prefill -s 42)
     llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
     llama_test(test-llama-archs NAME test-qwen4exp-layer-inputs ARGS --test-layer-inputs -s 42)
     llama_test(test-llama-archs NAME test-dflash-device-inputs ARGS --test-dflash-device-inputs -s 42)
