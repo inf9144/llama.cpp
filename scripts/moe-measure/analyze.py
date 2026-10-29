@@ -44,7 +44,7 @@ def analyze(lines, phase):
                 group['hits'].update(i for i, n in enumerate(histogram) if n and event['resident'][i])
         if 'expert_bytes' in event:
             group['banks'][event['tensor']] = event['expert_bytes']
-        if kind in ('h2d', 'admission_h2d'):
+        if kind in ('h2d', 'admission_h2d', 'stage_h2d'):
             group['h2d_bytes'] += event['bytes']
             group['upload_enqueue_us'] += event['enqueue_us']
         elif kind == 'd2d':

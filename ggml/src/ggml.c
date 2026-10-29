@@ -1110,9 +1110,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
     "QSA_SELECT",
     "FLASH_ATTN_SPARSE",
+    "MUL_MAT_ID_STREAM",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1228,9 +1229,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "qsa_select(top_k, score, pools, tail)",
     "flash_attn_sparse(q, k, v, indices)",
+    "mul_mat_id_stream(bank, x, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3309,6 +3311,7 @@ bool ggml_prec_set_acc(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_STREAM:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 0, prec_i32);
@@ -3337,6 +3340,7 @@ bool ggml_prec_set_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_STREAM:
             {
                 if (idx != 1) {
                     return false;
@@ -3358,6 +3362,7 @@ enum ggml_prec ggml_prec_get_acc(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_STREAM:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
@@ -3375,6 +3380,7 @@ enum ggml_prec ggml_prec_get_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_STREAM:
             if (idx != 1) {
                 return GGML_PREC_UNDEFINED;
             }

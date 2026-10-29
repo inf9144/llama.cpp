@@ -7,6 +7,8 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "../ggml-moe.h"
+#include <vector>
 
 #include <algorithm>
 #include <cfloat>
@@ -12681,5 +12683,47 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// Scalar oracle for the process-local streaming contract. Production activation
+// is HIP-only; the CPU implementation lets tests validate packet completeness,
+// logical IDs and noncontiguous weight addresses against ordinary MUL_MAT_ID.
+void ggml_compute_forward_mul_mat_id_stream(const ggml_compute_params * params, ggml_tensor * dst) {
+    GGML_ASSERT(params->ith == 0 && params->nth == 1);
+    const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
+    const auto stream = ggml_moe_get_stream(dst);
+    GGML_ASSERT(ggml_is_contiguous(dst) && x->type == GGML_TYPE_F32);
+    const auto to_float = ggml_get_type_traits(w->type)->to_float;
+    GGML_ASSERT(to_float);
+    std::vector<float> row(w->ne[0]);
+    std::vector<bool> visited(stream.n_experts, false);
+    memset(dst->data, 0, ggml_nbytes(dst));
+    ggml_moe_packet packet = {};
+    for (int32_t p = 0; stream.prepare(stream.userdata, p, &packet); ++p) {
+        GGML_ASSERT(packet.count >= 0 && packet.count <= stream.n_experts);
+        for (int32_t a = 0; a < packet.count; ++a) {
+            const int32_t e = packet.experts[a];
+            GGML_ASSERT(e >= 0 && e < stream.n_experts && !visited[e] && packet.addresses[e]);
+            visited[e] = true;
+            const char * weights = (const char *) (uintptr_t) packet.addresses[e];
+            for (int64_t m = 0; m < w->ne[1]; ++m) {
+                to_float(weights + m*w->nb[1], row.data(), w->ne[0]);
+                for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                    for (int64_t u = 0; u < ids->ne[0]; ++u) {
+                        const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + u*ids->nb[0]);
+                        if (id != e) continue;
+                        const float * input = (const float *) ((const char *) x->data + t*x->nb[2] + (u % x->ne[1])*x->nb[1]);
+                        double sum = 0;
+                        for (int64_t k = 0; k < w->ne[0]; ++k) sum += double(row[k])*input[k];
+                        ((float *) dst->data)[m + w->ne[1]*(u + ids->ne[0]*t)] = float(sum);
+                    }
+                }
+            }
+        }
+    }
+    for (int64_t t = 0; t < ids->ne[1]; ++t) for (int64_t u = 0; u < ids->ne[0]; ++u) {
+        const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + u*ids->nb[0]);
+        GGML_ASSERT(id == -1 || (id >= 0 && id < stream.n_experts && visited[id]));
     }
 }

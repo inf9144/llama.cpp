@@ -2654,6 +2654,22 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_ID_STREAM: {
+#if defined(GGML_USE_HIP)
+            const auto streaming = ggml_moe_get_stream(dst);
+            ggml_tensor logical = *dst->src[0];
+            logical.ne[2] = streaming.n_experts;
+            logical.nb[3] = logical.nb[2]*logical.ne[2];
+            if (ggml_cuda_mmb_supported_mmid(ctx.device, &logical, dst->src[1], dst->src[2], dst)) {
+                ggml_cuda_mul_mat_id_mmb(ctx, dst->src[0], dst->src[1], dst->src[2], dst, &streaming);
+            } else {
+                ggml_cuda_mul_mat_q(ctx, dst->src[0], dst->src[1], dst->src[2], dst, nullptr, &streaming);
+            }
+            break;
+#else
+            return false;
+#endif
+        }
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -2997,6 +3013,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
+
+        // Packet counts and H2D uploads are runtime data. The GGML graph stays
+        // reusable, but this split must execute directly, outside HIP capture.
+        if (node->op == GGML_OP_MUL_MAT_ID_STREAM) return false;
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -5953,6 +5973,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_ID_STREAM: {
+#if defined(GGML_USE_HIP)
+            const auto & info = ggml_cuda_info().devices[dev_ctx->device];
+            const auto config = ggml_moe_get_stream(op);
+            const auto * w = op->src[0];
+            return GGML_CUDA_CC_IS_RDNA3_0(info.cc) && info.warp_size == 32 &&
+                config.prepare && config.n_experts > 0 && config.n_experts <= 32768 &&
+                ggml_moe_stream_type(w->type) && w->ne[0] % 256 == 0 && w->ne[1] % 128 == 0 &&
+                ggml_is_contiguous(w) && ggml_is_contiguous(op->src[1]) &&
+                op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                ggml_get_op_params_i32(op, 3) != GGML_PREC_F32;
+#else
+            return false;
+#endif
+        }
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -6380,6 +6415,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_MUL_MAT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_STREAM:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return op->ne[2];

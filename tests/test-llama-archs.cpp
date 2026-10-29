@@ -2243,81 +2243,83 @@ static int test_moe_cache_policy(size_t seed) {
     GGML_ASSERT(moe_cache_fits(INT64_MAX, 10, 512, 512));
     GGML_ASSERT(!moe_cache_fits(INT64_MAX, 10, 512, 511));
 
-    moe_cache_slru cache;
-    constexpr int layers = 3, experts = 16, slots = 20;
+    moe_cache_clock clock;
+    clock.begin(0, 0, 7); GGML_ASSERT(clock.tokens == 8);
+    clock.begin(0, 4, 7); GGML_ASSERT(clock.tokens == 8); // repeated verify / rollback
+    clock.begin(0, 7, 8); GGML_ASSERT(clock.tokens == 9);
+    clock.begin(1, 20, 23); GGML_ASSERT(clock.tokens == 13); // distinct sequence, cached prefix
+    clock.begin(0, 0, 3); GGML_ASSERT(clock.tokens == 17); // new prompt
+
+    moe_cache_policy cache;
+    constexpr int layers = 3, experts = 16, slots = 10;
     std::vector<std::vector<int32_t>> maps(layers, std::vector<int32_t>(experts, -1));
     cache.init(layers, experts, slots);
-    for (int il = 0; il < layers; ++il) { cache.slot_map[il] = maps[il].data(); }
-    std::vector<moe_cache_slru::fill> fills;
+    for (int il = 0; il < layers; ++il) cache.slot_map[il] = maps[il].data();
+    std::vector<moe_cache_policy::fill> fills;
     size_t hits = 0;
-    int32_t decode[] = {1, 4, 1};
-    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 0 && fills.size() == 2);
-    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 2 && fills.empty());
-    const auto protected_slots = std::vector<int32_t>{maps[0][1], maps[0][4]};
-    int32_t prefill[] = {4, 2, 2, 7, 1};
-    GGML_ASSERT(cache.plan(1, prefill, 5, fills, hits, false) && fills.size() == 4);
-    GGML_ASSERT(cache.plan(1, prefill, 5, fills, hits, false) && hits == 4 && fills.empty());
-    GGML_ASSERT(cache.n_protected == 2);
-    for (auto slot : protected_slots) { GGML_ASSERT(cache.is_protected[slot]); }
-    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits) && hits == 2);
-
     std::mt19937 gen(seed);
+    moe_cache_policy scoring; scoring.init(1, 1, 1);
+    for (int i = 0; i < 4096; ++i) {
+        const uint64_t history = (uint64_t(gen()) << 32) | gen();
+        const int delta = gen() % 32;
+        scoring.needs[0].history = history; scoring.needs[0].slice = 0;
+        const uint64_t aged = delta >= 16 ? 0 : history << (4*delta);
+        uint32_t expected = 0;
+        for (int n = 0; n < 16; ++n) expected += ((aged >> (4*n)) & 15)*(n < 4 ? 4 : 1);
+        GGML_ASSERT(scoring.score(0, delta) == expected);
+    }
     for (int step = 0; step < 2000; ++step) {
         const int il = gen() % layers;
-        const bool promote = step % 3 == 0;
-        std::vector<int32_t> ids(1 + gen() % 128);
-        for (auto & id : ids) { id = gen() % experts; }
+        const bool force = step % 3 == 0;
+        std::vector<int32_t> ids(1 + gen() % (force ? 8 : 128));
+        for (auto & id : ids) id = gen() % experts;
         const auto before = maps[il];
-        std::vector<bool> selected(experts, false);
-        for (auto id : ids) { selected[id] = true; }
+        std::vector<bool> selected(experts, false), filled(experts, false), temporary(experts, false);
+        for (auto id : ids) selected[id] = true;
         size_t expected_hits = 0;
-        for (int e = 0; e < experts; ++e) { expected_hits += selected[e] && before[e] >= 0; }
-        GGML_ASSERT(cache.plan(il, ids.data(), ids.size(), fills, hits, promote));
+        for (int e = 0; e < experts; ++e) expected_hits += selected[e] && before[e] >= 0;
+        GGML_ASSERT(cache.plan(il, ids.data(), ids.size(), fills, hits, step*37, force));
         GGML_ASSERT(hits == expected_hits);
-        std::vector<bool> filled(experts, false);
         for (const auto & fill : fills) {
             GGML_ASSERT(selected[fill.expert] && before[fill.expert] < 0 && !filled[fill.expert]);
             GGML_ASSERT(maps[il][fill.expert] == fill.slot);
             filled[fill.expert] = true;
         }
-        for (int l = 0; l < layers; ++l) {
-            for (int e = 0; e < experts; ++e) {
-                const int slot = maps[l][e];
-                if (slot >= 0) { GGML_ASSERT(slot < slots && cache.key_of[slot] == l*experts + e); }
-                if (l == il && selected[e]) {
-                    GGML_ASSERT(slot >= 0);
-                    GGML_ASSERT(before[e] < 0 ? filled[e] : slot == before[e]);
-                }
+        for (auto e : cache.temporary) { GGML_ASSERT(!temporary[e]); temporary[e] = true; }
+        for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
+            const int slot = maps[l][e];
+            if (slot >= 0) GGML_ASSERT(slot < slots && cache.key_of[slot] == l*experts + e);
+            if (l == il && selected[e]) {
+                GGML_ASSERT((slot >= 0) != temporary[e]);
+                GGML_ASSERT(before[e] < 0 ? (filled[e] || temporary[e]) : slot == before[e]);
             }
         }
-        int protected_count = 0, listed = 0;
-        std::vector<bool> visited(slots, false);
-        for (int segment = 0; segment < 2; ++segment) {
-            int prev = -1;
-            for (int slot = cache.head[segment]; slot >= 0; slot = cache.next[slot]) {
-                GGML_ASSERT(slot < slots && !visited[slot]);
-                GGML_ASSERT(cache.prev[slot] == prev && cache.is_protected[slot] == bool(segment));
-                const int key = cache.key_of[slot];
-                if (key >= 0) { GGML_ASSERT(maps[key / experts][key % experts] == slot); }
-                visited[slot] = true;
-                prev = slot;
-                ++listed;
-                protected_count += segment;
-            }
-            GGML_ASSERT(prev == cache.tail[segment]);
+        for (int s = 0; s < slots; ++s) {
+            const int key = cache.key_of[s];
+            GGML_ASSERT(key < 0 || maps[key/experts][key % experts] == s);
         }
-        GGML_ASSERT(listed == slots && protected_count == cache.n_protected && protected_count <= slots/2);
     }
-    cache.seen_gen = UINT32_MAX;
-    GGML_ASSERT(cache.plan(0, decode, 3, fills, hits, false) && cache.seen_gen == 1);
-    moe_cache_slru tiny;
-    tiny.init(1, experts, 2);
-    std::vector<int32_t> tiny_map(experts, -1);
-    tiny.slot_map[0] = tiny_map.data();
+    // One hundred assignments in one batch still count as one weight request.
+    moe_cache_policy tiny; tiny.init(1, experts, 2);
+    std::vector<int32_t> tiny_map(experts, -1); tiny.slot_map[0] = tiny_map.data();
+    int32_t initial[] = {0, 1};
+    GGML_ASSERT(tiny.plan(0, initial, 2, fills, hits, 1, false));
+    const uint64_t history = tiny.needs[0].history;
+    for (int retry = 0; retry < 100; ++retry) tiny.plan(0, initial, 2, fills, hits, 1, false);
+    GGML_ASSERT(tiny.needs[0].history == history);
+    std::vector<int32_t> scan(100, 2);
+    tiny.plan(0, scan.data(), scan.size(), fills, hits, 2, false);
+    GGML_ASSERT(fills.empty() && tiny.temporary == std::vector<int32_t>{2});
+    tiny.plan(0, scan.data(), scan.size(), fills, hits, 3, false);
+    GGML_ASSERT(fills.size() == 1 && tiny_map[2] >= 0); // repeated need wins admission
     int32_t excessive[] = {0, 1, 2};
-    GGML_ASSERT(!tiny.plan(0, excessive, 3, fills, hits, false));
-    GGML_ASSERT(std::all_of(tiny_map.begin(), tiny_map.end(), [](int32_t slot) { return slot == -1; }));
-    printf("MoE cache policy: capacity bounds, prefill probation, pinned selections and 2000 mixed plans passed\n");
+    const auto prior = tiny_map;
+    GGML_ASSERT(!tiny.plan(0, excessive, 3, fills, hits, 4, true) && prior == tiny_map);
+    tiny.plan(0, excessive, 3, fills, hits, 5, false); // over-capacity selection streams safely
+    GGML_ASSERT(tiny.temporary.size() == 1);
+    tiny.plan(0, initial, 2, fills, hits, 20000, false); // expiry
+    GGML_ASSERT(tiny.needs[2].history == 0);
+    printf("MoE window policy: progress clock, hysteresis, retry suppression, expiry and 2000 mixed plans passed\n");
     return 0;
 }
 
@@ -2393,7 +2395,7 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         // Observe both contexts at the same operation boundaries.
         cp.cb_eval = [](ggml_tensor * t, bool ask, void * userdata) {
-            if (ask) { return t->op == GGML_OP_MUL_MAT_ID; }
+            if (ask) { return (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT_ID_STREAM); }
             auto & cap = *static_cast<capture *>(userdata);
             if (cap.check_locality && cap.prefill && t->ne[2] > moe_cache_max_batch) {
                 const char * name = t->src[0]->name;
@@ -2416,7 +2418,7 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         // Reference placement follows the stock scheduler and is not constrained by cache ownership.
         auto reference_cp = cp;
         reference_cp.cb_eval = [](ggml_tensor * t, bool ask, void *) {
-            return ask ? t->op == GGML_OP_MUL_MAT_ID : true;
+            return ask ? (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT_ID_STREAM) : true;
         };
         llama_context_ptr reference(llama_init_from_model(model.get(), reference_cp));
         cp.cb_eval_user_data = &cap;
@@ -2429,7 +2431,18 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         for (size_t i = 0; i < devices.size(); ++i) {
             auto buft = ggml_backend_dev_buffer_type(devices[i]);
             const size_t allocated = actual_memory.at(buft).context - reference_memory.at(buft).context;
-            GGML_ASSERT(allocated <= budgets[i]);
+            // Resident banks stay within the budget; the fixed 33-expert scratch
+            // bank and compact metadata are additional, separately bounded memory.
+            size_t stride = 0;
+            for (int il = 0; il < int(model->layers.size()); ++il) {
+                if (model->dev_layer(il) != devices[i]) continue;
+                for (const auto * w : {model->layers[il].ffn_gate_up_exps, model->layers[il].ffn_down_exps}) {
+                    if (w) stride = std::max(stride, w->nb[2]);
+                }
+            }
+            const size_t alignment = ggml_backend_buft_get_alignment(buft);
+            const size_t scratch = (moe_cache_stage_slots + 1)*stride + 16*(sizeof(uint64_t) + sizeof(int32_t)) + 4*alignment;
+            GGML_ASSERT(allocated <= budgets[i] + scratch);
         }
         llama_pos pos = 0, ref_pos = 0;
         double worst_nmse = 0;

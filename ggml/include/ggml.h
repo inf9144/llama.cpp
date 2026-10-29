@@ -605,6 +605,8 @@ extern "C" {
         GGML_OP_QSA_SELECT,
         GGML_OP_FLASH_ATTN_SPARSE,
 
+        GGML_OP_MUL_MAT_ID_STREAM, // process-local bounded expert streaming
+
         GGML_OP_COUNT,
     };
 

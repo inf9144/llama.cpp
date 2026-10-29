@@ -606,12 +606,12 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false, bool INDIRECT = false>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
         uint16_t * __restrict__ Dh, const bool store_f32,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
-        const uint32_t * __restrict__ desc, const int M, const int K) {
+        const uint32_t * __restrict__ desc, const int M, const int K, const uint64_t * addresses = nullptr) {
     __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
     const uint32_t dsc = desc[blockIdx.y];
@@ -620,7 +620,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
     const int m0 = blockIdx.x * BM;
     const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
-    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>((INDIRECT ? (const uint8_t *) (uintptr_t) addresses[e] : W + (size_t)e * expert_bytes) + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
 }
 
@@ -804,7 +804,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 }
 
 __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * __restrict__ desc_big, uint32_t * __restrict__ desc_small,
-        const int E, const int nbig_max, const int nsmall_max, const int BN_BIG, const int BN_SMALL, const int thresh) {
+        const int E, const int nbig_max, const int nsmall_max, const int BN_BIG, const int BN_SMALL, const int thresh, const int32_t * active = nullptr) {
     __shared__ int sb[1024], ss[1024];
     const int e = threadIdx.x;
     for (int i = e; i < nbig_max;   i += blockDim.x) desc_big[i]   = UINT32_MAX;
@@ -812,8 +812,9 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
     int carry_big = 0, carry_small = 0;
     // Cache banks can span several layers; scan them in fixed-size blocks.
     for (int base = 0; base < E; base += 1024) {
-        const int expert = base + e;
-        const int cnt = expert < E ? bounds[expert + 1] - bounds[expert] : 0;
+        const int index = base + e;
+        const int expert = index < E ? (active ? active[index] : index) : 0;
+        const int cnt = index < E ? bounds[expert + 1] - bounds[expert] : 0;
         const bool big = cnt >= thresh;
         const int tb = big ? (cnt + BN_BIG - 1) / BN_BIG : 0;
         const int ts = big ? 0 : (cnt + BN_SMALL - 1) / BN_SMALL;
@@ -890,7 +891,7 @@ bool ggml_cuda_mmb_supported_glu(int device, const ggml_tensor * gate, const ggm
 }
 
 template<int WT>
-static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * up) {
+static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * up, const ggml_moe_stream * streaming) {
     const int k = w->ne[0], m = w->ne[1];
     const int tokens = ids ? ids->ne[1] : ggml_nrows(x);
     cudaStream_t stream = ctx.stream();
@@ -909,29 +910,43 @@ static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, c
         }
         mmb_dense_kernel<128, 128, 32, 64, WT><<<dim3(m / 128, (tokens + 127) / 128), MMB_NT, 0, stream>>>(weights, converted.get(), output, nullptr, true, m, k, tokens);
     } else {
-        const int experts = w->ne[2], used = ids->ne[0], rows = used * tokens;
+        const int experts = streaming ? streaming->n_experts : w->ne[2], used = ids->ne[0], rows = used * tokens;
         CUDA_CHECK(cudaMemsetAsync(output, 0, ggml_nbytes(dst), stream));
         ggml_cuda_pool_alloc<int32_t> source(ctx.pool(), rows), target(ctx.pool(), rows), bounds(ctx.pool(), experts + 1);
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, source.get(), target.get(), bounds.get(),
             experts, tokens, used, x->ne[1], ids->nb[1] / sizeof(int32_t), x->nb[2] / x->nb[1], false, stream);
         constexpr int big_n = 128, small_n = 32, threshold = 32;
-        const int nbig = rows / big_n + experts + 1, nsmall = experts + 1;
-        ggml_cuda_pool_alloc<uint32_t> big(ctx.pool(), nbig), small(ctx.pool(), nsmall);
-        mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), big.get(), small.get(), experts, nbig, nsmall, big_n, small_n, threshold);
-        if (up) {
-            const uint8_t * up_weights = (const uint8_t *) up->data;
-            mmb_routed_glu_kernel<64, 128, 16, 64, WT><<<dim3(m / 64, nbig), MMB_NT, 0, stream>>>(weights, up_weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k);
-            mmb_routed_glu_kernel<64, 32, 16, 16, WT><<<dim3(m / 64, nsmall), MMB_NT, 0, stream>>>(weights, up_weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k);
-        } else {
-            mmb_routed_kernel<128, 128, 32, 64, WT><<<dim3(m / 128, nbig), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k);
-            mmb_routed_kernel<128, 32, 32, 16, WT><<<dim3(m / 128, nsmall), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k);
+        const int nbig_max = rows / big_n + experts + 1, nsmall_max = experts + 1;
+        ggml_cuda_pool_alloc<uint32_t> big(ctx.pool(), nbig_max), small(ctx.pool(), nsmall_max);
+        ggml_moe_packet packet = {};
+        for (int32_t p = 0;; ++p) {
+            if (streaming) {
+                if (!streaming->prepare(streaming->userdata, p, &packet)) break;
+                if (!packet.count) continue;
+                GGML_ASSERT(!up && packet.count > 0 && packet.count <= experts);
+            } else if (p) break;
+            const int active = streaming ? packet.count : experts;
+            const int packet_rows = streaming ? packet.rows : rows;
+            const int nbig = packet_rows / big_n + active + 1, nsmall = active + 1;
+            mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), big.get(), small.get(), active, nbig, nsmall, big_n, small_n, threshold, streaming ? packet.experts : nullptr);
+            if (up) {
+                const uint8_t * up_weights = (const uint8_t *) up->data;
+                mmb_routed_glu_kernel<64, 128, 16, 64, WT><<<dim3(m / 64, nbig), MMB_NT, 0, stream>>>(weights, up_weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k);
+                mmb_routed_glu_kernel<64, 32, 16, 16, WT><<<dim3(m / 64, nsmall), MMB_NT, 0, stream>>>(weights, up_weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k);
+            } else if (streaming) {
+                mmb_routed_kernel<128, 128, 32, 64, WT, false, false, true><<<dim3(m / 128, nbig), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k, packet.addresses);
+                mmb_routed_kernel<128, 32, 32, 16, WT, false, false, true><<<dim3(m / 128, nsmall), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k, packet.addresses);
+            } else {
+                mmb_routed_kernel<128, 128, 32, 64, WT><<<dim3(m / 128, nbig), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k);
+                mmb_routed_kernel<128, 32, 32, 16, WT><<<dim3(m / 128, nsmall), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k);
+            }
         }
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-static void mmb_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * up = nullptr) {
-#define MMB_CASE(TYPE, WT) case TYPE: mmb_launch<WT>(ctx, w, x, ids, dst, up); break
+static void mmb_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * up = nullptr, const ggml_moe_stream * streaming = nullptr) {
+#define MMB_CASE(TYPE, WT) case TYPE: mmb_launch<WT>(ctx, w, x, ids, dst, up, streaming); break
     switch (w->type) {
         MMB_CASE(GGML_TYPE_IQ4_NL, 0);
         MMB_CASE(GGML_TYPE_Q8_0, 1);
@@ -950,8 +965,8 @@ static void mmb_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * w,
 void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, ggml_tensor * dst) {
     mmb_dispatch(ctx, w, x, nullptr, dst);
 }
-void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst) {
-    mmb_dispatch(ctx, w, x, ids, dst);
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst, const ggml_moe_stream * streaming) {
+    mmb_dispatch(ctx, w, x, ids, dst, nullptr, streaming);
 }
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * x, const ggml_tensor * ids, ggml_tensor * dst) {
     mmb_dispatch(ctx, gate, x, ids, dst, up);

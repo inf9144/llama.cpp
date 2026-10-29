@@ -1811,7 +1811,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+        moe_cache->mul_mat(ctx0, w, cur_mm, ids, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);

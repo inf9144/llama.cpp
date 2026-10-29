@@ -25,6 +25,18 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(result['weight_address_unions'][0]['observed_weight_address_union_bytes'], 1000)
         self.assertEqual(result['reservation_highwater'][0]['bytes'], 2048)
 
+    def test_streaming_admission_and_staging(self):
+        base = dict(schema=1, context=1, graph=2, backend='ROCm1', tokens=512, graph_type=0, us=0,
+                    tensor='blk.3.ffn_up_exps.weight')
+        events = [dict(kind='routing', counts=[1, 1, 1], resident=[1, 0, 0], wait_us=7),
+                  dict(kind='bank', expert_bytes=100),
+                  dict(kind='admission_h2d', bytes=100, enqueue_us=2),
+                  dict(kind='stage_h2d', bytes=100, enqueue_us=3)]
+        report = analyzer.analyze(['MOE_MEASURE\t'+json.dumps(base | e) for e in events], 'prefill')
+        layer = report['layers'][0]
+        self.assertEqual((layer['h2d_bytes'], layer['d2d_bytes'], layer['upload_enqueue_us']), (200, 0, 5))
+        self.assertEqual((layer['unique_experts'], layer['miss_experts']), (3, 2))
+
     def test_missing_trace(self):
         with self.assertRaises(ValueError):
             analyzer.analyze(['ordinary log'], 'decode')

@@ -246,7 +246,7 @@ static void llama_verify_hadamard_graph(
             continue;
         }
 
-        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_MUL_MAT_ID_STREAM) {
             continue;
         }
 
@@ -1906,6 +1906,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    if (moe_cache) moe_cache->set_batch(ubatch);
 
     const bool text_graph = ubatch.token && !cparams.dflash_device_inputs && !ubatch.is_mixed() && gtype == ctx_type_to_graph_type(cparams.ctx_type);
     if (!text_graph) {

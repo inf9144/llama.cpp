@@ -7,6 +7,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_ubatch;
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -25,6 +26,11 @@ public:
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;
+
+    void set_batch(const llama_ubatch & batch);
+
+    // Select the all-resident or streaming execution plan with logical IDs.
+    ggml_tensor * mul_mat(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids, ggml_tensor * slots) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

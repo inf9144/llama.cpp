@@ -1,4 +1,5 @@
 #pragma once
+#include "../ggml-moe.h"
 
 #include "common.cuh"
 #include "unary.cuh"
@@ -991,7 +992,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion, bool indirect = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const char * __restrict__ x_gate, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -1000,7 +1001,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const uint64_t * addresses, const int32_t * active_experts) {
 
 #ifdef TURING_MMA_AVAILABLE
     constexpr bool fusion_available = true;
@@ -1038,13 +1039,13 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     // The fused kernel needs the whole K range of a tile in one block, so it always uses tiling.
-    if constexpr (has_fusion || !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1)) {
+    if constexpr (has_fusion || !ggml_cuda_mmq_get_stream_k(type, J, fallback, prec_src1) || indirect) {
         // The fused kernel writes the GLU of I/2 up rows and I/2 gate rows per tile.
         constexpr int I_dst = has_fusion ? I/2 : I;
 
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
-        const int zt = tmp2.y;
+        const int zt = indirect ? active_experts[tmp2.y] : int(tmp2.y);
         const int jt = blockIdx.x;
         const int it = blockIdx.y;
 
@@ -1101,11 +1102,12 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I_dst - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
+        const char * tile_x = indirect ? (const char *) (uintptr_t) addresses[zt] : x;
+        const int offset_x = (indirect ? 0 : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x) + it*I_dst*stride_row_x;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, has_fusion>
-            (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+            (tile_x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
@@ -1435,6 +1437,9 @@ struct mmq_args {
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
+    const uint64_t * addresses = nullptr;
+    const int32_t * active_experts = nullptr;
+    int n_active = 0;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1466,7 +1471,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int I_dst = has_fusion ? config.I/2 : config.I; // Rows of dst per tile, see mul_mat_q.
     const int nty  = (args.nrows_x   + I_dst - 1) / I_dst;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
-    const int ntzw = args.nchannels_y * args.nsamples_y;
+    const int ntzw = args.addresses ? args.n_active : args.nchannels_y * args.nsamples_y;
     // Column tiles innermost so that the concurrently running blocks share the same tile of x and read it from L2.
     const dim3 block_nums_xy_tiling(ntx, nty, ntzw);
 
@@ -1482,6 +1487,22 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+#if defined(GGML_USE_HIP)
+    if constexpr (!has_fusion && ggml_moe_stream_type(type)) {
+        if (args.addresses) {
+            GGML_ASSERT(nty <= 65535);
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1, false, true>), nbytes_shared);
+            mul_mat_q<type, J, fallback, prec_src1, false, true><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+                (args.x, nullptr, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd, args.addresses, args.active_experts);
+            return;
+        }
+    }
+#endif
+    GGML_ASSERT(!args.addresses);
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= 65535); // gridDim.y limit
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -1489,7 +1510,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.addresses, args.active_experts);
         return;
     }
 
@@ -1520,7 +1541,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, args.addresses, args.active_experts);
 
     if (!fixup_needed) {
         return;
@@ -1652,7 +1673,7 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_moe_stream * streaming = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
