@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare repeated greedy tokens and fixed-prefix probabilities, baseline/candidate.
 
-Uses the existing reference binaries, cache budgets and draft maximum 3. This is
-a numerical diagnostic, not a speed benchmark. No backend or sampler code changes.
+Uses the existing reference binaries and cache budgets. Draft maximum 3 is the
+default; 0 checks generation without speculative verify batches. This is a
+numerical diagnostic, not a speed benchmark. No backend or sampler code changes.
 """
 from __future__ import annotations
 
@@ -47,15 +48,17 @@ def greedy_request(prompt: list[int], count: int, seed: int) -> dict:
                 stream=False, return_tokens=True, n_probs=32, post_sampling_probs=False)
 
 
-def validate_completion(data: dict, prompt: list[int], single: bool = False) -> None:
+def validate_completion(data: dict, prompt: list[int], single: bool = False, no_drafts: bool = False) -> None:
     tokens = data.get('tokens')
     if not isinstance(tokens, list) or not tokens or any(type(t) is not int or t < 0 for t in tokens):
         raise ValueError('Missing generated token IDs')
     timing = data.get('timings') or {}
     if timing.get('cache_n') != 0 or timing.get('prompt_n') != len(prompt):
         raise ValueError('Prompt token count or prompt-cache check failed')
-    if single and (len(tokens) != 1 or timing.get('draft_n', 0) != 0):
-        raise ValueError('Single-token replay must run without speculative drafts')
+    if single and len(tokens) != 1:
+        raise ValueError('Single-token replay must return one token')
+    if (single or no_drafts) and timing.get('draft_n', 0) != 0:
+        raise ValueError('Expected no speculative draft tokens')
     rows = data.get('completion_probabilities') or []
     if len(rows) < len(tokens) or [r.get('id') for r in rows[:len(tokens)]] != tokens:
         raise ValueError('Generated tokens and probability rows do not align')
@@ -97,7 +100,9 @@ def compare(a: dict, b: dict) -> dict:
     return result
 
 
-def launch_text(source: str, binary: Path) -> str:
+def launch_text(source: str, binary: Path, draft_max: int = 3) -> str:
+    if draft_max not in (0, 3):
+        raise ValueError('Draft maximum must be 0 or 3 for this diagnostic')
     if re.search(r'--cache-ssd(?:-\S+)?', source) or '--cache-ram 0' not in source:
         raise ValueError('Existing template must disable SSD/RAM prompt caching')
     ports = re.findall(r'--port\s+(\d+)', source)
@@ -106,7 +111,7 @@ def launch_text(source: str, binary: Path) -> str:
     text, n = re.subn(r'(?m)^\s*\./build-rocm-moe-reference/bin/llama-server(?=\s|$)', lambda _: shlex.quote(str(binary)), source)
     if n != 1:
         raise ValueError('Reference server path is not unique in moe-server-reference.fish')
-    text, n = re.subn(r'(--spec-draft-n-max\s+)\d+', lambda m: m[1] + '3', text)
+    text, n = re.subn(r'(--spec-draft-n-max\s+)\d+', lambda m: m[1] + str(draft_max), text)
     if n != 1:
         raise ValueError('Draft maximum is not unique in the existing template')
     values = re.findall(r'--moe-cache-mib\s+([0-9]+(?:,[0-9]+)*)(?=\s|$)', text)
@@ -165,6 +170,8 @@ def main() -> int:
     parser.add_argument('--repo', type=Path, default=Path.home() / 'src/llama.cpp')
     parser.add_argument('--request', type=Path, default=Path('moe-first-request.json'))
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--draft-max', type=int, choices=(0, 3), default=3,
+                        help='0 checks single-token target generation; the draft model stays configured')
     args = parser.parse_args()
     root = args.repo.expanduser().resolve()
     binaries = {case: root / runner.BINARIES[case][0] for case in CASES}
@@ -189,7 +196,7 @@ def main() -> int:
         libs = {p.resolve() for pattern in ('libllama*.so*', 'libggml*.so*') for p in binary.parent.glob(pattern)}
         provenance[case] = dict(binary=str(binary), binary_sha256=runner.sha(binary),
                                 library_sha256={str(p): runner.sha(p) for p in sorted(libs)})
-    report: dict = dict(complete=False, binaries=provenance, draft_max=3,
+    report: dict = dict(complete=False, binaries=provenance, draft_max=args.draft_max,
                         note='Existing baseline/candidate and cache budgets. Plain greedy; no timing conclusions or full-vocabulary logit equivalence.',
                         greedy={}, comparisons={}, replay={})
     prompt = None
@@ -199,10 +206,10 @@ def main() -> int:
     try:
         for case in CASES:
             launcher = out / (case + '.fish')
-            launcher.write_text(launch_text(source, binaries[case]))
+            launcher.write_text(launch_text(source, binaries[case], args.draft_max))
             launchers[case] = launcher
             folder = out / case / 'greedy'
-            runner.say(f'{case}: repeated greedy generation, draft maximum 3')
+            runner.say(f'{case}: repeated greedy generation, draft maximum {args.draft_max}')
             with server(root, folder, launcher, case == 'candidate'):
                 text = http(folder, 'template', 'apply-template', request).get('prompt')
                 if not isinstance(text, str):
@@ -219,7 +226,7 @@ def main() -> int:
                 runs = []
                 for repeat in range(2):
                     data = http(folder, f'repeat-{repeat}', 'completion', greedy_request(prompt, count, seed))
-                    validate_completion(data, prompt)
+                    validate_completion(data, prompt, no_drafts=args.draft_max == 0)
                     runs.append(data)
                     runner.say(f'{case}/repeat-{repeat}: {len(data["tokens"])} tokens, token hash {digest(data["tokens"])[:12]}')
                 report['greedy'][case] = runs

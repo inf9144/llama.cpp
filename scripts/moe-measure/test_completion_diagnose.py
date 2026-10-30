@@ -22,7 +22,7 @@ def response(tokens, tops=None):
 
 
 class CompletionDiagnoseTests(unittest.TestCase):
-    def run_mocked_suite(self, root, fail=False, different_prompt=False):
+    def run_mocked_suite(self, root, fail=False, different_prompt=False, draft_max=3, unexpected_drafts=False):
         for case in diagnose.CASES:
             binary = root / diagnose.runner.BINARIES[case][0]
             binary.parent.mkdir(parents=True)
@@ -39,6 +39,7 @@ class CompletionDiagnoseTests(unittest.TestCase):
             folder.mkdir(parents=True)
             sessions.append((folder.parent.name, folder.name, candidate))
             self.assertIn('--moe-cache-mib 15200,9600', launcher.read_text())
+            self.assertIn(f'--spec-draft-n-max {draft_max}', launcher.read_text())
             yield
 
         def fake_http(folder, name, endpoint, payload=None):
@@ -52,10 +53,10 @@ class CompletionDiagnoseTests(unittest.TestCase):
             tokens = [40] if folder.name == 'replay' else [10, 20 if folder.parent.name == 'baseline' else 21, 30]
             data = response(tokens)
             data['timings']['prompt_n'] = len(payload['prompt'])
-            data['timings']['draft_n'] = 0 if folder.name == 'replay' else 3
+            data['timings']['draft_n'] = 1 if unexpected_drafts else (0 if folder.name == 'replay' else draft_max)
             return data
 
-        with mock.patch.object(sys, 'argv', ['completion_diagnose.py', '--repo', str(root), '--output', 'out']), \
+        with mock.patch.object(sys, 'argv', ['completion_diagnose.py', '--repo', str(root), '--output', 'out', '--draft-max', str(draft_max)]), \
                 mock.patch.object(diagnose, 'server', fake_server), mock.patch.object(diagnose, 'http', fake_http), \
                 contextlib.redirect_stdout(io.StringIO()):
             status = diagnose.main()
@@ -83,6 +84,26 @@ class CompletionDiagnoseTests(unittest.TestCase):
             self.assertIn('injected request failure', report['failure'])
             self.assertTrue((Path(folder) / 'out-handoff.tar.gz').is_file())
 
+    def test_zero_draft_control_preserves_repeats_and_fixed_prefix_probes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            status, sessions, requests, report = self.run_mocked_suite(Path(folder), draft_max=0)
+            self.assertEqual(status, 0)
+            self.assertTrue(report['complete'])
+            self.assertEqual(report['draft_max'], 0)
+            self.assertEqual(len(sessions), 4)
+            self.assertEqual(len([p for _, phase, p in requests if phase == 'greedy']), 4)
+            self.assertTrue(all(run['timings']['draft_n'] == 0 for runs in report['greedy'].values() for run in runs))
+            replay = [p['prompt'] for _, phase, p in requests if phase == 'replay']
+            self.assertEqual(replay, [[1, 2, 3], [1, 2, 3, 10]] * 2)
+
+    def test_zero_draft_control_rejects_actual_drafts_and_preserves_handoff(self):
+        with tempfile.TemporaryDirectory() as folder:
+            status, _, _, report = self.run_mocked_suite(Path(folder), draft_max=0, unexpected_drafts=True)
+            self.assertEqual(status, 1)
+            self.assertFalse(report['complete'])
+            self.assertIn('Expected no speculative draft tokens', report['failure'])
+            self.assertTrue((Path(folder) / 'out-handoff.tar.gz').is_file())
+
     def test_different_rendered_prompts_stop_before_candidate_generation(self):
         with tempfile.TemporaryDirectory() as folder:
             status, _, requests, report = self.run_mocked_suite(Path(folder), different_prompt=True)
@@ -102,6 +123,9 @@ class CompletionDiagnoseTests(unittest.TestCase):
         self.assertIn('--moe-cache-mib 15200,9600', cached)
         self.assertIn('--spec-draft-n-max 3', cached)
         self.assertIn('--ctx-size 262144 --temp 0.7', cached)
+        self.assertEqual(diagnose.launch_text(source, path, 0), cached.replace('--spec-draft-n-max 3', '--spec-draft-n-max 0'))
+        with self.assertRaisesRegex(ValueError, '0 or 3'):
+            diagnose.launch_text(source, path, 5)
         for bad in (source.replace('--port 8080', '--port 8081'),
                     source.replace('--moe-cache-mib 15200,9600', '--moe-cache-mib 0,0'),
                     source + '--cache-ssd-dir /tmp/cache',

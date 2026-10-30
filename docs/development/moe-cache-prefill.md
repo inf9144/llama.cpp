@@ -733,3 +733,22 @@ It then starts fresh servers and replays the same baseline token prefixes on bot
 The result is `report.json` plus one handoff archive. A complete diagnostic means data collection succeeded, not that model equivalence passed. Top-32 log-probability differences and top-1 margins are evidence for investigation; they are neither full-vocabulary logit NMSE nor a quality verdict. These runs force CPU probability collection and different sampling controls, so their durations are not performance measurements. Real-model GPU execution remains a hardware task; there are no further decode optimizations in this diagnostic change.
 
 Local checks: nine focused Python tests pass, covering greedy controls, unchanged cache budgets, generated-token/probability alignment, prompt mismatch rejection, fixed baseline prefix replay, comparison stopping at the first different token, and partial handoff preservation. Targeted `ty`, EditorConfig and `git diff --check` pass. The native HTTP/model execution has not been run here because the production models and GPUs are unavailable.
+
+## Greedy diagnostic results and single-token control
+
+The supplied `moe-completion-diagnose-20261031-001111-941090` handoff verifies the same rendered prompt and 5121 prompt token IDs on builds 82478ef and 579880d. Every returned token is an argmax of its reported raw probabilities with temperature 0, dynamic temperature 0, mirostat 0 and only the temperature sampler. The baseline's two generations first differ at zero-based position 125; the candidate's first differ at position 7. Candidate repeat 1 has exactly the same 128 output token IDs as baseline repeat 0.
+
+The early candidate divergence follows the shared text `The user has provided 40`. Repeat 0 ranks ` identical` at 44.67% and ` cases` at 42.88%; repeat 1 ranks ` cases` at 44.34% and ` identical` at 41.61%. The old baseline also reverses two close leading choices at its position 125. These are actual token changes with the same preceding tokens, not response-format or random-sampling differences. Close margins explain how a probability change becomes a different completion; they do not explain the probability change itself.
+
+Raw probability rows already differ at the first token after prefill, including within each build. Both fresh, fixed-prefix replay probes generate the same next token across builds and report no draft tokens, but their top-32 log probabilities differ. At prefix 7 the baseline's replay chooses ` identical`, whereas both of its free-running generations choose ` cases` at that same prefix. Replay recomputes the prefix in prefill and changes the final prompt batch from 1 to 8 tokens; free-running generation uses incremental decode/verify state. This localizes a comparison to execution path or state differences, without identifying the responsible operator or proving a rollback defect. The summary's maximum shared log-probability delta is not a full-vocabulary logit error and can come from low-probability candidates.
+
+The next control reuses the same binaries, prompt and cache budgets but sets the existing server draft maximum to 0:
+
+```sh
+git pull --ff-only
+python3 scripts/moe-measure/completion_diagnose.py --draft-max 0
+```
+
+No build, packet test or profiler is needed. The original launcher remains unchanged. The draft model and its target-feature capture remain configured; this is a control without draft tokens and speculative target verify batches, not a test that removes all DFlash infrastructure. Draft projection/ingestion can still run, so its timings are not a non-speculative performance benchmark. The diagnostic rejects any response reporting nonzero draft tokens, including the repeated generations, and archives incomplete results on failure.
+
+Within-build repeatability in this control distinguishes variation that persists without speculative verify from variation that needs the speculative execution path. It does not alone prove the cache correct. Cross-build differences still include the IQ2_S/IQ3_XXS fractional-scale correction absent from the old baseline, changed prefill placement and different matrix-multiply paths. No kernel, attention arithmetic or cache-policy change is made based on the greedy handoff. Physical execution of the zero-draft control remains open; eleven focused Python tests cover collection, validation and failure handling locally.
