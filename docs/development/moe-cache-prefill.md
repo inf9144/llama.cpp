@@ -710,3 +710,26 @@ GPU-side cache resolution is active and its device waits are still measurable. A
 For the next hardware comparison, retain the baseline binaries and rebuild only the candidate directories. Run the same numerical tests first, then `python3 scripts/moe-measure/decode-ab.py --draft-widths 5 --profile`. This focuses the next comparison on the clearest regression. No speedup after the rollback has been measured yet.
 
 Local rollback validation: the CPU Release targets `test-moe-stream` and `test-llama-archs` build successfully. The three targeted CTest entries `test-moe-stream`, `test-moe-cache-policy` and `test-moe-cache-prefill` pass (22.47 s total); the GPU cases skip without hardware. Source comparison confirms that MMVQ and the `MUL_MAT_ID` dispatcher exactly match their pre-candidate implementations, while the f2efb69 numerical correction and regression tests remain unchanged. A HIP compiler is unavailable in the current workspace, so neither a fresh HIP build nor physical GPU execution of this rollback is claimed.
+
+## Completion differences: diagnostic before further decode changes
+
+The draft-3 handoff `moe-decode-ab-20261030-233708-744468` contains three distinct completion hashes within the baseline's six requests, and three within the candidate's six requests. Recomputing the hashes from the archived responses confirms the implementation: they cover message/text/finish reason, including reasoning, and exclude response IDs and timings. The differences are real generated text. Both builds vary between requests; the baseline already does so without the new cache execution.
+
+The request uses temperature 0.7 and seed 42, while the Fish template also enables dynamic temperature. A fixed seed does not establish identical rendered prompt tokens or bitwise-identical target probabilities. The candidate additionally contains the intentional IQ2_S/IQ3_XXS fractional-scale correction that the old baseline lacks. These are relevant differences, not a proven explanation of the first changed token. Existing synthetic model coverage uses Q8_0 experts and does not establish mixed-IQ production-model equivalence.
+
+Keep draft maximum 3 while investigating this. The focused diagnostic uses the existing uninstrumented baseline and candidate binaries, the same positive MoE cache budgets and the reference Fish template:
+
+```sh
+git pull --ff-only
+python3 scripts/moe-measure/completion_diagnose.py
+```
+
+No CMake rebuild or packet test is needed for this Python-only addition. Stop an existing server on port 8080 before running it. The original Fish template and request are not edited. Generated diagnostic launchers set the existing draft maximum to 3; sampling changes are confined to the diagnostic HTTP requests. There are no new application flags or environment variables.
+
+The script renders and tokenizes the original chat request on each build, checks that the prompt is identical, then sends explicit token IDs to the native completion endpoint. Each build generates twice with plain greedy sampling: temperature 0, dynamic range 0 and only the temperature sampler. Raw output token IDs and the pre-sampling top-32 log probabilities are saved. This removes the chat response parser from the token comparison and checks repeatability within each build as well as differences across builds. Library hashes, executable hashes and server properties are recorded too.
+
+It then starts fresh servers and replays the same baseline token prefixes on both builds. Probes cover the prompt boundary and the earliest observed token divergence; if greedy outputs match, the second probe is at position 32 or the last available token. Each probe predicts one token and verifies that no speculative drafts were generated, separating a fixed-prefix target check from free-running verify behavior. Probabilities from generated sequences are compared only through the first differing token, while the preceding token prefix is still identical.
+
+The result is `report.json` plus one handoff archive. A complete diagnostic means data collection succeeded, not that model equivalence passed. Top-32 log-probability differences and top-1 margins are evidence for investigation; they are neither full-vocabulary logit NMSE nor a quality verdict. These runs force CPU probability collection and different sampling controls, so their durations are not performance measurements. Real-model GPU execution remains a hardware task; there are no further decode optimizations in this diagnostic change.
+
+Local checks: nine focused Python tests pass, covering greedy controls, unchanged cache budgets, generated-token/probability alignment, prompt mismatch rejection, fixed baseline prefix replay, comparison stopping at the first different token, and partial handoff preservation. Targeted `ty`, EditorConfig and `git diff --check` pass. The native HTTP/model execution has not been run here because the production models and GPUs are unavailable.
