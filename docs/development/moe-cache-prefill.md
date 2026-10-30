@@ -610,9 +610,9 @@ Keep the baseline binaries. Rebuild both candidate build directories and the two
 test targets with the normal ROCm configuration, then run:
 
 ```sh
-./build-rocm-moe-candidate-reference/bin/test-moe-stream --backend ROCm0
-./build-rocm-moe-candidate-reference/bin/test-moe-stream --backend ROCm1
-./build-rocm-moe-candidate-reference/bin/test-llama-archs --test-moe-cache-prefill -s 42
+./build-rocm-moe-stream-reference/bin/test-moe-stream --backend ROCm0
+./build-rocm-moe-stream-reference/bin/test-moe-stream --backend ROCm1
+./build-rocm-moe-stream-reference/bin/test-llama-archs --test-moe-cache-prefill -s 42
 python3 scripts/moe-measure/decode-ab.py --profile
 ```
 
@@ -642,3 +642,58 @@ uses the official ROCm 10.3.0a20261030 SDK (Clang 24), not the production machin
 ROCm 10.1. That SDK warns about the context-query API's deprecation; it remains
 available for the HIP 6.4-compatible BatchMemOp setup. No physical GPU is exposed
 in this environment, so the new GPU fixtures are compiled but not executed.
+
+## IQ2_S / IQ3_XXS fractional-scale correction after d9c17ce
+
+The first physical gfx1100 run passes all 27 previous packet cases with NMSE 0.
+The new five-query IQ2_S case then aborts at NMSE 2.75919393e-10, above the
+unchanged 1e-10 limit. IQ3_XXS also has a larger discrepancy than the other formats
+(about 1.04e-11). ROCm1 was interrupted before completion, and the later device
+lookup and integrated model checks are not validated by that partial run.
+
+The shared native MMVQ helpers, also used by ordinary decode, truncate fractional
+scales in integer arithmetic. IQ2_S computes
+`(s0*l0 + s1*l1 + (s0+s1)/2)/4` as integers. Its dequantization instead requires
+`(s0*(2*l0+1) + s1*(2*l1+1))/8`. IQ3_XXS similarly needs `(2*l+1)*s/4`
+rather than integer-truncated `(l*s + s/2)/2`. The MMQ path retains these fractions.
+The correction keeps the scaled numerator integral and applies 1/8 or 1/4 in
+FP32 after conversion. Dot-product sums and scale factors fit the existing signed
+24-bit multiply operands and 32-bit accumulator. No test tolerance is widened.
+
+A CPU reproduction uses the fixture's seed 47, K=2560, M=640, five queries and the
+same selected experts and exactly representable Q8 activations. It emulates each
+old/corrected native dot and wave32 reduction and compares against CPU-dequantized
+weights with double-precision accumulation:
+
+| Format | Old helper NMSE | Corrected helper NMSE |
+| --- | ---: | ---: |
+| IQ2_S | 2.75835298e-10 | 5.46604166e-15 |
+| IQ3_XXS | 1.03850740e-11 | 5.44969173e-15 |
+
+These are CPU emulation results, not new GPU measurements. The small difference
+from the reported GPU pairwise error also includes MMQ's FP32 accumulation order.
+The correction affects both existing decode and grouped verify for these two
+formats, so their numerical output can change slightly from the old baseline.
+Router selection, cache policy, attention arithmetic and runtime settings are
+unchanged. Production logits and DFlash acceptance still need hardware validation.
+
+The twenty small-verify GPU cases now also run each query separately through the
+ordinary one-token operation. They compare grouped verify, streamed MMQ and
+single-token decode independently with a CPU dequantization/double-accumulation
+oracle, and compare decode with verify. All NMSE limits remain 1e-10. Diagnostic
+values are flushed before asserting so redirected failure logs retain them.
+
+Local validation: the Release CPU `test-moe-stream` CTest passes all 27 packet cases and the padding guard check (22.55 s). The HIP Release build compiles and links `llama-server`, `test-moe-stream` and `test-llama-archs` for gfx1100 and gfx1101 with ROCm 10.3.0a20261030 (Clang 24). No physical GPU is available here; the corrected GPU arithmetic, device lookup, integrated model behavior and performance remain to be checked with the production ROCm 10.1 setup.
+
+Rebuild both candidate directories after pulling this correction. In Fish, this
+block captures stdout and stderr from all three tests and stops after a failure:
+
+```fish
+begin
+    ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend ROCm0
+    and ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend ROCm1
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-moe-cache-prefill -s 42
+end > test.log 2>&1
+```
+
+Run the performance suite only after the correctness tests complete successfully.

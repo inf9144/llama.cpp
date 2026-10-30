@@ -73,8 +73,9 @@ struct fixture {
 
     void run(ggml_type type, int tokens, bool broadcast, int packet_width, bool temporary, size_t seed, int columns = 256, int output_rows = 128) {
         k = columns; m = output_rows;
+        const bool verify = tokens <= 8;
         stage_width = packet_width; all_temporary = temporary;
-        ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true}));
+        ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 3*ggml_graph_overhead(), nullptr, true}));
         weights = ggml_new_tensor_3d(ctx.get(), type, k, m, experts);
         const int lanes = pipeline.context ? 2 : 1;
         stage_span = (stage_width + 1)*weights->nb[2];
@@ -93,6 +94,15 @@ struct fixture {
         auto * ticket = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
         auto * reference = ggml_mul_mat_id(ctx.get(), weights, x, ids);
         auto * actual = ggml_mul_mat_id_stream(ctx.get(), bank, x, ids, ticket, {&fixture::prepare, this, experts});
+        ggml_tensor * decode = nullptr;
+        if (verify) {
+            for (int t = 0; t < tokens; ++t) {
+                auto * xi = ggml_view_3d(ctx.get(), x, k, x->ne[1], 1, x->nb[1], x->nb[2], t*x->nb[2]);
+                auto * ii = ggml_view_2d(ctx.get(), ids, used, 1, ids->nb[1], t*ids->nb[1]);
+                auto * yi = ggml_mul_mat_id(ctx.get(), weights, xi, ii);
+                decode = decode ? ggml_concat(ctx.get(), decode, yi, 2) : yi;
+            }
+        }
         GGML_ASSERT(ggml_moe_stream_weight_supported(weights) && ggml_moe_stream_weight_supported(bank));
         GGML_ASSERT(ggml_backend_supports_op(backend, actual));
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
@@ -132,7 +142,8 @@ struct fixture {
             packets.emplace_back(misses.begin() + first, misses.begin() + std::min(first + stage_width, misses.size()));
         }
         maps.assign(packets.size(), std::vector<uint64_t>(experts));
-        for (auto * out : {reference, actual}) {
+        for (auto * out : {reference, actual, decode}) {
+            if (!out) continue;
             ggml_cgraph * graph = ggml_new_graph(ctx.get());
             ggml_build_forward_expand(graph, out);
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
@@ -155,6 +166,32 @@ struct fixture {
         const double nmse = error / std::max(energy, 1e-30);
         printf("%s %s K=%d tokens=%d broadcast=%d packet=%d all_stage=%d packets=%zu NMSE=%.9g max_abs=%.9g\n",
             ggml_backend_name(backend), ggml_type_name(type), k, tokens, broadcast, stage_width, all_temporary, packets.size(), nmse, max_error);
+        fflush(stdout);
+        if (verify) {
+            // Neither GPU result is an oracle: decode all quantized weights on
+            // CPU, then accumulate each routed dot product in double precision.
+            std::vector<float> d(a.size()), row_weights(k);
+            ggml_backend_tensor_get(decode, d.data(), 0, ggml_nbytes(decode));
+            double error_verify = 0, error_stream = 0, error_decode = 0, error_consistency = 0, oracle_energy = 0;
+            for (int t = 0; t < tokens; ++t) for (int u = 0; u < used; ++u) for (int row = 0; row < m; ++row) {
+                const size_t offset = size_t(routing[t*used + u])*weights->nb[2] + row*weights->nb[1];
+                ggml_get_type_traits(type)->to_float(host.data() + offset, row_weights.data(), k);
+                const auto * values = input.data() + (t*x->ne[1] + (broadcast ? 0 : u))*k;
+                double expected = 0;
+                for (int col = 0; col < k; ++col) expected += double(row_weights[col])*values[col];
+                const int i = (t*used + u)*m + row;
+                const double v = double(r[i]) - expected, s = double(a[i]) - expected, dc = double(d[i]) - expected;
+                const double consistent = double(r[i]) - d[i];
+                GGML_ASSERT(std::isfinite(d[i]));
+                error_verify += v*v; error_stream += s*s; error_decode += dc*dc; error_consistency += consistent*consistent;
+                oracle_energy += expected*expected;
+            }
+            const double norm = std::max(oracle_energy, 1e-30);
+            printf("%s %s verify oracle: verify=%.9g stream=%.9g decode=%.9g decode_vs_verify=%.9g (NMSE)\n",
+                ggml_backend_name(backend), ggml_type_name(type), error_verify/norm, error_stream/norm, error_decode/norm, error_consistency/norm);
+            fflush(stdout);
+            GGML_ASSERT(error_verify/norm < 1e-10 && error_stream/norm < 1e-10 && error_decode/norm < 1e-10 && error_consistency/norm < 1e-10);
+        }
         GGML_ASSERT(nmse < 1e-10);
     }
 };
