@@ -16,6 +16,7 @@
 #include "../src/llama-memory.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-model.h"
+#include "../src/llama-moe-cache.h"
 #include "../src/llama-moe-cache-policy.h"
 
 #include <cinttypes>
@@ -32,6 +33,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <locale>
+#endif
 
 static bool arch_matches(const std::string & filter, llm_arch arch) {
     if (filter.empty()) {
@@ -2235,6 +2243,72 @@ static int test_qsa_sparse(size_t seed, float stdev) {
 }
 
 static int test_moe_cache_policy(size_t seed) {
+#if defined(__linux__)
+    namespace fs = std::filesystem;
+    std::string pattern = (fs::temp_directory_path() / "llama-moe-links-XXXXXX").string();
+    GGML_ASSERT(mkdtemp(&pattern[0]));
+    struct cleanup {
+        fs::path path;
+        ~cleanup() { std::error_code ec; fs::remove_all(path, ec); }
+    } fixture { pattern };
+    const auto root = fixture.path / "bus/pci/devices";
+    const auto fast_port = fixture.path / "devices/pci0000:00/0000:00:01.0";
+    const auto slow_port = fixture.path / "devices/pci0000:00/0000:00:02.0";
+    const auto bridge = slow_port / "0000:10:00.0";
+    const auto fast_gpu = fast_port / "0000:03:00.0";
+    const auto slow_gpu = bridge / "0000:14:00.0";
+    fs::create_directories(root);
+    auto link = [](const fs::path & path, const char * speed, const char * width) {
+        fs::create_directories(path);
+        std::ofstream(path / "max_link_speed") << speed;
+        std::ofstream(path / "current_link_width") << width;
+    };
+    link(fast_port, "16.0 GT/s PCIe\n", "16\n");
+    link(slow_port, "16.0 GT/s PCIe\n", "4\n");
+    link(bridge, "16.0 GT/s PCIe\n", "16\n");
+    link(fast_gpu, "16.0 GT/s PCIe\n", "16\n");
+    link(slow_gpu, "16.0 GT/s PCIe\n", "16\n");
+    fs::create_directory_symlink(fast_gpu, root / "0000:03:00.0");
+    fs::create_directory_symlink(slow_gpu, root / "0000:14:00.0");
+    const auto pci_root = root.string();
+    auto probe = [&](const char * id) { return llama_moe_cache_host_link(id, pci_root.c_str()); };
+    auto fast = probe("0000:03:00.0");
+    auto slow = probe("0000:14:00.0");
+    GGML_ASSERT(fast.bandwidth() == 256 && fast.limiting_device == "0000:03:00.0");
+    GGML_ASSERT(probe("0:3:0.0").bandwidth() == 256);
+    GGML_ASSERT(slow.bandwidth() == 64 && slow.limiting_device == "0000:00:02.0");
+    GGML_ASSERT(moe_cache_stage_on_faster_link(slow.bandwidth(), fast.bandwidth(), 260, 512));
+    std::ofstream(fast_gpu / "current_link_speed") << "2.5 GT/s PCIe\n";
+    GGML_ASSERT(probe("0000:03:00.0").bandwidth() == 256);
+    // Sysfs numbers retain the C locale even in an application with comma decimals.
+    struct comma_decimal : std::numpunct<char> {
+        char do_decimal_point() const override { return ','; }
+    };
+    const auto previous_locale = std::locale();
+    std::locale::global(std::locale(previous_locale, new comma_decimal));
+    GGML_ASSERT(probe("0000:03:00.0").bandwidth() == 256);
+    std::locale::global(previous_locale);
+    for (const char * id : {static_cast<const char *>(nullptr), "", "0000:03:00.0-v0", "0000:03:20.0", "0000:03:00.8", "../0000:03:00.0", "0000:04:00.0"}) {
+        GGML_ASSERT(probe(id).bandwidth() == 0);
+    }
+    for (const char * width : {"", "0", "-1", "33", "unknown"}) {
+        link(slow_port, "16.0 GT/s PCIe\n", width);
+        GGML_ASSERT(probe("0000:14:00.0").bandwidth() == 0);
+    }
+    for (const char * speed : {"", "Unknown speed", "nan GT/s PCIe", "256.0 GT/s PCIe", "16.0 GB/s"}) {
+        link(slow_port, speed, "4\n");
+        GGML_ASSERT(probe("0000:14:00.0").bandwidth() == 0);
+    }
+    link(slow_port, "16.0 GT/s PCIe\n", "4\n");
+    fs::remove(bridge / "current_link_width");
+    GGML_ASSERT(probe("0000:14:00.0").bandwidth() == 0);
+    link(bridge, "8.0 GT/s PCIe\n", "4\n");
+    GGML_ASSERT(probe("0000:14:00.0").bandwidth() == 32);
+    link(slow_port, "16.0 GT/s PCIe\n", "16\n");
+    link(bridge, "16.0 GT/s PCIe\n", "16\n");
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(probe("0000:14:00.0").bandwidth(), fast.bandwidth(), 260, 512));
+    printf("MoE PCIe topology: endpoint, upstream bottleneck, locale and unknown-link fallback passed\n");
+#endif
     GGML_ASSERT(moe_cache_stage_on_faster_link(64, 256, 260, 512));
     GGML_ASSERT(!moe_cache_stage_on_faster_link(256, 256, 260, 512));
     GGML_ASSERT(!moe_cache_stage_on_faster_link(64, 256, 400, 512));

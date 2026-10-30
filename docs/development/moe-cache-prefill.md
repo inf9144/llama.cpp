@@ -41,13 +41,18 @@ are placed in ascending freed slots to retain coalesced H2D copies. Consecutive
 bypassed experts are uploaded together too.
 
 Large-batch placement is fixed when the context is created. On Linux, supported
-HIP devices expose a PCI bus ID; sysfs provides the endpoint's speed ceiling and
-negotiated width. For a partially resident group, compare the owner's estimated
+HIP devices expose a PCI bus ID; sysfs provides each link's speed ceiling and
+negotiated width. Resolve the endpoint symlink and follow its PCI bridge parents;
+the smallest link product on that path determines the estimate. For a partially resident group, compare the owner's estimated
 uncached transfer cost with full host streaming on a faster link. Redirect only
 when `faster_link * (total_experts - slots) > owner_link * total_experts`.
 Unknown links, equal links, complete banks, and selections wider than 32 experts
 retain local placement. This is a static transfer-cost estimate, not a measured
 bandwidth or a guarantee for every router distribution or PCIe topology.
+Speed parsing uses the C locale. If an endpoint or PCI parent has unreadable or
+invalid link data, the whole path is unknown rather than skipping a possible
+bottleneck. Startup reports the limiting PCI device and its speed/width once per
+supported GPU, or explicitly reports unknown topology.
 
 Redirected groups use the same streaming operation and a typed view of the
 destination's bounded scratch. They do not copy a remote cache bank or upload
@@ -444,3 +449,48 @@ and zero-acceptance gates remain. Check that `ROCm1 prefill execution = ROCm0` i
 announced on this machine and inspect the model fixture's `redirected` count.
 Measure uninstrumented speed first, then transfer time, staging/compute memory and
 DFlash acceptance. This revision has not been merged to `codex-compat`.
+
+## PCIe path correction after the 120144 handoff
+
+The `20261030-120144-995261` hardware run used `4a73011e7` but announced local
+prefill on both GPUs. Its results do not validate redirected execution. The
+separate latency-demand window did work: warm small-batch expert H2D was 0.2901
+GiB, versus 13.3917 GiB in the previous candidate run. Total warm expert H2D was
+63.0767 GiB and expert D2D was zero. The uninstrumented warm prefill changed from
+439.21 to 457.53 tokens/s; completion hashes and speculative work differ, so this
+is not an equal-work decode comparison or a redirection speedup.
+
+The old link reader examined only the GPU endpoint. That misses an upstream
+chipset/switch restriction when the endpoint itself has a wider link. The reader
+now follows the resolved sysfs hierarchy and uses its narrowest link estimate.
+A synthetic sysfs fixture reproduces identical x16 GPU endpoints with an x4
+upstream connection on one path, verifies the resulting redirect decision, and
+covers a slower intermediate bridge, idle speed, non-C numeric locales, malformed
+PCI IDs and missing/invalid parent attributes. No card names, PCI addresses or
+forced placement rules are added to runtime dispatch.
+
+The handoff does not contain the host's sysfs attributes. It therefore cannot
+establish whether this endpoint-only blind spot, unreadable attributes or another
+topology estimate caused the inactive placement on that host. The startup link
+lines now make that distinction inspectable. The A/B runner requires known link
+data and placement declarations for multi-GPU cache runs and prints the actual
+owner-to-execution map. Unknown topology still falls back locally in the runtime;
+only the controlled multi-GPU benchmark rejects it instead of silently accepting
+an unverified placement experiment.
+
+Continue with the existing 5121-token / 128-token A/B fixture. For the reported
+x16/x4 configuration, verify `ROCm1 prefill execution = ROCm0` and the corresponding
+`Candidate-Prefill` map. Small decode/verify placement, KV/attention ownership,
+resident budgets, packet arithmetic and cache admission are unchanged. No longer
+context benchmark or new runtime control is introduced in this correction.
+
+Validation: CPU Release build with measurement enabled; all three targeted CTest
+entries pass (policy/topology, model prefill/checkpoint/reset, streamed packets).
+The CPU model logits remain exact (NMSE 0); the 27 packet cases retain a worst
+NMSE of 7.18e-15 and maximum absolute error of 3.06e-5. All twelve measurement-runner
+Python tests, targeted Python type checks, EditorConfig, model-naming checks and
+`git diff --check` pass.
+
+HIP compilation, the redirected GPU model fixture, output/acceptance consistency,
+activation-transfer overhead, new VRAM peaks and actual throughput remain to be
+checked on gfx1100/gfx1101; the implementation environment has no HIP SDK or GPU.

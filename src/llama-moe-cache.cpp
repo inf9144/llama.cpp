@@ -12,9 +12,55 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <locale>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#include <filesystem>
+#endif
+
+llama_moe_cache_link llama_moe_cache_host_link(const char * device_id, const char * root) {
+#if defined(__linux__)
+    auto pci_id = [](const char * id) -> std::string {
+        unsigned domain, bus, device, function;
+        char extra;
+        if (!id || sscanf(id, "%4x:%2x:%2x.%1x%c", &domain, &bus, &device, &function, &extra) != 4 ||
+                domain > 0xffff || bus > 0xff || device > 0x1f || function > 7) return {};
+        char bdf[16];
+        snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", domain, bus, device, function);
+        return bdf;
+    };
+    const auto bdf = pci_id(device_id);
+    if (bdf.empty()) return {};
+
+    std::error_code ec;
+    auto path = std::filesystem::canonical(std::filesystem::path(root) / bdf, ec);
+    if (ec) return {};
+    llama_moe_cache_link result;
+    for (; !pci_id(path.filename().string().c_str()).empty(); path = path.parent_path()) {
+        double speed = 0;
+        int width = 0;
+        std::string unit;
+        std::ifstream speed_file(path / "max_link_speed");
+        std::ifstream width_file(path / "current_link_width");
+        speed_file.imbue(std::locale::classic());
+        width_file.imbue(std::locale::classic());
+        // Ignore idle speed changes, but retain electrically negotiated lanes.
+        if (!(speed_file >> speed >> unit) || !(width_file >> width) || unit != "GT/s" ||
+                !(speed >= 2.5 && speed <= 128 && width > 0 && width <= 32)) return {};
+        if (result.bandwidth() == 0 || speed*width < result.bandwidth()) {
+            result = { speed, width, path.filename().string() };
+        }
+    }
+    return result;
+#else
+    GGML_UNUSED(device_id);
+    GGML_UNUSED(root);
+    return {};
+#endif
+}
 
 namespace {
 
@@ -47,29 +93,6 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static double llama_moe_cache_host_link(ggml_backend_dev_t dev) {
-#if defined(__linux__)
-    ggml_backend_dev_props props = {};
-    ggml_backend_dev_get_props(dev, &props);
-    unsigned domain, bus, device, function;
-    char extra;
-    if (props.device_id && sscanf(props.device_id, "%x:%x:%x.%x%c", &domain, &bus, &device, &function, &extra) == 4 &&
-            domain <= 0xffff && bus <= 0xff && device <= 0x1f && function <= 7) {
-        char path[80];
-        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/", domain, bus, device, function);
-        double speed = 0;
-        int width = 0;
-        // Use negotiated width with the speed ceiling, not an idle speed sample.
-        std::ifstream(std::string(path) + "max_link_speed") >> speed;
-        std::ifstream(std::string(path) + "current_link_width") >> width;
-        if (speed >= 2.5 && speed <= 128 && width > 0 && width <= 32) return speed*width;
-    }
-#else
-    GGML_UNUSED(dev);
-#endif
-    return 0;
-}
-
 }
 
 struct llama_moe_cache::impl {
@@ -81,7 +104,7 @@ struct llama_moe_cache::impl {
         double split = 0.0;    // share of the budget
         size_t budget = 0;     // explicit per-device budget
         bool prefill = false;
-        double host_link = 0;
+        llama_moe_cache_link host_link;
         size_t stage_stride = 0;
         int32_t max_experts = 0;
         ggml_tensor * stage = nullptr;
@@ -180,7 +203,19 @@ struct llama_moe_cache::impl {
                 using supports_prefill_fn = bool (*)(ggml_backend_dev_t);
                 auto supports = reg ? (supports_prefill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_cache_supports_prefill") : nullptr;
                 d.prefill = supports && supports(dev);
-                if (d.prefill) d.host_link = llama_moe_cache_host_link(dev);
+                if (d.prefill) {
+                    ggml_backend_dev_props props = {};
+                    ggml_backend_dev_get_props(dev, &props);
+                    d.host_link = llama_moe_cache_host_link(props.device_id);
+                    if (d.host_link.bandwidth() > 0) {
+                        LLAMA_LOG_INFO("%s: %10s host link = %.1f GT/s x%d, limiting device %s (GPU %s)\n", __func__,
+                            ggml_backend_name(d.backend), d.host_link.speed, d.host_link.width,
+                            d.host_link.limiting_device.c_str(), props.device_id);
+                    } else {
+                        LLAMA_LOG_WARN("%s: %10s host link = unknown (GPU %s); keep local prefill\n", __func__,
+                            ggml_backend_name(d.backend), props.device_id ? props.device_id : "unknown");
+                    }
+                }
             }
         }
         if (devices.empty()) {
@@ -319,8 +354,8 @@ struct llama_moe_cache::impl {
                 if (n_expert_used <= moe_cache_stage_slots) {
                     for (size_t id = 0; id < devices.size(); ++id) {
                         const auto & candidate = devices[id];
-                        if (candidate.prefill && candidate.host_link > devices[g.prefill_id].host_link &&
-                                moe_cache_stage_on_faster_link(d.host_link, candidate.host_link, g.n_slots, max_slots)) {
+                        if (candidate.prefill && candidate.host_link.bandwidth() > devices[g.prefill_id].host_link.bandwidth() &&
+                                moe_cache_stage_on_faster_link(d.host_link.bandwidth(), candidate.host_link.bandwidth(), g.n_slots, max_slots)) {
                             g.prefill_id = id;
                         }
                     }

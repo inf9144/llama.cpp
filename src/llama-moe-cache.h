@@ -4,10 +4,22 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
 struct llama_ubatch;
+
+struct llama_moe_cache_link {
+    double speed = 0;
+    int width = 0;
+    std::string limiting_device;
+
+    double bandwidth() const { return speed*width; }
+};
+
+// Internal PCIe estimate; the root argument also permits isolated sysfs fixtures.
+llama_moe_cache_link llama_moe_cache_host_link(const char * device_id, const char * root = "/sys/bus/pci/devices");
 
 // keeps recently and repeatedly used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts

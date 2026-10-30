@@ -207,7 +207,7 @@ def rate(result: dict, kind: str) -> float | None:
     return None
 
 
-def require_candidate_scratch(trace: Path) -> None:
+def require_candidate_scratch(trace: Path) -> str:
     """Reject a silent whole-group fallback before spending time on requests."""
     text = trace.read_text(encoding="utf-8", errors="replace")
     caches = {m[0] for m in re.findall(r"\b(ROCm\d+)\s+MoE cache size\s*=\s*([0-9.]+)", text) if float(m[1]) > 0}
@@ -215,11 +215,20 @@ def require_candidate_scratch(trace: Path) -> None:
     execution: dict[str, set[str]] = {}
     for owner, device in re.findall(r"\b(ROCm\d+)\s+prefill execution\s*=\s*(ROCm\d+)", text):
         execution.setdefault(owner, set()).add(device)
+    if len(caches) > 1:
+        links = {device for device, speed, width in
+                 re.findall(r"\b(ROCm\d+)\s+host link\s*=\s*([0-9.]+) GT/s x(\d+)", text)
+                 if float(speed) > 0 and int(width) > 0}
+        if caches - links or caches - execution.keys():
+            raise RuntimeError(f"Candidate-Topologie unvollständig: Cache-GPUs={sorted(caches)}, "
+                               f"PCIe-Pfade={sorted(links)}, Platzierung={sorted(execution)}. "
+                               "Host-Link-Zeilen in trace.log prüfen; kein stiller Multi-GPU-Fallback im A/B-Test.")
     required = set().union(*(execution.get(owner, {owner}) for owner in caches))
     if not caches or required - scratch:
         raise RuntimeError(f"Candidate-Streaming inaktiv: Cache-GPUs={sorted(caches)}, Staging-GPUs={sorted(scratch)}. "
                            f"Geplante Prefill-GPUs={sorted(required)}. "
                            "Keine Performance-Auswertung eines stillen Fallbacks; Candidate-Build/Dispatch prüfen.")
+    return ", ".join(f"{owner} -> {'/'.join(sorted(execution.get(owner, {owner})))}" for owner in sorted(caches))
 
 
 def require_candidate_acceptance(result: dict) -> None:
@@ -258,9 +267,10 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
         stopped = False
         try:
             wait_health(proc, cli.startup_timeout)
+            placement = ""
             if candidate:
-                require_candidate_scratch(out / "instrumented" / "trace.log")
-            say(f"{name}: server bereit" + ("; Candidate-Staging auf den geplanten Prefill-GPUs aktiv" if candidate else ""))
+                placement = require_candidate_scratch(out / "instrumented" / "trace.log")
+            say(f"{name}: server bereit" + (f"; Candidate-Prefill: {placement}" if candidate else ""))
             for phase in ("cold", "warm"):
                 result = send_request(request, out / phase, cli.request_timeout)
                 results[phase] = result
