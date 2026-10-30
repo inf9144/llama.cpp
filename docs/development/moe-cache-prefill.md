@@ -136,8 +136,8 @@ Vision, prompt-tail ingest and checkpoint/rollback mechanisms are not modified.
 ## Validation and current evidence
 
 Implementation environment: CPU Release builds with measurement enabled and disabled;
-the latter also builds the RPC backend. All three targeted CTest entries and six
-measurement-analysis tests pass. No HIP compiler or GPU is present;
+the latter also builds the RPC backend. All three targeted CTest entries and nine
+measurement/runner tests pass. No HIP compiler or GPU is present;
 HIP configure fails with `Failed to find HIP root directory`. Consequently the HIP
 build, kernel numerics and end-to-end speed/VRAM results below remain hardware gates.
 
@@ -263,6 +263,7 @@ throughput or VRAM benefit.
 
 Correction validation: CPU Release with measurement enabled; all three targeted CTest
 entries pass (27 packet comparisons, policy invariants and the FFN-640 model fixture).
-The six existing analyzer/profile unit tests pass. No HIP SDK or GPU is available
+All nine analyzer/profile/runner unit tests pass, including preserving the handoff
+when activation fails before candidate requests complete. No HIP SDK or GPU is available
 in the implementation environment, so the corrected GPU dispatch, GPU numerics
 and resulting end-to-end performance/VRAM changes remain unverified here.

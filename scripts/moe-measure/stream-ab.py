@@ -310,7 +310,7 @@ def print_comparison(variants: dict) -> None:
     print("\nA/B-VERGLEICH (uninstrumentierte 01-reference; Host-Bytes aus 02-measure)\n")
     print(f"{'Variante':12} {'Cache':6} {'Wall(s)':>9} {'Prefill t/s':>12} {'Decode t/s':>11} {'H2D GiB':>9} {'D2D GiB':>9} {'Prompt':>8} {'Comp':>6} {'Hash':>8}")
     for variant in ("baseline", "candidate"):
-        if variant not in variants:
+        if "01-reference" not in variants.get(variant, {}):
             continue
         r = variants[variant]
         for phase in ("cold", "warm"):
@@ -320,7 +320,7 @@ def print_comparison(variants: dict) -> None:
             print(f"{variant:12} {phase:6} {p['request_wall_s']:9.3f} {val(rate(p, 'prefill')):>12} "
                   f"{val(rate(p, 'decode')):>11} {val(q.get('h2d_gib')):>9} {val(q.get('d2d_gib')):>9} "
                   f"{p['usage'].get('prompt_tokens', 0):8} {p['usage'].get('completion_tokens',0):6} {p['content_sha256'][:8]:>8}")
-    if "baseline" in variants and "candidate" in variants:
+    if all("01-reference" in variants.get(variant, {}) for variant in ("baseline", "candidate")):
         print("\nDelta Candidate vs. Baseline (uninstrumentiert):")
         for phase in ("cold", "warm"):
             base = variants["baseline"]["01-reference"]["requests"][phase]
