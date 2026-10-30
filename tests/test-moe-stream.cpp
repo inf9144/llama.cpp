@@ -16,7 +16,8 @@
 // Both kernels read exactly the same quantized matrices. All activation values
 // are exactly representable in BF16 and Q8, isolating address/routing correctness.
 struct fixture {
-    static constexpr int experts = 67, slots = 24, k = 256, m = 128, used = 4;
+    static constexpr int experts = 67, slots = 24, m = 128, used = 4;
+    int k = 256;
     ggml_backend_t backend;
     ggml_tensor * weights, * bank, * stage, * addresses, * active;
     std::vector<uint8_t> host;
@@ -51,7 +52,8 @@ struct fixture {
         return true;
     }
 
-    void run(ggml_type type, int tokens, bool broadcast, int packet_width, bool temporary, size_t seed) {
+    void run(ggml_type type, int tokens, bool broadcast, int packet_width, bool temporary, size_t seed, int columns = 256) {
+        k = columns;
         stage_width = packet_width; all_temporary = temporary;
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true}));
         weights = ggml_new_tensor_3d(ctx.get(), type, k, m, experts);
@@ -64,6 +66,7 @@ struct fixture {
         auto * ticket = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
         auto * reference = ggml_mul_mat_id(ctx.get(), weights, x, ids);
         auto * actual = ggml_mul_mat_id_stream(ctx.get(), bank, x, ids, ticket, {&fixture::prepare, this, experts});
+        GGML_ASSERT(ggml_moe_stream_weight_supported(weights) && ggml_moe_stream_weight_supported(bank));
         GGML_ASSERT(ggml_backend_supports_op(backend, actual));
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         GGML_ASSERT(buffer);
@@ -114,8 +117,8 @@ struct fixture {
             const double d = double(a[i]) - r[i]; error += d*d; energy += double(r[i])*r[i]; max_error = std::max(max_error, std::abs(d));
         }
         const double nmse = error / std::max(energy, 1e-30);
-        printf("%s %s tokens=%d broadcast=%d packet=%d all_stage=%d packets=%zu NMSE=%.9g max_abs=%.9g\n",
-            ggml_backend_name(backend), ggml_type_name(type), tokens, broadcast, stage_width, all_temporary, packets.size(), nmse, max_error);
+        printf("%s %s K=%d tokens=%d broadcast=%d packet=%d all_stage=%d packets=%zu NMSE=%.9g max_abs=%.9g\n",
+            ggml_backend_name(backend), ggml_type_name(type), k, tokens, broadcast, stage_width, all_temporary, packets.size(), nmse, max_error);
         GGML_ASSERT(nmse < 1e-10);
     }
 };
@@ -140,6 +143,12 @@ int main(int argc, char ** argv) {
             f.run(type, 64, true, 8, false, 42); // MMQ, repeated packets and tail
             f.run(type, 512, true, 32, false, 43); // MMB prefill / up
             f.run(type, 512, false, 16, true, 44); // MMB down, empty resident packet
+        }
+        // Real model FFN width: a partial 256-column iteration is valid MMQ
+        // input. MMB must decline it without disabling the layer's stream plan.
+        for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+            f.run(type, 64, false, 8, false, 45, 640);
+            f.run(type, 512, false, 32, true, 46, 640);
         }
         ++tested; gpu += hip;
     }

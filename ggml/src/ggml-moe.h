@@ -27,6 +27,15 @@ static inline bool ggml_moe_stream_type(enum ggml_type type) {
     }
 }
 
+// Streaming eligibility follows the native MMQ weight format. MMB's stricter
+// K % 256 requirement belongs to its own per-operation dispatch: the real
+// Flash-Next down projection has K=640 and uses IQ4_NL / Q2_0 via MMQ.
+static inline bool ggml_moe_stream_weight_supported(const struct ggml_tensor * w) {
+    return ggml_moe_stream_type(w->type) && ggml_is_contiguous(w) && w->ne[3] == 1 &&
+        w->ne[0] > 0 && w->ne[0] <= INT32_MAX && w->ne[0] % ggml_blck_size(w->type) == 0 &&
+        w->ne[1] > 0 && w->ne[1] <= INT32_MAX && w->ne[1] % 128 == 0;
+}
+
 // Addresses are indexed by the model's logical expert ID, never by cache capacity.
 // Only experts in this packet are active. Every selected expert must occur once.
 // prepare queues uploads on the executing backend stream before its kernels run.

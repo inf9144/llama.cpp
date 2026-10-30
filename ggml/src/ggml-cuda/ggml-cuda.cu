@@ -5980,8 +5980,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             const auto * w = op->src[0];
             return GGML_CUDA_CC_IS_RDNA3_0(info.cc) && info.warp_size == 32 &&
                 config.prepare && config.n_experts > 0 && config.n_experts <= 32768 &&
-                ggml_moe_stream_type(w->type) && w->ne[0] % 256 == 0 && w->ne[1] % 128 == 0 &&
-                ggml_is_contiguous(w) && ggml_is_contiguous(op->src[1]) &&
+                ggml_moe_stream_weight_supported(w) && ggml_is_contiguous(op->src[1]) &&
                 op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                 ggml_get_op_params_i32(op, 3) != GGML_PREC_F32;
 #else

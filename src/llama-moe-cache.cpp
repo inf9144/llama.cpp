@@ -273,8 +273,7 @@ struct llama_moe_cache::impl {
             }
             g.policy.init(model.layers.size(), n_expert, g.n_slots);
             g.streaming = d.prefill && n_expert <= 32768 && std::all_of(g.ref.begin(), g.ref.end(), [](const ggml_tensor * w) {
-                return ggml_moe_stream_type(w->type) && ggml_is_contiguous(w) && w->ne[3] == 1 && w->ne[0] % 256 == 0 &&
-                    w->ne[1] % 128 == 0 && w->ne[0] <= INT32_MAX && w->ne[1] <= INT32_MAX;
+                return ggml_moe_stream_weight_supported(w);
             });
             for (int32_t il : g.layers) {
                 for (const auto * w : llama_moe_cache_layer_experts(model.layers[il])) {

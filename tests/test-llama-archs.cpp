@@ -2342,12 +2342,12 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
     devices.resize(std::min<size_t>(devices.size(), 2));
     auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     gguf_set_val_u32(meta.get(), "qwen4exp.expert_count", 16);
-    gguf_set_val_u32(meta.get(), "qwen4exp.expert_feed_forward_length", 512);
+    gguf_set_val_u32(meta.get(), "qwen4exp.expert_feed_forward_length", 640);
     ggml_context_ptr types(ggml_init({16*ggml_tensor_overhead(), nullptr, true}));
     for (int il = 0; il < 2; ++il) {
         for (const char * bank : {"gate_up", "down"}) {
             const bool down = strcmp(bank, "down") == 0;
-            auto * t = ggml_new_tensor_3d(types.get(), GGML_TYPE_Q8_0, down ? 512 : 256, down ? 256 : 1024, 16);
+            auto * t = ggml_new_tensor_3d(types.get(), GGML_TYPE_Q8_0, down ? 640 : 256, down ? 256 : 1280, 16);
             ggml_format_name(t, "blk.%d.ffn_%s_exps.weight", il, bank);
             gguf_add_tensor(meta.get(), t);
         }

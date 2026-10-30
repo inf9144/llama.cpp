@@ -118,7 +118,8 @@ property; a whole-process VRAM delta cannot be inferred by summing logical tenso
 sizes. Existing conservative attention-mask reservations are untouched.
 
 Initial automatic streaming is restricted to RDNA3.0 wave32 HIP, contiguous native
-MMQ quantized weights, K divisible by 256, M divisible by 128, at most 32768 logical
+MMQ quantized weights, K aligned to their native quantization block, M divisible
+by 128, at most 32768 logical
 experts and fewer than 65536 routed rows. MMB retains its existing requirements.
 Unsupported types (including separate-scale FP4), activation layouts/precisions,
 backends and zero-budget groups use the existing host-weight path. The operation
@@ -143,13 +144,14 @@ build, kernel numerics and end-to-end speed/VRAM results below remain hardware g
 - Window-policy tests: 2000 mixed plans, duplicate routes, pinned hits, cross-layer
   eviction, forced admission, bypass beyond capacity, hysteresis, retry suppression,
   sequence progress/reset, expiration and 4096 scalar-vs-packed score comparisons.
-- `test-moe-stream`: 21 CPU numerical cases across Q8_0 and all six expert formats
+- `test-moe-stream`: 27 CPU numerical cases across Q8_0 and all six expert formats
   observed in the supplied mixed model. Noncontiguous/reversed resident slots,
   unsorted logical routes, 8/16/32-slot packets, incomplete tails, broadcast/up and
-  down inputs, and an empty resident packet/all-temporary selection are covered.
-  NMSE is at most 5.2e-15; maximum absolute difference is 1.72e-5. Activations are
+  down inputs, and an empty resident packet/all-temporary selection are covered. Six cases use
+  K=640 for Q8_0, IQ4_NL and Q2_0, the last two matching the real down-bank formats.
+  NMSE is at most 7.2e-15; maximum absolute difference is 3.06e-5. Activations are
   exactly representable in Q8 and BF16 to isolate routing/address correctness.
-- Quantized Qwen4Exp CPU fixture: exact logits (NMSE 0) for prefill 64/512/1024,
+- Quantized Qwen4Exp CPU fixture with expert FFN width 640: exact logits (NMSE 0) for prefill 64/512/1024,
   decode/verify 1/4/8, checkpoint restore and warm-cache sequence reset. It explicitly
   skips GPU-cache execution when no supported device exists.
 - Existing measurement analysis tests include staging H2D bytes; host enqueue times
@@ -197,3 +199,70 @@ VRAM separately. Measurement builds emit `hybrid_plan`, `admission_h2d` and
 Vision/tail/checkpoint behavior on the real model. Do not infer a speedup from the
 isolated kernels or a lower byte count. Do not merge to `codex-compat` before that
 review.
+
+
+## 2026-10-30: correct the inactive K=640 dispatch
+
+The two `moe-stream-ab-20261030-074022-834702` and
+`moe-stream-ab-20261030-074408-198202` handoffs do **not** benchmark active expert
+streaming. Their server build IDs are `82478ef` and `a4aaa9b` as intended, and the
+candidate emits the new `hybrid_plan` records. However, it reserves no bounded miss
+scratch, emits no `stage_h2d`, and still emits 705 `work_copy` records per request.
+Both profiled device allocation peaks are identical between baseline and candidate.
+
+The cause is an overly restrictive implementation guard: the whole cache group
+required K to be divisible by 256, copying MMB's limit into streaming eligibility.
+The actual model has `n_embd=2560` and expert FFN width 640. Every down projection
+therefore has K=640, excluding the complete group even though its IQ4_NL/Q2_0
+format is valid for the existing MMQ kernel. MMB's inability to execute that one
+matrix must not disable MMQ streaming for the layer.
+
+The corrected model and HIP guards share `ggml_moe_stream_weight_supported()`.
+They require the format's native block alignment; MMB keeps K % 256 and declines
+K=640 independently, routing those operations to MMQ. No dot-product arithmetic,
+router policy, cache size or runtime switch is changed by this correction. The
+model fixture now uses FFN width 640 rather than 512, including Q8_0 gate/up and
+down weights. Kernel fixtures cover K=640 at 64/512 queries, mixed resident and
+staged weights and an all-temporary plan. They assert the same shared eligibility
+predicate used by model construction and HIP supports-op.
+
+For example, the first handoff's large-prefill-only transfer counts are:
+
+| Metric | Baseline | Inactive candidate |
+| --- | ---: | ---: |
+| Cold expert H2D | 146.7583 GiB | 146.7583 GiB |
+| Warm expert H2D | 104.5918 GiB | 104.5996 GiB |
+| Warm cache-to-workspace D2D | 46.3959 GiB | 46.3959 GiB |
+
+These figures exclude decode/verify. The runner's overview combines whole-request
+host bytes with uninstrumented timings, so those columns must not be mistaken for
+prefill-only transfer measurements. The first baseline's cold prefill (223.53 t/s)
+was much slower than the same baseline binary in the second session (348.61 t/s);
+its apparent +55.82% candidate gain is not evidence for this inactive streaming
+path. In the second session warm prefill differs by only +1.65%. Different cold
+completion hashes and DFlash work prevent a clean generation comparison too.
+
+The checked-in runner has automatic activation gates:
+
+```sh
+python3 scripts/moe-measure/stream-ab.py --profile
+```
+
+It uses the same four build directories and existing Fish templates/request. It
+requires bounded scratch on every cache GPU **before** submitting candidate
+requests, then requires `hybrid_plan`, no `work_copy` in either request and cold
+`stage_h2d`. This is specific to the suite's Flash-Next setup; intentionally testing
+a model/configuration that falls back requires a different workload, not treating
+that fallback as a streaming result. The checks reject both submitted inactive
+archives and accept a synthetic active trace; a partial GPU activation is rejected.
+The original uploaded runner can still produce timings, but does not enforce these
+gates. Rebuild the two candidate directories after pulling the fix. Run the two
+GPU numerical fixtures and integrated model test above before the next A/B round;
+the inactive runs establish neither new-kernel numerical correctness nor its
+throughput or VRAM benefit.
+
+Correction validation: CPU Release with measurement enabled; all three targeted CTest
+entries pass (27 packet comparisons, policy invariants and the FFN-640 model fixture).
+The six existing analyzer/profile unit tests pass. No HIP SDK or GPU is available
+in the implementation environment, so the corrected GPU dispatch, GPU numerics
+and resulting end-to-end performance/VRAM changes remain unverified here.
