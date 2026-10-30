@@ -10,6 +10,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +47,29 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+static double llama_moe_cache_host_link(ggml_backend_dev_t dev) {
+#if defined(__linux__)
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    unsigned domain, bus, device, function;
+    char extra;
+    if (props.device_id && sscanf(props.device_id, "%x:%x:%x.%x%c", &domain, &bus, &device, &function, &extra) == 4 &&
+            domain <= 0xffff && bus <= 0xff && device <= 0x1f && function <= 7) {
+        char path[80];
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/", domain, bus, device, function);
+        double speed = 0;
+        int width = 0;
+        // Use negotiated width with the speed ceiling, not an idle speed sample.
+        std::ifstream(std::string(path) + "max_link_speed") >> speed;
+        std::ifstream(std::string(path) + "current_link_width") >> width;
+        if (speed >= 2.5 && speed <= 128 && width > 0 && width <= 32) return speed*width;
+    }
+#else
+    GGML_UNUSED(dev);
+#endif
+    return 0;
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -56,6 +81,7 @@ struct llama_moe_cache::impl {
         double split = 0.0;    // share of the budget
         size_t budget = 0;     // explicit per-device budget
         bool prefill = false;
+        double host_link = 0;
         size_t stage_stride = 0;
         int32_t max_experts = 0;
         ggml_tensor * stage = nullptr;
@@ -79,6 +105,7 @@ struct llama_moe_cache::impl {
         int32_t n_slots = 0;
         moe_cache_policy policy;
         bool streaming = false;
+        int32_t prefill_id = -1;
     };
 
     struct layer {
@@ -96,6 +123,7 @@ struct llama_moe_cache::impl {
         int32_t il;
         int32_t ip;           // index of the bank
         ggml_tensor * cached; // view of the bank used in place of the host experts
+        ggml_tensor * prefill_cached;
         struct metadata {
             std::vector<uint64_t> addresses;
             std::vector<int32_t> experts;
@@ -152,6 +180,7 @@ struct llama_moe_cache::impl {
                 using supports_prefill_fn = bool (*)(ggml_backend_dev_t);
                 auto supports = reg ? (supports_prefill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_cache_supports_prefill") : nullptr;
                 d.prefill = supports && supports(dev);
+                if (d.prefill) d.host_link = llama_moe_cache_host_link(dev);
             }
         }
         if (devices.empty()) {
@@ -257,6 +286,7 @@ struct llama_moe_cache::impl {
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
         for (group & g : groups) {
+            g.prefill_id = g.id;
             const device & d = devices[g.id];
             const int32_t n_expert  = g.ref[0]->ne[2];
             const size_t  budget = per_device
@@ -284,9 +314,21 @@ struct llama_moe_cache::impl {
                 }
             }
             if (g.streaming) {
-                auto & device = devices[g.id];
+                // Preserve locality unless the owner's uncached fraction costs
+                // more link time than full host streaming on a faster device.
+                if (n_expert_used <= moe_cache_stage_slots) {
+                    for (size_t id = 0; id < devices.size(); ++id) {
+                        const auto & candidate = devices[id];
+                        if (candidate.prefill && candidate.host_link > devices[g.prefill_id].host_link &&
+                                moe_cache_stage_on_faster_link(d.host_link, candidate.host_link, g.n_slots, max_slots)) {
+                            g.prefill_id = id;
+                        }
+                    }
+                }
+                auto & device = devices[g.prefill_id];
                 device.max_experts = std::max(device.max_experts, n_expert);
                 for (const auto * w : g.ref) device.stage_stride = std::max(device.stage_stride, w->nb[2]);
+                if (g.prefill_id != g.id) n_tensors[g.prefill_id] += g.ref.size()*g.layers.size();
             }
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += 2*g.layers.size();
@@ -355,7 +397,15 @@ struct llama_moe_cache::impl {
                     ggml_tensor * bank   = g.banks[ip];
                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
                     ggml_format_name(cached, "moe_cache.%s", l.experts[ip]->name);
-                    bindings[l.experts[ip]] = { this, il, (int32_t) ip, cached, {}, GGML_PREC_DEFAULT };
+                    ggml_tensor * prefill_cached = cached;
+                    if (g.streaming && g.prefill_id != g.id) {
+                        auto & execution = devices[g.prefill_id];
+                        prefill_cached = ggml_new_tensor_3d(execution.ctx.get(), bank->type, bank->ne[0], bank->ne[1], moe_cache_stage_slots);
+                        prefill_cached->view_src = execution.stage;
+                        GGML_ASSERT(ggml_nbytes(prefill_cached) <= ggml_nbytes(execution.stage));
+                        ggml_format_name(prefill_cached, "moe_cache.stream.%s", l.experts[ip]->name);
+                    }
+                    bindings[l.experts[ip]] = { this, il, (int32_t) ip, cached, prefill_cached, {}, GGML_PREC_DEFAULT };
                     const auto precision = model.prec_policy.prec_src1.find(l.experts[ip]);
                     if (precision != model.prec_policy.prec_src1.end()) bindings[l.experts[ip]].activation_precision = precision->second;
                 }
@@ -423,7 +473,7 @@ struct llama_moe_cache::impl {
 
         for (size_t id = 0; id < devices.size(); ++id) {
             const device & d = devices[id];
-            if (d.host_bytes == 0) {
+            if (d.host_bytes == 0 && !d.scratch_size) {
                 continue;
             }
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts\n", __func__,
@@ -438,11 +488,20 @@ struct llama_moe_cache::impl {
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
                 }
             }
+            for (size_t execution = 0; execution < devices.size(); ++execution) {
+                if (std::any_of(groups.begin(), groups.end(), [&](const group & g) {
+                        return g.id == (int32_t) id && g.streaming && g.prefill_id == (int32_t) execution;
+                    })) {
+                    LLAMA_LOG_INFO("%s: %10s prefill execution = %s\n", __func__,
+                        ggml_backend_name(d.backend), ggml_backend_name(devices[execution].backend));
+                }
+            }
         }
     }
 
-    ggml_backend_t backend(int32_t il) const {
-        return devices[groups[layers[il].ig].id].backend;
+    ggml_backend_t backend(int32_t il, int64_t n_tokens) const {
+        const group & g = groups[layers[il].ig];
+        return devices[n_tokens > moe_cache_max_batch && g.streaming ? g.prefill_id : g.id].backend;
     }
 
     ~impl() {
@@ -516,7 +575,8 @@ struct llama_moe_cache::impl {
         layer & l = layers[il];
         group & g = groups[l.ig];
 
-        GGML_ASSERT(backend == devices[g.id].backend);
+        const bool local = !prefill || g.prefill_id == g.id;
+        GGML_ASSERT(backend == devices[prefill ? g.prefill_id : g.id].backend);
 
         // the get_rows that looks up the slots of the selected experts
         const int n_nodes = ggml_graph_n_nodes(graph);
@@ -547,20 +607,22 @@ struct llama_moe_cache::impl {
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
 
-        MOE_MEASURE(llama_moe_measure::routing(backend, l.experts.front(), ids.data(), ids.size(), l.slot_map->ne[1], ggml_time_us()-routing_start, g.policy.slot_map[il]));
+        MOE_MEASURE(llama_moe_measure::routing(backend, l.experts.front(), ids.data(), ids.size(), l.slot_map->ne[1], ggml_time_us()-routing_start,
+            local ? g.policy.slot_map[il] : nullptr));
 
 #ifdef LLAMA_MOE_MEASURE
         const int64_t planning_start = ggml_time_us();
 #endif
         size_t n_hit = 0;
-        if (!g.policy.plan(il, ids.data(), ids.size(), fills, n_hit, clock.tokens, !prefill)) {
+        if (!g.policy.plan(il, ids.data(), ids.size(), fills, n_hit, clock.tokens, !prefill, clock.latency_tokens, local)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
         MOE_MEASURE(llama_moe_measure::record r("hybrid_plan", backend, l.experts.front());
             r.out << ",\"host_plan_us\":" << ggml_time_us()-planning_start
                   << ",\"resident_hits\":" << n_hit << ",\"admissions\":" << fills.size()
-                  << ",\"temporary\":" << g.policy.temporary.size() << ",\"clock\":" << clock.tokens);
+                  << ",\"temporary\":" << g.policy.temporary.size() << ",\"clock\":" << clock.tokens
+                  << ",\"latency_clock\":" << clock.latency_tokens << ",\"local_cache\":" << (local ? "true" : "false"));
         l.selected = g.policy.uniq;
         l.temporary = g.policy.temporary;
         l.counts.assign(g.policy.counts.begin(), g.policy.counts.end());
@@ -616,7 +678,7 @@ struct llama_moe_cache::impl {
                 ins.first->second.second = std::max<int64_t>(ins.first->second.second, batch.pos[t]);
             }
         }
-        for (const auto & r : ranges) clock.begin(r.first, r.second.first, r.second.second);
+        for (const auto & r : ranges) clock.begin(r.first, r.second.first, r.second.second, batch.n_tokens <= moe_cache_max_batch);
     }
 
     static bool prepare(void * userdata, int32_t packet, ggml_moe_packet * out) {
@@ -627,7 +689,7 @@ struct llama_moe_cache::impl {
     bool prepare(binding & b, int32_t packet, ggml_moe_packet * out) {
         const layer & l = layers[b.il];
         const group & g = groups[l.ig];
-        device & d = devices[g.id];
+        device & d = devices[g.prefill_id];
         const size_t first = packet > 0 ? size_t(packet - 1)*moe_cache_stage_slots : 0;
         if (packet > 0 && first >= l.temporary.size()) return false;
         const ggml_tensor * w = l.experts[b.ip];
@@ -636,7 +698,7 @@ struct llama_moe_cache::impl {
         packet_addresses.assign(w->ne[2], 0);
         packet_experts.clear();
         int32_t max_tokens = 0, rows = 0;
-        if (packet == 0) {
+        if (packet == 0 && g.prefill_id == g.id) {
             for (int32_t e : l.selected) {
                 const int32_t slot = g.policy.slot_map[b.il][e];
                 if (slot < 0) continue;
@@ -645,7 +707,7 @@ struct llama_moe_cache::impl {
                 max_tokens = std::max(max_tokens, l.counts[e]);
                 rows += l.counts[e];
             }
-        } else {
+        } else if (packet > 0) {
             const size_t end = std::min(first + moe_cache_stage_slots, l.temporary.size());
             for (size_t i = first; i < end;) {
                 const int32_t e = l.temporary[i];
@@ -666,6 +728,10 @@ struct llama_moe_cache::impl {
                 }
                 i += n;
             }
+        }
+        if (packet_experts.empty()) {
+            *out = {};
+            return true;
         }
         // Upload metadata through the same backend API / stream as the weights.
         // The host vectors are distinct for each bank/packet and stay alive until
@@ -692,13 +758,13 @@ struct llama_moe_cache::impl {
         } else {
             GGML_ASSERT(groups[layers[b.il].ig].streaming);
             ggml_moe_stream stream = { static_cast<ggml_moe_prepare_t>(&impl::prepare), &b, (int32_t) w->ne[2] };
-            res = ggml_mul_mat_id_stream(ctx, b.cached, x, ids, slots, stream);
+            res = ggml_mul_mat_id_stream(ctx, b.prefill_cached, x, ids, slots, stream);
         }
         ggml_prec_set_src(res, b.activation_precision, 1);
         // A model-specific activation layout / precision can be unsupported even
         // when its weights qualify. Keep the host-weight operation as fallback;
         // never schedule a process-local device-address callback on the CPU.
-        return ggml_backend_supports_op(backend(b.il), res) ? res : ggml_mul_mat_id(ctx, w, x, ids);
+        return ggml_backend_supports_op(backend(b.il, ids->ne[1]), res) ? res : ggml_mul_mat_id(ctx, w, x, ids);
     }
 
     void log_stats() const {
@@ -725,8 +791,8 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<gg
 
 llama_moe_cache::~llama_moe_cache() = default;
 
-ggml_backend_t llama_moe_cache::backend(int32_t il) const {
-    return pimpl->backend(il);
+ggml_backend_t llama_moe_cache::backend(int32_t il, int64_t n_tokens) const {
+    return pimpl->backend(il, n_tokens);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {

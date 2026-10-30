@@ -65,8 +65,14 @@ struct fixture {
         stage_width = packet_width; all_temporary = temporary;
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true}));
         weights = ggml_new_tensor_3d(ctx.get(), type, k, m, experts);
-        bank = ggml_new_tensor_3d(ctx.get(), type, k, m, slots);
-        stage = ggml_new_tensor_3d(ctx.get(), type, k, m, stage_width + 1);
+        stage = temporary ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (stage_width + 1)*weights->nb[2]) :
+            ggml_new_tensor_3d(ctx.get(), type, k, m, stage_width + 1);
+        bank = ggml_new_tensor_3d(ctx.get(), type, k, m, temporary ? used : slots);
+        if (temporary) {
+            // Remote-owner execution uses only a typed view of bounded scratch.
+            // No full working bank is allocated or passed to the scheduler.
+            bank->view_src = stage;
+        }
         addresses = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, experts);
         active = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, experts);
         auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, broadcast ? 1 : used, tokens);
@@ -78,7 +84,9 @@ struct fixture {
         GGML_ASSERT(ggml_backend_supports_op(backend, actual));
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         GGML_ASSERT(buffer);
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_buffer_clear(buffer.get(), 0);
+        if (temporary) GGML_ASSERT(bank->data == stage->data && bank->buffer == stage->buffer);
         poison.assign(ggml_nbytes(stage), 0xff);
 
         std::mt19937 gen(seed);
@@ -88,7 +96,7 @@ struct fixture {
         ggml_quantize_chunk(type, wf.data(), host.data(), 0, m*experts, k, importance.data());
         ggml_backend_tensor_set(weights, host.data(), 0, host.size());
         for (int e = 0; e < experts; e += 3) {
-            ggml_backend_tensor_set(bank, host.data() + size_t(e)*weights->nb[2], size_t(slots - 1 - e/3)*bank->nb[2], bank->nb[2]);
+            if (!temporary) ggml_backend_tensor_set(bank, host.data() + size_t(e)*weights->nb[2], size_t(slots - 1 - e/3)*bank->nb[2], bank->nb[2]);
         }
         std::vector<float> input(ggml_nelements(x));
         for (size_t i = 0; i < input.size(); ++i) input[i] = i % 32 == 0 ? 127.0f/16 : (int(gen() % 255) - 127)/16.0f;

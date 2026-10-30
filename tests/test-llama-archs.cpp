@@ -2235,6 +2235,12 @@ static int test_qsa_sparse(size_t seed, float stdev) {
 }
 
 static int test_moe_cache_policy(size_t seed) {
+    GGML_ASSERT(moe_cache_stage_on_faster_link(64, 256, 260, 512));
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(256, 256, 260, 512));
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(64, 256, 400, 512));
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(64, 256, 512, 512));
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(0, 256, 260, 512));
+    GGML_ASSERT(!moe_cache_stage_on_faster_link(64, 0, 260, 512));
     GGML_ASSERT(!moe_cache_fits(0, 2, 512, 1024));
     GGML_ASSERT(!moe_cache_fits(1024, 0, 512, 1024));
     GGML_ASSERT(!moe_cache_fits(1, 513, 512, 1024));
@@ -2249,6 +2255,13 @@ static int test_moe_cache_policy(size_t seed) {
     clock.begin(0, 7, 8); GGML_ASSERT(clock.tokens == 9);
     clock.begin(1, 20, 23); GGML_ASSERT(clock.tokens == 13); // distinct sequence, cached prefix
     clock.begin(0, 0, 3); GGML_ASSERT(clock.tokens == 17); // new prompt
+    GGML_ASSERT(clock.latency_tokens == 17);
+    clock.begin(0, 4, 1027, false);
+    GGML_ASSERT(clock.tokens == 1041 && clock.latency_tokens == 17);
+    clock.begin(0, 1024, 1027);
+    GGML_ASSERT(clock.latency_tokens == 17); // speculative revisit
+    clock.begin(0, 1026, 1031);
+    GGML_ASSERT(clock.latency_tokens == 21);
 
     moe_cache_policy cache;
     constexpr int layers = 3, experts = 16, slots = 10;
@@ -2319,7 +2332,26 @@ static int test_moe_cache_policy(size_t seed) {
     GGML_ASSERT(tiny.temporary.size() == 1);
     tiny.plan(0, initial, 2, fills, hits, 20000, false); // expiry
     GGML_ASSERT(tiny.needs[2].history == 0);
-    printf("MoE window policy: progress clock, hysteresis, retry suppression, expiry and 2000 mixed plans passed\n");
+    // A full prompt must not expire decode demand or upload into a remote bank.
+    moe_cache_policy phased; phased.init(1, experts, 2);
+    std::vector<int32_t> phased_map(experts, -1); phased.slot_map[0] = phased_map.data();
+    phased.plan(0, initial, 2, fills, hits, 1, false, 0);
+    phased.plan(0, initial, 2, fills, hits, 1, true, 0);
+    GGML_ASSERT(phased.needs[0].latency_history == 1); // separate prefill stamp
+    for (int retry = 0; retry < 4; ++retry) phased.plan(0, initial, 2, fills, hits, 1, true, 0);
+    GGML_ASSERT(phased.needs[0].latency_history == 1);
+    for (int batch = 1; batch <= 10; ++batch) {
+        phased.plan(0, scan.data(), scan.size(), fills, hits, 1 + batch*1024, false, 0);
+        GGML_ASSERT(fills.empty() && phased_map[0] >= 0 && phased_map[1] >= 0);
+    }
+    const auto resident = phased_map;
+    phased.plan(0, excessive, 3, fills, hits, 11000, false, 0, false);
+    GGML_ASSERT(hits == 0 && fills.empty() && phased_map == resident);
+    GGML_ASSERT(phased.temporary == std::vector<int32_t>({0, 1, 2}));
+    GGML_ASSERT(phased.score(0, 11000/moe_cache_policy::slice_tokens, 0) > 0);
+    GGML_ASSERT(phased.score(0, 11000/moe_cache_policy::slice_tokens, 16) <= moe_cache_policy::window_max_score);
+    GGML_ASSERT(phased.needs[0].latency_history == 0);
+    printf("MoE window policy: phase clocks, latency protection, remote staging, link selection and 2000 mixed plans passed\n");
     return 0;
 }
 
@@ -2379,6 +2411,7 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         bool prefill = false;
         bool check_locality = true;
         int cached = 0;
+        int redirected = 0;
         int fallback = 0;
     };
     // Compare the same GPU model with and without caching, with equal and small/zero budgets.
@@ -2404,7 +2437,18 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
                 GGML_ASSERT(block && sscanf(block, "blk.%d.", &il) == 1);
                 if (strncmp(name, "moe_cache.", 10) == 0) {
                     auto backend = ggml_backend_sched_get_tensor_backend(cap.ctx->get_sched(), t);
-                    GGML_ASSERT(backend && ggml_backend_get_device(backend) == cap.model->dev_layer(il));
+                    const auto * w = t->src[0];
+                    const auto buffer = w->view_src ? w->view_src->buffer : w->buffer;
+                    const auto execution = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+                    GGML_ASSERT(backend && ggml_backend_get_device(backend) == execution);
+                    if (strncmp(name, "moe_cache.stream.", 17) == 0) {
+                        GGML_ASSERT(t->op == GGML_OP_MUL_MAT_ID_STREAM && execution != cap.model->dev_layer(il));
+                        GGML_ASSERT(w->view_src && w->ne[2] == moe_cache_stage_slots);
+                        GGML_ASSERT(ggml_nbytes(w) <= ggml_nbytes(w->view_src));
+                        ++cap.redirected;
+                    } else {
+                        GGML_ASSERT(execution == cap.model->dev_layer(il));
+                    }
                     ++cap.cached;
                 } else {
                     ++cap.fallback;
@@ -2435,7 +2479,6 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
             // bank and compact metadata are additional, separately bounded memory.
             size_t stride = 0;
             for (int il = 0; il < int(model->layers.size()); ++il) {
-                if (model->dev_layer(il) != devices[i]) continue;
                 for (const auto * w : {model->layers[il].ffn_gate_up_exps, model->layers[il].ffn_down_exps}) {
                     if (w) stride = std::max(stride, w->nb[2]);
                 }
@@ -2479,8 +2522,8 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         }
         const bool any_budget = std::any_of(budgets.begin(), budgets.end(), [](size_t b) { return b != 0; });
         GGML_ASSERT(!any_budget || config != 0 || cap.cached > 0);
-        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, fallback=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
-            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.fallback, worst_nmse);
+        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, redirected=%d, fallback=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
+            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.redirected, cap.fallback, worst_nmse);
     }
     return 0;
 }

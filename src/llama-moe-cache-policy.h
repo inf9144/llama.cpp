@@ -17,20 +17,30 @@ static inline bool moe_cache_fits(int64_t tokens, int64_t used, int64_t experts,
         (slots >= experts || tokens <= slots / used);
 }
 
+// Compare full host streaming with the uncached fraction on the owner link.
+// Unknown topology and complete banks retain local execution.
+static inline bool moe_cache_stage_on_faster_link(double owner, double other, int64_t slots, int64_t experts) {
+    return owner > 0 && other > owner && slots >= 0 && slots < experts &&
+        other * double(experts - slots) > owner * double(experts);
+}
+
 // Advance with sequence progress, not wall time or the number of speculative calls.
 // Revisiting rejected positions / restoring a checkpoint does not age the cache again.
 // Starting a new prompt at zero starts a new segment without clearing useful history.
 struct moe_cache_clock {
     uint64_t tokens = 0;
+    uint64_t latency_tokens = 0;
     std::unordered_map<int32_t, int64_t> high;
 
-    void begin(int32_t seq, int64_t first, int64_t last) {
+    void begin(int32_t seq, int64_t first, int64_t last, bool latency = true) {
         auto it = high.emplace(seq, -1).first;
         if (first == 0 && it->second > 0) {
             it->second = -1;
         }
         if (last > it->second) {
-            tokens += uint64_t(last - std::max(it->second, first - 1));
+            const uint64_t advance = uint64_t(last - std::max(it->second, first - 1));
+            tokens += advance;
+            if (latency) latency_tokens += advance;
             it->second = last;
         }
     }
@@ -39,13 +49,17 @@ struct moe_cache_clock {
 // One policy for decode, verify and prefill. Banks/budgets are unchanged.
 // Scores count repeated weight requests, once per (layer, expert, progress stamp),
 // not token assignments. The recent 1024 tokens have 4x the weight of older needs.
-// 16 capped counters cover 4096 forward token positions. Saturation and the stamp
-// prevent retries of rejected speculative tokens from gaining unlimited hotness.
+// Each window covers 4096 forward positions. The latency window advances only
+// with small batches, so a long prefill cannot erase useful decode/verify history.
 struct moe_cache_policy {
     static constexpr uint64_t slice_tokens = 256;
+    static constexpr uint32_t window_max_score = 15*(16 + 3*4);
     struct demand {
         uint64_t history = 0;
         uint64_t slice = 0;
+        uint64_t latency_history = 0;
+        uint64_t latency_slice = 0;
+        uint64_t latency_stamp = UINT64_MAX;
         uint64_t stamp = UINT64_MAX;
         uint32_t frequency = 0; // secondary tie-break only
     };
@@ -71,23 +85,30 @@ struct moe_cache_policy {
         scores.resize(needs.size());
     }
 
-    uint32_t score(int32_t key, uint64_t slice) {
-        demand & d = needs[key];
-        const uint64_t delta = slice - d.slice;
-        d.history = delta >= 16 ? 0 : d.history << (4*delta);
-        d.slice = slice;
-        const uint64_t pairs = (d.history & UINT64_C(0x0f0f0f0f0f0f0f0f)) +
-            ((d.history >> 4) & UINT64_C(0x0f0f0f0f0f0f0f0f));
+    static uint32_t window_score(uint64_t & history, uint64_t & previous, uint64_t slice) {
+        const uint64_t delta = slice - previous;
+        history = delta >= 16 ? 0 : history << (4*delta);
+        previous = slice;
+        const uint64_t pairs = (history & UINT64_C(0x0f0f0f0f0f0f0f0f)) +
+            ((history >> 4) & UINT64_C(0x0f0f0f0f0f0f0f0f));
         const uint32_t total = (pairs*UINT64_C(0x0101010101010101)) >> 56;
-        const uint32_t recent = (d.history & 15) + ((d.history >> 4) & 15) +
-            ((d.history >> 8) & 15) + ((d.history >> 12) & 15);
+        const uint32_t recent = (history & 15) + ((history >> 4) & 15) +
+            ((history >> 8) & 15) + ((history >> 12) & 15);
         return total + 3*recent;
+    }
+
+    uint32_t score(int32_t key, uint64_t slice, uint64_t latency_slice = 0) {
+        demand & d = needs[key];
+        // Lexicographic priority for repeated latency-sensitive demand, then
+        // total demand. This is one replacement policy, not a fixed partition.
+        return window_score(d.latency_history, d.latency_slice, latency_slice)*(window_max_score + 1) +
+            window_score(d.history, d.slice, slice);
     }
 
     // force_resident is the latency-oriented all-resident execution plan for
     // small batches / legacy backends. Streaming permits bypass instead of churn.
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills,
-              size_t & n_hit, uint64_t clock, bool force_resident) {
+              size_t & n_hit, uint64_t clock, bool force_resident, uint64_t latency_clock = 0, bool accessible = true) {
         fills.clear(); temporary.clear(); uniq.clear(); n_hit = 0;
         std::fill(counts.begin(), counts.end(), 0);
         for (size_t i = 0; i < n_ids; ++i) {
@@ -96,17 +117,27 @@ struct moe_cache_policy {
         }
         if (force_resident && uniq.size() > size_t(n_slots)) return false;
         const uint64_t slice = clock / slice_tokens;
+        const uint64_t latency_slice = latency_clock / slice_tokens;
         for (int32_t e : uniq) {
             const int32_t key = il*n_expert + e;
-            score(key, slice);
+            score(key, slice, latency_slice);
             demand & d = needs[key];
             if (d.stamp != clock) {
                 if ((d.history & 15) != 15) ++d.history;
                 d.frequency = (7*d.frequency + std::min(counts[e], uint32_t(65535))) / 8;
                 d.stamp = clock;
             }
-            scores[key] = score(key, slice);
-            n_hit += slot_map[il][e] >= 0;
+            if (force_resident && d.latency_stamp != clock) {
+                if ((d.latency_history & 15) != 15) ++d.latency_history;
+                d.latency_stamp = clock;
+            }
+            scores[key] = score(key, slice, latency_slice);
+            n_hit += accessible && slot_map[il][e] >= 0;
+        }
+        if (!accessible) {
+            std::sort(uniq.begin(), uniq.end());
+            temporary = uniq;
+            return true;
         }
         if (n_hit == uniq.size()) {
             std::sort(uniq.begin(), uniq.end());
@@ -118,7 +149,7 @@ struct moe_cache_policy {
         for (int32_t s = 0; s < n_slots; ++s) {
             const int32_t key = key_of[s];
             if (key >= 0 && key/n_expert == il && counts[key % n_expert]) continue;
-            if (key >= 0) scores[key] = score(key, slice);
+            if (key >= 0) scores[key] = score(key, slice, latency_slice);
             victims.push_back(s);
         }
         const auto victim_less = [&](int32_t a, int32_t b) {

@@ -2713,10 +2713,11 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
     ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
-    if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
+    auto backend = moe_cache->backend(il, selected_experts->ne[1]);
+    if (!ggml_backend_supports_op(backend, slots)) {
         return nullptr;
     }
-    ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+    ggml_backend_sched_set_tensor_backend(sched, slots, backend);
     cb(slots, "ffn_moe_slots", il);
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location('stream_ab', Path(__file__).with_name('stream-ab.py'))
+assert spec is not None and spec.loader is not None
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
@@ -32,6 +33,18 @@ class StreamActivationTests(unittest.TestCase):
         active['kinds']['cold'].pop('stage_h2d')
         with self.assertRaises(RuntimeError):
             runner.require_candidate_stream(active)
+
+    def test_redirect_requires_all_announced_execution_devices(self):
+        text = ('ROCm0 MoE cache size = 15200.0 MiB\nROCm1 MoE cache size = 9600.0 MiB\n'
+                'ROCm0 bounded miss scratch = 29 MiB\n'
+                'ROCm0 prefill execution = ROCm0\nROCm1 prefill execution = ROCm0\n')
+        with tempfile.TemporaryDirectory() as folder:
+            trace = Path(folder) / 'trace.log'
+            trace.write_text(text)
+            runner.require_candidate_scratch(trace)
+            trace.write_text(text + 'ROCm1 prefill execution = ROCm1\n')
+            with self.assertRaises(RuntimeError):
+                runner.require_candidate_scratch(trace)
 
     def test_zero_acceptance_after_many_drafts_is_rejected(self):
         with self.assertRaises(RuntimeError):

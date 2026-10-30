@@ -1,8 +1,9 @@
 # Window-based MoE admission and bounded HIP expert streaming
 
 Review branch: `feature/moe-cache-prefill`. Production `codex-compat` is not changed.
-The active production-model run at `f82020d` failed correctness; the padding
-correction below requires renewed GPU validation before merge.
+The production-model run at `58c330f` no longer shows the zero-acceptance failure
+of `f82020d`. Its warm performance regression motivates the topology and demand
+correction below, which still requires GPU validation before merge.
 The branch includes the earlier, default-off `LLAMA_MOE_MEASURE` build instrumentation.
 No new application option, runtime environment variable or cache budget is introduced.
 
@@ -39,6 +40,24 @@ Admission ranking and physical placement are separate: ascending admitted expert
 are placed in ascending freed slots to retain coalesced H2D copies. Consecutive
 bypassed experts are uploaded together too.
 
+Large-batch placement is fixed when the context is created. On Linux, supported
+HIP devices expose a PCI bus ID; sysfs provides the endpoint's speed ceiling and
+negotiated width. For a partially resident group, compare the owner's estimated
+uncached transfer cost with full host streaming on a faster link. Redirect only
+when `faster_link * (total_experts - slots) > owner_link * total_experts`.
+Unknown links, equal links, complete banks, and selections wider than 32 experts
+retain local placement. This is a static transfer-cost estimate, not a measured
+bandwidth or a guarantee for every router distribution or PCIe topology.
+
+Redirected groups use the same streaming operation and a typed view of the
+destination's bounded scratch. They do not copy a remote cache bank or upload
+prefill admissions into it. All selected weights are streamed from host memory;
+the remote bank remains available for small decode/verify. Demand is still
+observed for admission on later local requests. Local groups retain direct cache
+reads, direct admission and miss staging. Startup logs announce each owner's
+prefill execution device. No peer access, extra stream or remote weight cache is
+introduced, and the graph cannot switch execution devices during a request.
+
 For more than 32 query tokens, the process-local `MUL_MAT_ID_STREAM` operation
 consumes **logical model IDs**, a lookup dependency and a backend packet callback.
 Each packet supplies a logical-ID-to-weight-address table, a compact active list,
@@ -73,15 +92,22 @@ Small all-resident decode/verify retains its existing kernels and graph eligibil
 ## Demand window and small batches
 
 Each `(layer, expert)` counts repeated requests for its weights, rather than raw
-token assignments. Sixteen capped counters cover 4096 advancing token positions
-in 256-token slices. The newest four slices receive four times the older weight.
+token assignments. Two windows use sixteen capped counters, each covering 4096
+advancing positions in 256-position slices. One sees all requests; the other
+advances only with batches of at most 32 tokens. A long prefill therefore cannot
+expire recent decode/verify demand. Each window weights its newest four slices
+four times more strongly. Scores order latency-window demand first and total
+demand second: `latency_score * 421 + total_score`, where 420 is the maximum
+single-window score. There is no fixed partition of resident storage.
 Token assignment frequency is only a tie-breaker, after demand and recency.
 A miss must exceed the weakest unpinned resident's score by more than
 `max(1, resident_score/8)` to replace it; an empty slot accepts immediately.
 
 The clock follows sequence position progress, independently per sequence. Revisiting
 positions during verify or rollback does not advance it repeatedly; the same
-progress stamp cannot increase an expert's demand counter again. A prompt at position zero after previous forward progress begins another segment. This is a conservative progress proxy,
+progress stamp cannot increase an expert's demand counter again. The two windows
+have separate request stamps, so a first small request can record latency demand
+even if prefill already visited that position. A prompt at position zero after previous forward progress begins another segment. This is a conservative progress proxy,
 **not** an accepted-token oracle: a first speculative visit can count demand and
 advance the high-water mark by its lookahead. Policy state is performance metadata
 and is not serialized with KV checkpoints. Restoring a nonzero prefix does not
@@ -106,7 +132,7 @@ The additional persistent device scratch is bounded by:
 + backend alignment
 ```
 
-There is one 32-slot scratch bank plus one read-padding guard per device, shared
+There is one 32-slot scratch bank plus one read-padding guard per execution device, shared
 across layers and gate/up/down banks. It is not 32 complete expert bundles per
 layer. Resident bank budgets are unchanged. Both allocations are included in
 `llama_context::memory_breakdown()` and reported separately at initialization.
@@ -182,7 +208,7 @@ Build `llama-server`, `test-moe-stream` and `test-llama-archs`.
 The kernel fixture compares streamed results with the ordinary operation **on the
 same GPU**, before testing integrated model/cache behavior. It exercises MMQ for
 64 tokens and MMB where applicable for 512 tokens. The model fixture checks
-single/unequal/zero budgets, device ownership, prefill and decode/verify, state
+single/unequal/zero budgets, local/redirected placement, prefill and decode/verify, state
 restore and sequence reset. Its printed logit tolerance is NMSE <5e-4; that is not
 an acceptance guarantee for the production model.
 
@@ -329,3 +355,92 @@ the integrated model test, then use the same guarded A/B suite. The padding fix
 has not been executed on a GPU in the implementation environment, and production
 DFlash acceptance, output correctness and the performance/VRAM measurements must
 be rechecked before merge. No change has been merged to `codex-compat`.
+
+## 2026-10-30: keep streaming off the slow link and preserve generation demand
+
+The `moe-stream-ab-20261030-095410-184302` archive identifies the candidate as
+`58c330f`. Its cold uninstrumented response matches the baseline's completion hash
+and 78/144 accepted drafts. Warm responses differ (83/130 versus 78/144), so decode
+throughput is not an equal-work comparison. The candidate's warm prefill is still
+3.00% slower, 436.78 versus 450.27 tokens/s; warm request wall time is 4.30% longer.
+Removing D2D copies is insufficient to claim a speedup.
+
+Host expert accounting in `02-measure` separates two problems:
+
+| Expert traffic, GiB | Baseline | `58c330f` |
+| --- | ---: | ---: |
+| Cold large batches, ROCm0 | 146.7562 | 41.3732 |
+| Cold large batches, ROCm1 | 0 | 30.5674 |
+| Warm large batches, ROCm0 | 107.7442 | 37.6787 |
+| Warm large batches, ROCm1 | 0 | 27.5710 |
+| Warm small batches, both GPUs | 0.3389 | 13.3917 |
+| Warm expert D2D | 43.3012 | 0 |
+
+The baseline executes all large host-expert matmuls on ROCm0. Streaming instead
+anchored 85 of 235 large layer batches on ROCm1. On this machine that GPU is behind
+an x4 link. Whole-process profiler H2D duration sums change from 10.9025 to 4.3733
+seconds on GPU0, but from 1.6968 to 11.4087 seconds on GPU1. These sums include
+initialization, both requests and draft work; they are not isolated prefill costs
+and must not be added to claim an end-to-end delta. The profiler timestamps also
+have a different epoch from the runner's monotonic request timestamps; directly
+joining them by multiplying request microseconds by 1000 would be incorrect.
+
+For roughly half-resident groups and a fourfold link difference, the static
+transfer estimate now selects ROCm0 streaming for ROCm1-owned large batches.
+Local ROCm0 cache hits still compute in place. ROCm1's resident banks and budgets
+are unchanged; decode/verify still uses them directly. Redirected prefill observes
+demand but does not evict from or admit into that remote bank. It deliberately
+streams more host bytes over the faster link instead of requiring slow-link
+uploads to save bytes. This is not remote cache-hit execution or a peer-copy path.
+The same bounded operation handles both placements. No attention arithmetic,
+expert routing or dequantization kernel is changed.
+
+The original all-token window also aged cold decode history out during the next
+5121-token prefill. A separate small-batch progress window and priority preserve
+that demand, while new local small requests can still replace stale residents.
+This is a replacement-policy correction, not restoration of SLRU or a new cache.
+Neither window repeatedly rewards speculative revisits to the same progress
+stamp; neither claims to know which speculative tokens will eventually be accepted.
+
+An offline replay consumes all 5220 routing/plan pairs from the candidate's
+instrumented process, including initialization and both requests. Group capacities
+are 1600/1066/3202/532/1333/265 on ROCm0 and 260/2089/782/1044/260/260 on ROCm1.
+The unchanged policy reproduces every recorded hit/admission/temporary count
+exactly. Replaying the correction with the same route histograms predicts warm
+small-batch H2D of 3.3809 GiB instead of 13.3917 GiB, and large-batch H2D of
+99.7135 GiB, entirely on ROCm0, instead of 65.2497 GiB split across both GPUs.
+This uses the actual C++ planner, not a Python policy reimplementation. Small-batch
+progress is reconstructed from changes of the recorded all-token clock; accepted
+positions are not in the trace. Frozen routing, timing, overlap and future GPU
+numerics are not simulated. These are policy/placement estimates, not measured
+throughput or an acceptance guarantee. The warm decode estimate still exceeds the
+baseline's 0.3389 GiB; that remaining gap is not hidden as a solved problem.
+
+There are still no full expert work tensors or expert D2D copies on supported
+streamed operations. The remote placement uses only tensor metadata views of the
+already allocated scratch. If all ROCm1 groups redirect as estimated here, its
+29.01 MiB scratch allocation disappears and ROCm0 keeps one shared 29.01 MiB bank.
+Compute-buffer high-water marks and whole-process peak VRAM require a new hardware
+run; the previous roughly 500.72 MiB main-GPU compute-buffer saving is not a new
+measurement for this revision. Conservative attention-mask reservations remain.
+
+Validation in the implementation environment: CPU Release with measurement enabled;
+all three targeted CTest entries pass. The 27 poisoned-packet comparisons now also
+exercise typed scratch views with empty resident packets and no separate working
+bank. Policy tests cover topology crossover, full/unknown-link fallback, independent
+progress clocks, retry suppression, decode protection through long prefills,
+expiry and observation without remote-bank mutation. The model fixture retains
+prefill/decode/verify and checkpoint/reset checks; GPU configurations now report
+`redirected` counts separately. All eleven Python tests pass. Python type checking,
+EditorConfig checks and `git diff --check` pass for the changed files.
+
+No HIP SDK or GPU is present here. Rebuild both candidate directories, run the
+existing two GPU packet fixtures and integrated model fixture, then use
+`python3 scripts/moe-measure/stream-ab.py --profile`. The runner now verifies
+scratch on every announced **execution** device, including mixed local/redirected
+groups, rather than assuming cache ownership equals execution placement. Missing
+declarations retain the previous strict per-owner check; working-tensor fallback
+and zero-acceptance gates remain. Check that `ROCm1 prefill execution = ROCm0` is
+announced on this machine and inspect the model fixture's `redirected` count.
+Measure uninstrumented speed first, then transfer time, staging/compute memory and
+DFlash acceptance. This revision has not been merged to `codex-compat`.

@@ -18,8 +18,8 @@ public:
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const size_t * sizes = nullptr);
     ~llama_moe_cache();
 
-    // the device that caches layer il
-    ggml_backend_t backend(int32_t il) const;
+    // Execution device; small batches stay with the resident cache owner.
+    ggml_backend_t backend(int32_t il, int64_t n_tokens = 0) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
