@@ -33,6 +33,12 @@ class StreamActivationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             runner.require_candidate_stream(active)
 
+    def test_zero_acceptance_after_many_drafts_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            runner.require_candidate_acceptance({'timings': {'draft_n': 375, 'draft_n_accepted': 0}})
+        runner.require_candidate_acceptance({'timings': {'draft_n': 144, 'draft_n_accepted': 78}})
+        runner.require_candidate_acceptance({'timings': {'draft_n': 3, 'draft_n_accepted': 0}})
+
     def test_early_candidate_failure_can_still_print_and_archive(self):
         # main() prints before creating the handoff. Missing candidate results
         # must not raise another exception that skips that archive operation.

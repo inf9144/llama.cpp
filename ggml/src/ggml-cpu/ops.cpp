@@ -12701,6 +12701,10 @@ void ggml_compute_forward_mul_mat_id_stream(const ggml_compute_params * params, 
     memset(dst->data, 0, ggml_nbytes(dst));
     ggml_moe_packet packet = {};
     for (int32_t p = 0; stream.prepare(stream.userdata, p, &packet); ++p) {
+        if (packet.padding_bytes) {
+            GGML_ASSERT(packet.padding);
+            memset(packet.padding, 0, packet.padding_bytes);
+        }
         GGML_ASSERT(packet.count >= 0 && packet.count <= stream.n_experts);
         for (int32_t a = 0; a < packet.count; ++a) {
             const int32_t e = packet.experts[a];

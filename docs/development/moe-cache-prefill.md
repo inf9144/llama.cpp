@@ -1,6 +1,8 @@
 # Window-based MoE admission and bounded HIP expert streaming
 
 Review branch: `feature/moe-cache-prefill`. Production `codex-compat` is not changed.
+The active production-model run at `f82020d` failed correctness; the padding
+correction below requires renewed GPU validation before merge.
 The branch includes the earlier, default-off `LLAMA_MOE_MEASURE` build instrumentation.
 No new application option, runtime environment variable or cache budget is introduced.
 
@@ -136,7 +138,7 @@ Vision, prompt-tail ingest and checkpoint/rollback mechanisms are not modified.
 ## Validation and current evidence
 
 Implementation environment: CPU Release builds with measurement enabled and disabled;
-the latter also builds the RPC backend. All three targeted CTest entries and nine
+the latter also builds the RPC backend. All three targeted CTest entries and ten
 measurement/runner tests pass. No HIP compiler or GPU is present;
 HIP configure fails with `Failed to find HIP root directory`. Consequently the HIP
 build, kernel numerics and end-to-end speed/VRAM results below remain hardware gates.
@@ -263,7 +265,67 @@ throughput or VRAM benefit.
 
 Correction validation: CPU Release with measurement enabled; all three targeted CTest
 entries pass (27 packet comparisons, policy invariants and the FFN-640 model fixture).
-All nine analyzer/profile/runner unit tests pass, including preserving the handoff
+All ten analyzer/profile/runner unit tests pass, including preserving the handoff
 when activation fails before candidate requests complete. No HIP SDK or GPU is available
 in the implementation environment, so the corrected GPU dispatch, GPU numerics
 and resulting end-to-end performance/VRAM changes remain unverified here.
+
+
+## 2026-10-30: active streaming exposes a poisoned read guard
+
+The `moe-stream-ab-20261030-085959-917988` handoff proves active streaming on both
+GPUs: each reserves 29.01 MiB of bounded scratch, and the candidate emits
+`stage_h2d` with no `work_copy` or expert D2D records. However, every candidate
+request accepts **0 of 375 draft tokens** and produces repeated `必究` characters.
+The baseline produces coherent text and accepts 78/144 or 83/130 draft tokens.
+This is a correctness failure. Neither the roughly 900/1277 tokens/s cold/warm
+prefill nor the 20.18/10.61 GiB whole-request H2D totals are a valid performance
+result for the intended workload.
+
+The first cold prefill graph has exactly matching baseline/candidate router
+histograms through layer 20. Starting at layer 21, all 1024 queries select only
+experts 0..9; later layers remain collapsed. For GPU1's large batches that means
+only 10 distinct experts per layer instead of hundreds. Much of the apparent
+transfer improvement therefore comes from corrupted routing, not useful reuse.
+The fixed graph allocation still shows the intended main GPU0 compute reservation
+change, 1176.75 -> 676.03 MiB, with 29.01 MiB extra staging on each device. A valid
+end-to-end VRAM/speed conclusion must wait for correct production-model execution.
+
+A concrete staging-padding bug explains how non-finite outputs can arise. MMQ
+loads complete K tiles. K=640 leaves a final partial 256-value tile, so its weight
+loads can reach beyond the last row of the last staged matrix. Null activation
+padding does not neutralize a NaN/Inf weight scale: IEEE multiplication by zero
+still produces NaN. The bank's extra expert was cleared at initialization, but
+reusing the same raw storage for different matrix sizes/formats can put old
+quantized payload into that guard. In particular, a 460800-byte Q2_0 down expert
+can follow a 627200-byte IQ3_XXS up expert. Its new end lies within the old payload,
+whose bit fields need not be valid finite Q2_0 scales.
+
+The packet contract now exposes the staging read guard (one expert immediately
+after the current payload). Both HIP consumers clear it with `cudaMemsetAsync`
+on the executing backend stream, after the packet's uploads and before its
+kernels. Resident cache packets do not clear or copy their weights. The existing
+33-slot allocation already covers the guard, so no extra VRAM, host staging cache,
+feature switch, or host synchronization is added. CPU's packet oracle implements
+the same guard contract. Matmul arithmetic is unchanged.
+
+Regression coverage now poisons the staging payload and guard with 0xff **before
+every packet**, including the last short packet, then checks finite/equivalent
+outputs and a zero guard. This models reuse across quantized matrices rather than
+freshly cleared test storage. A separate CPU test dequantizes padded K=640 tiles
+for Q8_0, IQ4_NL and Q2_0: it reproduces NaNs from poisoned scales times zero and
+restores finite tails by clearing the guard. The 27 packet comparisons, policy
+and FFN-640/checkpoint fixture, and ten Python tests pass in CPU Release. The
+previous Q8_0 model test on two GPUs passed with NMSE 5.00462e-13, but it did not
+exercise poisoned mixed-format reuse; that earlier pass is not validation of this
+correction on the real model. The captured trace has no intermediate floating
+point tensors, so the exact first corrupt GPU tensor remains unobserved.
+
+The runner now rejects a candidate with at least 32 drafted tokens and zero
+accepted tokens immediately after that response, retaining the response and
+handoff. It no longer continues to call that run a completed performance result.
+Rebuild both candidate directories, rerun `test-moe-stream` on ROCm0/ROCm1 and
+the integrated model test, then use the same guarded A/B suite. The padding fix
+has not been executed on a GPU in the implementation environment, and production
+DFlash acceptance, output correctness and the performance/VRAM measurements must
+be rechecked before merge. No change has been merged to `codex-compat`.

@@ -1,6 +1,7 @@
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 #include "common.cuh"
 #include "mmb.cuh"
+#include "moe.cuh"
 #include "mmid.cuh"
 #include "unary.cuh"
 
@@ -921,7 +922,7 @@ static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, c
         ggml_moe_packet packet = {};
         for (int32_t p = 0;; ++p) {
             if (streaming) {
-                if (!streaming->prepare(streaming->userdata, p, &packet)) break;
+                if (!ggml_cuda_moe_prepare_packet(*streaming, p, packet, stream)) break;
                 if (!packet.count) continue;
                 GGML_ASSERT(!up && packet.count > 0 && packet.count <= experts);
             } else if (p) break;

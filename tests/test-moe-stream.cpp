@@ -21,6 +21,7 @@ struct fixture {
     ggml_backend_t backend;
     ggml_tensor * weights, * bank, * stage, * addresses, * active;
     std::vector<uint8_t> host;
+    std::vector<uint8_t> poison;
     std::vector<int32_t> counts;
     std::vector<std::vector<int32_t>> packets;
     std::vector<std::vector<uint64_t>> maps;
@@ -36,6 +37,11 @@ struct fixture {
         const auto & selected = packets[p];
         std::fill(map.begin(), map.end(), 0);
         int max_tokens = 0, rows = 0;
+        if (p > 0) {
+            // Model reuse of a larger / differently quantized matrix. 0xff is
+            // a NaN half scale in the native down formats, not neutral padding.
+            ggml_backend_tensor_set_async(backend, stage, poison.data(), 0, poison.size());
+        }
         for (size_t i = 0; i < selected.size(); ++i) {
             const int e = selected[i];
             if (p == 0) {
@@ -48,7 +54,9 @@ struct fixture {
         }
         ggml_backend_tensor_set_async(backend, addresses, map.data(), 0, map.size()*sizeof(uint64_t));
         if (!selected.empty()) ggml_backend_tensor_set_async(backend, active, selected.data(), 0, selected.size()*sizeof(int32_t));
-        *out = {(const uint64_t *) addresses->data, (const int32_t *) active->data, int32_t(selected.size()), max_tokens, rows};
+        *out = {(const uint64_t *) addresses->data, (const int32_t *) active->data, int32_t(selected.size()), max_tokens, rows,
+                p > 0 ? (char *) stage->data + selected.size()*weights->nb[2] : nullptr,
+                p > 0 ? weights->nb[2] : 0};
         return true;
     }
 
@@ -71,6 +79,7 @@ struct fixture {
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
         GGML_ASSERT(buffer);
         ggml_backend_buffer_clear(buffer.get(), 0);
+        poison.assign(ggml_nbytes(stage), 0xff);
 
         std::mt19937 gen(seed);
         std::vector<float> wf(ggml_nelements(weights)), importance(k, 1.0f);
@@ -108,6 +117,11 @@ struct fixture {
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
             ggml_backend_synchronize(backend);
         }
+        // Check the final partial packet as well as kernel finiteness. The CPU
+        // oracle checks the same contract even though it reads only logical K.
+        std::vector<uint8_t> guard(weights->nb[2], 0xff);
+        ggml_backend_tensor_get(stage, guard.data(), packets.back().size()*weights->nb[2], guard.size());
+        GGML_ASSERT(std::all_of(guard.begin(), guard.end(), [](uint8_t value) { return value == 0; }));
         std::vector<float> a(ggml_nelements(actual)), r(a.size());
         ggml_backend_tensor_get(actual, a.data(), 0, ggml_nbytes(actual));
         ggml_backend_tensor_get(reference, r.data(), 0, ggml_nbytes(reference));
@@ -123,10 +137,37 @@ struct fixture {
     }
 };
 
+// Reproduce the poisoned-tail failure without requiring a GPU: a tiled read
+// dequantizes the next block, then multiplies it by zero activation padding.
+static void test_quantized_padding() {
+    ggml_context_ptr init(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    GGML_ASSERT(init);
+    constexpr int logical_k = 640, tiled_k = 768;
+    for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+        const size_t payload = ggml_row_size(type, logical_k), padded = ggml_row_size(type, tiled_k);
+        std::vector<float> weights(logical_k, 0.25f), dequantized(tiled_k);
+        std::vector<uint8_t> bytes(padded, 0xff);
+        ggml_quantize_chunk(type, weights.data(), bytes.data(), 0, 1, logical_k, nullptr);
+        const auto to_float = ggml_get_type_traits(type)->to_float;
+        to_float(bytes.data(), dequantized.data(), tiled_k);
+        volatile float zero = 0.0f;
+        float tail = 0;
+        for (int i = logical_k; i < tiled_k; ++i) tail += zero*dequantized[i];
+        GGML_ASSERT(std::isnan(tail));
+        memset(bytes.data() + payload, 0, padded - payload);
+        to_float(bytes.data(), dequantized.data(), tiled_k);
+        tail = 0;
+        for (int i = logical_k; i < tiled_k; ++i) tail += zero*dequantized[i];
+        GGML_ASSERT(std::isfinite(tail) && tail == 0);
+    }
+    printf("Quantized K=640 padding: poisoned scales reproduce NaNs; zero guards restore finite tails in 3 formats\n");
+}
+
 int main(int argc, char ** argv) {
     const char * filter = argc == 3 && strcmp(argv[1], "--backend") == 0 ? argv[2] : nullptr;
     GGML_ASSERT(argc == 1 || filter);
     ggml_backend_load_all();
+    test_quantized_padding();
     int tested = 0, gpu = 0;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto dev = ggml_backend_dev_get(i);

@@ -217,6 +217,14 @@ def require_candidate_scratch(trace: Path) -> None:
                            "Keine Performance-Auswertung eines stillen Fallbacks; Candidate-Build/Dispatch prüfen.")
 
 
+def require_candidate_acceptance(result: dict) -> None:
+    timing = result.get("timings") or {}
+    drafted, accepted = timing.get("draft_n"), timing.get("draft_n_accepted")
+    if isinstance(drafted, (int, float)) and drafted >= 32 and accepted == 0:
+        raise RuntimeError(f"Candidate: {drafted} Draft-Tokens, kein einziger akzeptiert. "
+                           "DFlash-Korrektheit prüfen; diese Suite wertet das nicht als Performance-Erfolg.")
+
+
 def require_candidate_stream(split: dict) -> None:
     for phase in ("cold", "warm"):
         kinds = split["kinds"].get(phase, {})
@@ -251,6 +259,8 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
             for phase in ("cold", "warm"):
                 result = send_request(request, out / phase, cli.request_timeout)
                 results[phase] = result
+                if candidate:
+                    require_candidate_acceptance(result)
                 say(f"{name}/{phase}: {result['request_wall_s']} s; Prompt {result['usage'].get('prompt_tokens')}; "
                     f"Prefill {rate(result, 'prefill')} t/s; Decode {rate(result, 'decode')} t/s")
             stop_server(proc, cli.shutdown_timeout)

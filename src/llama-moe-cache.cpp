@@ -676,7 +676,9 @@ struct llama_moe_cache::impl {
             ggml_backend_tensor_set_async(d.backend, d.active, packet_experts.data(), 0, packet_experts.size()*sizeof(int32_t));
         }
         *out = { (const uint64_t *) d.addresses->data, (const int32_t *) d.active->data,
-                 (int32_t) packet_experts.size(), max_tokens, rows };
+                 (int32_t) packet_experts.size(), max_tokens, rows,
+                 packet > 0 ? (char *) d.stage->data + packet_experts.size()*w->nb[2] : nullptr,
+                 packet > 0 ? w->nb[2] : 0 };
         return true;
     }
 

@@ -46,6 +46,10 @@ struct ggml_moe_packet {
     int32_t count;
     int32_t max_tokens;
     int32_t rows;
+    // Reused staging may contain another format beyond the current payload.
+    // Clear this read guard on the executing stream before consuming the packet.
+    void * padding;
+    size_t padding_bytes;
 };
 typedef bool (*ggml_moe_prepare_t)(void * userdata, int32_t packet, struct ggml_moe_packet * out);
 struct ggml_moe_stream {

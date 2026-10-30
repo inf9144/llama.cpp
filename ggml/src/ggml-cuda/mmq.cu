@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "moe.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -384,7 +385,7 @@ void ggml_cuda_mul_mat_q(
 
     if (streaming) {
         ggml_moe_packet packet = {};
-        for (int32_t p = 0; streaming->prepare(streaming->userdata, p, &packet); ++p) {
+        for (int32_t p = 0; ggml_cuda_moe_prepare_packet(*streaming, p, packet, stream); ++p) {
             if (!packet.count) continue;
             GGML_ASSERT(packet.count > 0 && packet.count <= logical_experts && packet.max_tokens > 0);
             args.addresses = packet.addresses;
