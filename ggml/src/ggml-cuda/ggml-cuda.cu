@@ -2323,12 +2323,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
 #if defined(GGML_USE_HIP)
-        const auto verify_precision = ggml_prec_get_src(dst, 1);
-        if ((verify_precision == GGML_PREC_DEFAULT || verify_precision == GGML_PREC_Q8) &&
-                ggml_cuda_mmvq_verify_supported(ctx.device, src0, src1, ids)) {
-            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-            return;
-        }
         if (ggml_cuda_mmb_supported_mmid(ctx.device, src0, src1, ids, dst)) {
             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
             return;

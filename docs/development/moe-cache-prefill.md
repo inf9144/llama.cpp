@@ -566,20 +566,9 @@ ROCm1 needs no large-packet staging when all its prefill groups redirect to ROCm
 Large-batch routing still reads back IDs once per layer. Transfers of the next
 layer's experts cannot precede knowledge of its router result.
 
-### Grouped verify candidate
+### Verify dispatch after hardware profiling
 
-Five to eight query `MUL_MAT_ID` operations get a narrowly dispatched RDNA3
-candidate for the actual K/M shapes: K=2560 with M=640/1280, or K=640 with M=2560.
-It supports Q8_0, Q2_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, contiguous
-weights/inputs, and at most 32 selected experts per query. Each unique selected
-physical expert has one leader; four weight rows remain in LDS while matching
-queries consume them. Unsorted IDs and repeated experts across queries are valid.
-The existing native Q8_1 conversion, quantized dot products and wave reductions
-are reused. Kernels for one to four queries, fused operations and other layouts
-retain their previous dispatch. This candidate changes floating-point reduction
-order relative to MMQ/MMB; it is not asserted to be bit-identical or faster.
-Moving an operation from MMQ/MMB to MMVQ requires default/Q8 activation precision;
-existing MMVQ eligibility is unchanged.
+The grouped RDNA3 verify candidate from d9c17ce was numerically correct after the fractional-scale correction, but slower on both physical GPUs. It has been removed together with its dispatch override. Five to eight query operations again use the existing per-type MMVQ/MMQ/MMB selection. In particular, IQ4_NL/IQ4_XS retain native MMVQ through six queries, while IQ2_S/IQ3_S/IQ3_XXS retain their four-query limit. The GPU slot lookup, bounded upload pipeline and corrected shared dot products remain in use. No inactive candidate or runtime switch is retained.
 
 The normal draft width stays unchanged. `decode-ab.py` runs the existing A/B
 fixture at draft maxima 3, 5 and 7, corresponding to target verify widths up to
@@ -590,8 +579,8 @@ introduced. The existing main-model mixed quantization remains native.
 ### Validation and the next hardware round
 
 The GPU packet fixture also uses both lanes, poisons every reused lane, and checks
-the final partial guard. Twenty added real-shape verify cases compare the grouped
-kernel against streamed MMQ/MMB on exactly Q8/BF16-representable activations.
+the final partial guard. Twenty added real-shape verify cases compare the ordinary
+verify dispatch against streamed MMQ/MMB on exactly Q8/BF16-representable activations.
 A separate two-layer fixture runs the same lookup graph twelve times without an
 evaluation callback, exercising cold admission, all-hit continuation, eviction,
 duplicate/unsorted IDs and graph capture/replay against a dequantized CPU oracle.
@@ -697,3 +686,27 @@ end > test.log 2>&1
 ```
 
 Run the performance suite only after the correctness tests complete successfully.
+
+## Physical GPU results after f2efb69 and verify rollback
+
+The supplied `moe-decode-ab-20261030-202448-724033-handoff.tar.gz` completes all draft widths. `test(2).log` validates 47 packet cases per GPU, including twenty verify cases with independent CPU and one-token references. Worst pairwise NMSE is 5.86442089e-14; the worst CPU-oracle NMSE is 5.35913598e-14. The device-lookup fixture passes on both gfx1100 and gfx1101 with NMSE 2.5884e-15, including twelve graph executions and cross-layer eviction. The integrated model fixture passes checkpoint/reset and cache-budget fallback comparisons with worst logit NMSE 5.00462e-13. Its summaries report zero redirected operations, so it is not proof of the remote-owner prefill path in the production model.
+
+The uninstrumented warm measurements show that faster prefill is being offset by a verify regression:
+
+| Draft maximum | Baseline prefill t/s | Candidate prefill t/s | Baseline decode t/s | Candidate decode t/s |
+| --- | ---: | ---: | ---: | ---: |
+| 3 | 455.70 | 544.07 | 33.72 | 32.41 |
+| 5 | 474.22 | 580.39 | 34.83 | 21.69 |
+| 7 | 479.51 | 594.46 | 28.70 | 18.07 |
+
+The draft-7 profiler records an average IQ4_NL MMQ kernel duration of 173.69 us on gfx1100 and 187.61 us on gfx1101 in the baseline. The new grouped verify kernel averages 929.53 us and 1406.87 us respectively. These are per-call averages from the mixed cold/warm runs, not a fixed-routing microbenchmark. The new verify kernels sum to 4.79 GPU-seconds at draft 5 and 6.04 GPU-seconds at draft 7 across both GPUs. Summed GPU durations can overlap and must not be subtracted directly from request time.
+
+The code repeats leader/deduplication scans for each four-row block and serializes matching query dots while staging weights in LDS. This is a plausible source of the measured cost; the traces establish the regression, not a breakdown of LDS stalls versus instruction cost. Removing the candidate restores the previous dispatch exactly, including the native kernels it had also overridden for already-supported types.
+
+All completion hashes differ between baseline and candidate in this suite. Draft-5 warm acceptance falls from 86/197 to 76/251, while draft-7 warm acceptance rises from 85/287 to 89/260 despite slower decode. The kernel regression therefore cannot be attributed to lower acceptance alone. The request uses temperature 0.7 and seed 42; the changed generation trajectories do not establish production-logit equivalence. The synthetic numerical tests passing does not close that production validation requirement.
+
+GPU-side cache resolution is active and its device waits are still measurable. A zero host routing wait in the report does not mean zero GPU waiting. Those waits and cache demand should be assessed again after removing the verify regression, before changing the admission policy or synchronization design. The existing prefill placement and both staging lanes are preserved.
+
+For the next hardware comparison, retain the baseline binaries and rebuild only the candidate directories. Run the same numerical tests first, then `python3 scripts/moe-measure/decode-ab.py --draft-widths 5 --profile`. This focuses the next comparison on the clearest regression. No speedup after the rollback has been measured yet.
+
+Local rollback validation: the CPU Release targets `test-moe-stream` and `test-llama-archs` build successfully. The three targeted CTest entries `test-moe-stream`, `test-moe-cache-policy` and `test-moe-cache-prefill` pass (22.47 s total); the GPU cases skip without hardware. Source comparison confirms that MMVQ and the `MUL_MAT_ID` dispatcher exactly match their pre-candidate implementations, while the f2efb69 numerical correction and regression tests remain unchanged. A HIP compiler is unavailable in the current workspace, so neither a fresh HIP build nor physical GPU execution of this rollback is claimed.
