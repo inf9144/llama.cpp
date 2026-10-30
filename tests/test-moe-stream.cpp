@@ -3,6 +3,7 @@
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-moe.h"
+#include "../src/llama-moe-cache-policy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +17,8 @@
 // Both kernels read exactly the same quantized matrices. All activation values
 // are exactly representable in BF16 and Q8, isolating address/routing correctness.
 struct fixture {
-    static constexpr int experts = 67, slots = 24, m = 128, used = 4;
+    static constexpr int experts = 67, slots = 24, used = 4;
+    int m = 128;
     int k = 256;
     ggml_backend_t backend;
     ggml_tensor * weights, * bank, * stage, * addresses, * active;
@@ -27,6 +29,8 @@ struct fixture {
     std::vector<std::vector<uint64_t>> maps;
     int stage_width;
     bool all_temporary;
+    ggml_moe_pipeline pipeline = {};
+    size_t stage_span = 0;
 
     static bool prepare(void * userdata, int32_t p, ggml_moe_packet * out) {
         return static_cast<fixture *>(userdata)->prepare(p, out);
@@ -35,46 +39,55 @@ struct fixture {
         if (size_t(p) == packets.size()) return false;
         auto & map = maps[p];
         const auto & selected = packets[p];
+        const int lane = pipeline.context ? p%2 : 0;
+        auto upload = [&](ggml_tensor * dst, const void * src, size_t offset, size_t bytes) {
+            if (pipeline.context) pipeline.upload(pipeline.context, dst, src, offset, bytes);
+            else ggml_backend_tensor_set_async(backend, dst, src, offset, bytes);
+        };
+        if (pipeline.context) pipeline.packet_begin(pipeline.context, lane);
         std::fill(map.begin(), map.end(), 0);
         int max_tokens = 0, rows = 0;
         if (p > 0) {
             // Model reuse of a larger / differently quantized matrix. 0xff is
             // a NaN half scale in the native down formats, not neutral padding.
-            ggml_backend_tensor_set_async(backend, stage, poison.data(), 0, poison.size());
+            upload(stage, poison.data(), lane*stage_span, poison.size());
         }
         for (size_t i = 0; i < selected.size(); ++i) {
             const int e = selected[i];
             if (p == 0) {
                 map[e] = uintptr_t(bank->data) + size_t(slots - 1 - e/3)*bank->nb[2];
             } else {
-                ggml_backend_tensor_set_async(backend, stage, host.data() + size_t(e)*weights->nb[2], i*weights->nb[2], weights->nb[2]);
-                map[e] = uintptr_t(stage->data) + i*weights->nb[2];
+                upload(stage, host.data() + size_t(e)*weights->nb[2], lane*stage_span + i*weights->nb[2], weights->nb[2]);
+                map[e] = uintptr_t(stage->data) + lane*stage_span + i*weights->nb[2];
             }
             max_tokens = std::max(max_tokens, counts[e]); rows += counts[e];
         }
-        ggml_backend_tensor_set_async(backend, addresses, map.data(), 0, map.size()*sizeof(uint64_t));
-        if (!selected.empty()) ggml_backend_tensor_set_async(backend, active, selected.data(), 0, selected.size()*sizeof(int32_t));
-        *out = {(const uint64_t *) addresses->data, (const int32_t *) active->data, int32_t(selected.size()), max_tokens, rows,
-                p > 0 ? (char *) stage->data + selected.size()*weights->nb[2] : nullptr,
-                p > 0 ? weights->nb[2] : 0};
+        upload(addresses, map.data(), lane*experts*sizeof(uint64_t), map.size()*sizeof(uint64_t));
+        if (!selected.empty()) upload(active, selected.data(), lane*experts*sizeof(int32_t), selected.size()*sizeof(int32_t));
+        *out = {(const uint64_t *) addresses->data + lane*experts, (const int32_t *) active->data + lane*experts, int32_t(selected.size()), max_tokens, rows,
+                p > 0 ? (char *) stage->data + lane*stage_span + selected.size()*weights->nb[2] : nullptr,
+                p > 0 ? weights->nb[2] : 0, nullptr, nullptr};
+        if (pipeline.context) pipeline.packet_end(pipeline.context, lane, out);
         return true;
     }
 
-    void run(ggml_type type, int tokens, bool broadcast, int packet_width, bool temporary, size_t seed, int columns = 256) {
-        k = columns;
+    void run(ggml_type type, int tokens, bool broadcast, int packet_width, bool temporary, size_t seed, int columns = 256, int output_rows = 128) {
+        k = columns; m = output_rows;
         stage_width = packet_width; all_temporary = temporary;
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true}));
         weights = ggml_new_tensor_3d(ctx.get(), type, k, m, experts);
-        stage = temporary ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (stage_width + 1)*weights->nb[2]) :
-            ggml_new_tensor_3d(ctx.get(), type, k, m, stage_width + 1);
+        const int lanes = pipeline.context ? 2 : 1;
+        stage_span = (stage_width + 1)*weights->nb[2];
+        stage = temporary ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, lanes*stage_span) :
+            ggml_new_tensor_3d(ctx.get(), type, k, m, lanes*(stage_width + 1));
         bank = ggml_new_tensor_3d(ctx.get(), type, k, m, temporary ? used : slots);
         if (temporary) {
             // Remote-owner execution uses only a typed view of bounded scratch.
             // No full working bank is allocated or passed to the scheduler.
             bank->view_src = stage;
         }
-        addresses = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, experts);
-        active = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, experts);
+        addresses = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, lanes*experts);
+        active = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, lanes*experts);
         auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, broadcast ? 1 : used, tokens);
         auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, used, tokens);
         auto * ticket = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
@@ -87,7 +100,7 @@ struct fixture {
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_buffer_clear(buffer.get(), 0);
         if (temporary) GGML_ASSERT(bank->data == stage->data && bank->buffer == stage->buffer);
-        poison.assign(ggml_nbytes(stage), 0xff);
+        poison.assign(stage_span, 0xff);
 
         std::mt19937 gen(seed);
         std::vector<float> wf(ggml_nelements(weights)), importance(k, 1.0f);
@@ -128,7 +141,8 @@ struct fixture {
         // Check the final partial packet as well as kernel finiteness. The CPU
         // oracle checks the same contract even though it reads only logical K.
         std::vector<uint8_t> guard(weights->nb[2], 0xff);
-        ggml_backend_tensor_get(stage, guard.data(), packets.back().size()*weights->nb[2], guard.size());
+        const int last_lane = pipeline.context ? (packets.size() - 1)%2 : 0;
+        ggml_backend_tensor_get(stage, guard.data(), last_lane*stage_span + packets.back().size()*weights->nb[2], guard.size());
         GGML_ASSERT(std::all_of(guard.begin(), guard.end(), [](uint8_t value) { return value == 0; }));
         std::vector<float> a(ggml_nelements(actual)), r(a.size());
         ggml_backend_tensor_get(actual, a.data(), 0, ggml_nbytes(actual));
@@ -142,6 +156,107 @@ struct fixture {
         printf("%s %s K=%d tokens=%d broadcast=%d packet=%d all_stage=%d packets=%zu NMSE=%.9g max_abs=%.9g\n",
             ggml_backend_name(backend), ggml_type_name(type), k, tokens, broadcast, stage_width, all_temporary, packets.size(), nmse, max_error);
         GGML_ASSERT(nmse < 1e-10);
+    }
+};
+
+struct lookup_fixture {
+    static constexpr int experts = 13, slots = 8, k = 256, m = 128, tokens = 8, used = 2;
+    ggml_backend_t backend;
+    ggml_moe_pipeline pipeline = {};
+    ggml_tensor * map;
+    ggml_tensor * bank;
+    moe_cache_policy policy;
+    std::vector<int32_t> maps = std::vector<int32_t>(2*experts, -1);
+    std::vector<uint8_t> weights;
+    uint64_t clock = 0;
+    int hits = 0, misses = 0, cross_layer_evictions = 0;
+
+    static void resolve(void * userdata, int32_t il, const int32_t * ids, int32_t count, bool miss) {
+        auto & f = *(lookup_fixture *) userdata;
+        std::vector<moe_cache_policy::fill> fills;
+        size_t n_hit;
+        const auto before = f.maps;
+        GGML_ASSERT(f.policy.plan(il, ids, count, fills, n_hit, f.clock, true, f.clock, miss));
+        if (!miss) { ++f.hits; return; }
+        ++f.misses;
+        for (int e = 0; e < experts; ++e) {
+            const int index = (1 - il)*experts + e;
+            f.cross_layer_evictions += before[index] >= 0 && f.maps[index] < 0;
+        }
+        for (auto fill : fills) {
+            f.pipeline.upload(f.pipeline.context, f.bank,
+                f.weights.data() + (il*experts + fill.expert)*f.bank->nb[2], fill.slot*f.bank->nb[2], f.bank->nb[2]);
+        }
+        f.pipeline.upload(f.pipeline.context, f.map, f.maps.data(), 0, ggml_nbytes(f.map));
+    }
+
+    void run(ggml_moe_pipeline_init_t init) {
+        if (!init(backend, 2, &resolve, this, &pipeline)) return;
+        if (!pipeline.device_lookup) {
+            printf("%s device lookup tests SKIPPED: stream-signal graph support unavailable\n", ggml_backend_name(backend));
+            pipeline.destroy(pipeline.context);
+            return;
+        }
+        ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
+        map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 2*experts);
+        bank = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q8_0, k, m, slots + 1);
+        auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, used, tokens);
+        ggml_tensor * ids[2], * out[2];
+        auto * graph = ggml_new_graph(ctx.get());
+        for (int il = 0; il < 2; ++il) {
+            ids[il] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, used*tokens);
+            auto * view = ggml_view_2d(ctx.get(), map, 1, experts, sizeof(int32_t), il*experts*sizeof(int32_t));
+            auto * selected = ggml_moe_cache_lookup(ctx.get(), view, ids[il], pipeline.lookup_job(pipeline.context, il));
+            out[il] = ggml_mul_mat_id(ctx.get(), bank, x, ggml_reshape_2d(ctx.get(), selected, used, tokens));
+            ggml_set_output(out[il]);
+            ggml_build_forward_expand(graph, out[il]);
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        GGML_ASSERT(buffer);
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(buffer.get(), 0);
+        ggml_backend_tensor_set(map, maps.data(), 0, ggml_nbytes(map));
+        policy.init(2, experts, slots);
+        for (int il = 0; il < 2; ++il) policy.slot_map[il] = maps.data() + il*experts;
+        std::vector<float> source(2*experts*k*m), input(k*used*tokens);
+        for (size_t i = 0; i < source.size(); ++i) source[i] = (int(i%251) - 125)/128.0f;
+        for (size_t i = 0; i < input.size(); ++i) input[i] = i%32 == 0 ? 127.0f/16 : (int(i%127) - 63)/16.0f;
+        weights.resize(2*experts*bank->nb[2]);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, source.data(), weights.data(), 0, 2*experts*m, k, nullptr);
+        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(weights.data(), source.data(), source.size());
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        double worst = 0;
+        for (int step = 0; step < 12; ++step) {
+            clock = (step + 1)*32;
+            std::vector<int32_t> routing[2];
+            for (int il = 0; il < 2; ++il) {
+                routing[il].resize(used*tokens);
+                const int period = il == 0 && step >= 4 ? 3 : 2;
+                for (int t = 0; t < tokens; ++t) for (int u = 0; u < used; ++u) routing[il][t*used + u] = (3*(step/2) + 2*(t%period) + u)%experts;
+                ggml_backend_tensor_set(ids[il], routing[il].data(), 0, ggml_nbytes(ids[il]));
+            }
+            pipeline.begin(pipeline.context);
+            GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            pipeline.flush(pipeline.context);
+            for (int il = 0; il < 2; ++il) {
+                std::vector<float> actual(m*used*tokens);
+                ggml_backend_tensor_get(out[il], actual.data(), 0, ggml_nbytes(out[il]));
+                double error = 0, energy = 0;
+                for (int t = 0; t < tokens; ++t) for (int u = 0; u < used; ++u) for (int row = 0; row < m; ++row) {
+                    double expected = 0;
+                    const int e = il*experts + routing[il][t*used + u];
+                    for (int col = 0; col < k; ++col) expected += double(source[(e*m + row)*k + col])*input[(t*used + u)*k + col];
+                    const double value = actual[(t*used + u)*m + row];
+                    GGML_ASSERT(std::isfinite(value));
+                    error += (value - expected)*(value - expected); energy += expected*expected;
+                }
+                worst = std::max(worst, error/std::max(energy, 1e-30));
+            }
+        }
+        GGML_ASSERT(hits > 0 && misses > 0 && cross_layer_evictions > 0 && worst < 1e-10);
+        printf("%s device lookup: hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
+            ggml_backend_name(backend), hits, misses, cross_layer_evictions, worst);
+        pipeline.destroy(pipeline.context);
     }
 };
 
@@ -188,6 +303,8 @@ int main(int argc, char ** argv) {
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr)); GGML_ASSERT(backend);
         if (ggml_backend_is_cpu(backend.get())) ggml_backend_cpu_set_n_threads(backend.get(), 2);
         fixture f; f.backend = backend.get();
+        auto init = reg ? (ggml_moe_pipeline_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_pipeline_init") : nullptr;
+        if (hip && init) init(backend.get(), 1, [](void *, int32_t, const int32_t *, int32_t, bool) {}, nullptr, &f.pipeline);
         for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0}) {
             f.run(type, 64, true, 8, false, 42); // MMQ, repeated packets and tail
             f.run(type, 512, true, 32, false, 43); // MMB prefill / up
@@ -199,6 +316,16 @@ int main(int argc, char ** argv) {
             f.run(type, 64, false, 8, false, 45, 640);
             f.run(type, 512, false, 32, true, 46, 640);
         }
+        if (hip) {
+            for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0}) {
+                for (int width : {5, 8}) f.run(type, width, true, 8, false, 47, 2560, 640);
+            }
+            for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0}) {
+                for (int width : {5, 8}) f.run(type, width, false, 8, true, 48, 640, 2560);
+            }
+        }
+        if (f.pipeline.context) f.pipeline.destroy(f.pipeline.context);
+        if (hip && init) { lookup_fixture lookup; lookup.backend = backend.get(); lookup.run(init); }
         ++tested; gpu += hip;
     }
     if (!gpu) printf("RDNA3 HIP devices unavailable: GPU kernel tests SKIPPED\n");

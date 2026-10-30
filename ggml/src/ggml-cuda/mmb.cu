@@ -923,7 +923,7 @@ static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, c
         for (int32_t p = 0;; ++p) {
             if (streaming) {
                 if (!ggml_cuda_moe_prepare_packet(*streaming, p, packet, stream)) break;
-                if (!packet.count) continue;
+                if (!packet.count) { ggml_cuda_moe_consume_packet(packet, stream); continue; }
                 GGML_ASSERT(!up && packet.count > 0 && packet.count <= experts);
             } else if (p) break;
             const int active = streaming ? packet.count : experts;
@@ -941,6 +941,7 @@ static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, c
                 mmb_routed_kernel<128, 128, 32, 64, WT><<<dim3(m / 128, nbig), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), big.get(), m, k);
                 mmb_routed_kernel<128, 32, 32, 16, WT><<<dim3(m / 128, nsmall), MMB_NT, 0, stream>>>(weights, w->nb[2], converted.get(), output, nullptr, true, source.get(), target.get(), bounds.get(), small.get(), m, k);
             }
+            if (streaming) ggml_cuda_moe_consume_packet(packet, stream);
         }
     }
     CUDA_CHECK(cudaGetLastError());

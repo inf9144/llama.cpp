@@ -1640,7 +1640,7 @@ bool rpc_server::memset_tensor(const rpc_msg_memset_tensor_req & request) {
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
     // Streaming callbacks contain process-local addresses; never accept them over RPC.
-    if (tensor->op == GGML_OP_MUL_MAT_ID_STREAM) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID_STREAM || tensor->op == GGML_OP_MOE_CACHE_LOOKUP) {
         LOG_ERROR("[%s] process-local MoE stream received over RPC\n", __func__);
         return nullptr;
     }
@@ -2893,7 +2893,7 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
-    return op->op != GGML_OP_MUL_MAT_ID_STREAM;
+    return op->op != GGML_OP_MUL_MAT_ID_STREAM && op->op != GGML_OP_MOE_CACHE_LOOKUP;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

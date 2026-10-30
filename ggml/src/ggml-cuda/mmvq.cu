@@ -1095,6 +1095,77 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
+#if defined(GGML_USE_HIP)
+// A leader owns one selected expert, even when routing repeats it in different
+// positions. Its four rows stay in LDS while all matching query rows consume
+// them. Dot products and wave reductions use the existing native Q8_1 helpers.
+template <ggml_type type>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_verify(
+        const char * weights, const block_q8_1 * input, const int32_t * ids, float * dst,
+        int k, int m, int used, int tokens, int ids_stride, int input_channels,
+        int input_row, int input_token, int output_row, int output_token, int expert_stride) {
+    constexpr int warp = ggml_cuda_get_physical_warp_size();
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int bs = ggml_cuda_type_traits<type>::bs;
+    constexpr int vdr = get_vdr_mmvq(type, true);
+    const int leader = blockIdx.y;
+    const int expert = ids[(leader/used)*ids_stride + leader%used];
+    if (expert < 0) return;
+    for (int p = 0; p < leader; ++p) {
+        if (ids[(p/used)*ids_stride + p%used] == expert) return;
+    }
+    const int row0 = 4*blockIdx.x;
+    const int row_bytes = k/qk*bs;
+    extern __shared__ uint32_t local_weights[];
+    for (int i = threadIdx.x; i < 4*row_bytes/int(sizeof(uint32_t)); i += blockDim.x) {
+        const int row = i*int(sizeof(uint32_t))/row_bytes;
+        const int offset = i*int(sizeof(uint32_t))%row_bytes;
+        local_weights[i] = row0 + row < m ? *(const uint32_t *) (weights + size_t(expert)*expert_stride + size_t(row0 + row)*row_bytes + offset) : 0;
+    }
+    __syncthreads();
+    const int row = threadIdx.x/warp;
+    const int lane = threadIdx.x%warp;
+    if (row0 + row >= m) return;
+    const char * w = (const char *) local_weights + row*row_bytes;
+    constexpr auto dot = get_vec_dot_q_cuda(type, true);
+    for (int p = leader; p < used*tokens; ++p) {
+        const int token = p/used, channel = p%used;
+        if (ids[token*ids_stride + channel] != expert) continue;
+        const auto * y = input + token*input_token + (channel%input_channels)*input_row;
+        float sum = 0;
+        for (int block = lane/(qi/vdr); block < k/qk; block += vdr*warp/qi) {
+            sum += dot(w, y + block*(qk/QK8_1), block, vdr*(lane%(qi/vdr)));
+        }
+        sum = warp_reduce_sum<warp>(sum);
+        if (lane == 0) dst[token*output_token + channel*output_row + row0 + row] = sum;
+    }
+}
+#endif
+
+bool ggml_cuda_mmvq_verify_supported(int device, const ggml_tensor * w, const ggml_tensor * x, const ggml_tensor * ids) {
+#if defined(GGML_USE_HIP)
+    const auto & info = ggml_cuda_info().devices[device];
+    if (!GGML_CUDA_CC_IS_RDNA3_0(info.cc) || info.warp_size != 32 || !ids ||
+            ids->ne[1] < 5 || ids->ne[1] > 8 || ids->ne[0] > 32 ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(x) || !ggml_is_contiguous(ids) ||
+            w->ne[3] != 1 || x->ne[3] != 1 || x->type != GGML_TYPE_F32 ||
+            w->ne[0] > 4096 || w->nb[1]%sizeof(uint32_t) ||
+            !((w->ne[0] == 2560 && (w->ne[1] == 640 || w->ne[1] == 1280)) ||
+              (w->ne[0] == 640 && w->ne[1] == 2560))) return false;
+    switch (w->type) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: return true;
+        default: return false;
+    }
+#else
+    GGML_UNUSED_VARS(device, w, x, ids);
+    return false;
+#endif
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1112,6 +1183,27 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#if defined(GGML_USE_HIP)
+    constexpr bool native = type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_S ||
+        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if constexpr (native) {
+        if (!has_fusion && !fusion.shared_up && GGML_CUDA_CC_IS_RDNA3_0(cc) && warp_size == 32 &&
+                ncols_dst >= 5 && ncols_dst <= 8 && nchannels_dst <= 32 &&
+                stride_row_x == ncols_x/ggml_cuda_type_traits<type>::qk && stride_channel_x == stride_row_x*nrows_x &&
+                ((ncols_x == 2560 && (nrows_x == 640 || nrows_x == 1280)) || (ncols_x == 640 && nrows_x == 2560))) {
+            constexpr int block_bytes = ggml_cuda_type_traits<type>::bs;
+            const size_t row_bytes = size_t(stride_row_x)*block_bytes;
+            const dim3 grid((nrows_x + 3)/4, nchannels_dst*ncols_dst);
+            mul_mat_vec_q_verify<type><<<grid, 4*warp_size, 4*row_bytes, stream>>>(
+                (const char *) vx, (const block_q8_1 *) vy, ids, dst, ncols_x, nrows_x, nchannels_dst, ncols_dst,
+                ids_stride, nchannels_y.z, stride_channel_y, stride_col_y, stride_channel_dst, stride_col_dst, stride_channel_x*block_bytes);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,

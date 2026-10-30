@@ -32,6 +32,7 @@ def analyze(lines, phase):
         group = groups.setdefault(key, dict(phase=phase, context=key[0], graph=key[1], backend=key[2], layer=layer,
                                            tokens=event['tokens'], graph_type=event['graph_type'], banks={},
                                            h2d_bytes=0, d2d_bytes=0, routing_wait_us=0, upload_enqueue_us=0,
+                                           host_plan_us=0, device_lookup=False, device_miss=False,
                                            counts=None, hits=set()))
         kind = event['kind']
         if kind == 'routing':
@@ -44,6 +45,10 @@ def analyze(lines, phase):
                 group['hits'].update(i for i, n in enumerate(histogram) if n and event['resident'][i])
         if 'expert_bytes' in event:
             group['banks'][event['tensor']] = event['expert_bytes']
+        if kind == 'hybrid_plan':
+            group['host_plan_us'] += event['host_plan_us']
+            group['device_lookup'] |= event.get('device_lookup', False)
+            group['device_miss'] |= event.get('device_miss', False)
         if kind in ('h2d', 'admission_h2d', 'stage_h2d'):
             group['h2d_bytes'] += event['bytes']
             group['upload_enqueue_us'] += event['enqueue_us']
@@ -84,6 +89,7 @@ def analyze(lines, phase):
                 reservation_highwater=[dict(context=k[0], backend=k[1], bytes=v) for k, v in reservations.items()],
                 weight_address_unions=address_unions, incomplete_groups=incomplete,
                 limitations=['Host enqueue/wait times are not GPU durations.',
+                             'Device routing has no CPU routing wait; its signal waits and observer lag require GPU/CPU profiling.',
                              'Per-split input-copy address union is NOT whole-process or cross-split simultaneous live peak.',
                              'Kernel durations and allocation lifetimes require the GPU profiler.',
                              'Generic scheduler transfers outside expert callbacks are not counted here.',

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location('analyze', Path(__file__).with_name('analyze.py'))
+assert spec is not None and spec.loader is not None
 analyzer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyzer)
 
@@ -40,6 +41,18 @@ class AnalyzeTests(unittest.TestCase):
     def test_missing_trace(self):
         with self.assertRaises(ValueError):
             analyzer.analyze(['ordinary log'], 'decode')
+
+    def test_async_device_hits_keep_plan_time_separate(self):
+        base = dict(schema=1, context=1, graph=2, backend='ROCm1', tokens=4, graph_type=0, us=0,
+                    tensor='blk.3.ffn_up_exps.weight')
+        events = [dict(kind='routing', counts=[2, 1], resident=[1, 1], wait_us=0),
+                  dict(kind='bank', expert_bytes=100),
+                  dict(kind='hybrid_plan', host_plan_us=5, device_lookup=True, device_miss=False)]
+        layer = analyzer.analyze(['MOE_MEASURE\t'+json.dumps(base | e) for e in events], 'decode')['layers'][0]
+        self.assertTrue(layer['device_lookup'])
+        self.assertFalse(layer['device_miss'])
+        self.assertEqual((layer['host_plan_us'], layer['routing_wait_us']), (5, 0))
+        self.assertEqual((layer['resident_experts'], layer['miss_experts'], layer['h2d_bytes']), (2, 0, 0))
 
     def test_incomplete_is_visible(self):
         row = dict(schema=1, context=1, graph=1, backend='CPU', kind='bank', tensor='unknown', tokens=1, graph_type=0, expert_bytes=128)

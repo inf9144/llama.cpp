@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/moe.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -2322,6 +2323,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
 #if defined(GGML_USE_HIP)
+        const auto verify_precision = ggml_prec_get_src(dst, 1);
+        if ((verify_precision == GGML_PREC_DEFAULT || verify_precision == GGML_PREC_Q8) &&
+                ggml_cuda_mmvq_verify_supported(ctx.device, src0, src1, ids)) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ggml_cuda_mmb_supported_mmid(ctx.device, src0, src1, ids, dst)) {
             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
             return;
@@ -2654,6 +2661,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_MOE_CACHE_LOOKUP:
+#if defined(GGML_USE_HIP)
+            ggml_hip_moe_cache_lookup(ctx, dst);
+            break;
+#else
+            return false;
+#endif
         case GGML_OP_MUL_MAT_ID_STREAM: {
 #if defined(GGML_USE_HIP)
             const auto streaming = ggml_moe_get_stream(dst);
@@ -2864,8 +2878,8 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+static void ggml_cuda_set_tensor_async_impl(ggml_backend_cuda_context * cuda_ctx, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, cudaStream_t stream) {
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2883,15 +2897,28 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         if (cuda_ctx->rocm_malloc_stage_pool == nullptr) {
             cuda_ctx->rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
         }
-        cuda_ctx->rocm_malloc_stage_pool->copy(cuda_ctx->stream(),
+        cuda_ctx->rocm_malloc_stage_pool->copy(stream,
             (char *) tensor->data + offset, data, size,
             (size_t) malloc_pool_mib * 1024 * 1024);
         return;
     }
 #endif
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, stream));
 }
+
+static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_tensor_async_impl(ctx, tensor, data, offset, size, ctx->stream());
+}
+
+#if defined(GGML_USE_HIP)
+void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size, cudaStream_t stream) {
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    ggml_cuda_set_tensor_async_impl(&ctx, tensor, data, offset, size, stream);
+}
+#endif
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -5973,6 +6000,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_MOE_CACHE_LOOKUP: {
+#if defined(GGML_USE_HIP)
+            const auto & info = ggml_cuda_info().devices[dev_ctx->device];
+            return GGML_CUDA_CC_IS_RDNA3_0(info.cc) && info.warp_size == 32 &&
+                ggml_moe_get_lookup_job(op) && op->type == GGML_TYPE_I32 &&
+                op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == 1 &&
+                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                op->src[1]->type == GGML_TYPE_I32 && ggml_is_vector(op->src[1]) &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                ggml_nelements(op) > 0 && ggml_nelements(op) <= 256;
+#else
+            return false;
+#endif
+        }
         case GGML_OP_MUL_MAT_ID_STREAM: {
 #if defined(GGML_USE_HIP)
             const auto & info = ggml_cuda_info().devices[dev_ctx->device];
@@ -6410,6 +6451,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_MOE_CACHE_LOOKUP:
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
@@ -6591,6 +6633,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_get_features;
     }
 #if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_hip_moe_pipeline_init") == 0) {
+        return (void *) ggml_hip_moe_pipeline_init;
+    }
     if (strcmp(name, "ggml_backend_hip_moe_cache_supports_prefill") == 0) {
         return (void *) ggml_backend_hip_moe_cache_supports_prefill;
     }

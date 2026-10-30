@@ -329,7 +329,6 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -418,6 +417,8 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+    // Workers, streams and graph wait parameters must be released before backends.
+    llama_moe_cache_ptr moe_cache;
     // Staging for one target batch, released before the backends it uses.
     std::unique_ptr<llama_layer_inputs_device> layer_inputs_device;
 

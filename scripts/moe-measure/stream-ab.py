@@ -191,6 +191,9 @@ def host_summary(host: dict) -> dict:
             "h2d_gib": round(sum(x.get("h2d_bytes", 0) for x in layers)/2**30, 4),
             "d2d_gib": round(sum(x.get("d2d_bytes", 0) for x in layers)/2**30, 4),
             "routing_wait_ms": round(sum(x.get("routing_wait_us", 0) for x in layers)/1000, 3),
+            "host_plan_ms": round(sum(x.get("host_plan_us", 0) for x in layers)/1000, 3),
+            "device_lookup_layers": sum(bool(x.get("device_lookup")) for x in layers),
+            "device_all_hit_layers": sum(bool(x.get("device_lookup")) and not x.get("device_miss") for x in layers),
             "upload_enqueue_ms": round(sum(x.get("upload_enqueue_us", 0) for x in layers)/1000, 3),
             "note": "Expert-callback transfers only; not all host-to-device transfers."}
 
@@ -223,6 +226,10 @@ def require_candidate_scratch(trace: Path) -> str:
             raise RuntimeError(f"Candidate-Topologie unvollständig: Cache-GPUs={sorted(caches)}, "
                                f"PCIe-Pfade={sorted(links)}, Platzierung={sorted(execution)}. "
                                "Host-Link-Zeilen in trace.log prüfen; kein stiller Multi-GPU-Fallback im A/B-Test.")
+    routing = set(re.findall(r"\b(ROCm\d+)\s+device routing = enabled, transfer pipeline = enabled", text))
+    if caches - routing:
+        raise RuntimeError(f"Candidate-Decode-Pipeline inaktiv auf {sorted(caches - routing)}. "
+                           "HIP-Signal-/Graph-Unterstützung und Candidate-Build prüfen; siehe trace.log.")
     required = set().union(*(execution.get(owner, {owner}) for owner in caches))
     if not caches or required - scratch:
         raise RuntimeError(f"Candidate-Streaming inaktiv: Cache-GPUs={sorted(caches)}, Staging-GPUs={sorted(scratch)}. "
@@ -376,6 +383,11 @@ def prepare_launchers(root: Path, suite: Path, arguments: argparse.Namespace) ->
         for key in ("reference", "measure"):
             source = root / f"moe-server-{key}.fish"
             text = source.read_text()
+            draft_max = getattr(arguments, "draft_max", None)
+            if draft_max is not None:
+                text, matches = re.subn(r"(--spec-draft-n-max\s+)\d+", lambda m: m[1] + str(draft_max), text)
+                if matches != 1:
+                    raise ValueError(f"{source}: --spec-draft-n-max nicht eindeutig; kein unkontrollierter Verify-Vergleich")
             if re.search(r"--cache-ssd(?:-\S+)?", text):
                 raise ValueError(f"{source}: SSD-Promptcache muss deaktiviert sein")
             if "--cache-ram 0" not in text:
@@ -410,6 +422,7 @@ def main() -> int:
     p.add_argument("--output", type=Path)
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--profile", action="store_true", help="Auch ROCprofv3 auf beiden Varianten (Gesamt-Session) ausführen")
+    p.add_argument("--draft-max", type=int, choices=range(1, 8), help="Bestehenden Draft-Parameter für beide Varianten gleich überschreiben")
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--startup-timeout", type=int, default=900)
     p.add_argument("--request-timeout", type=int, default=900)
@@ -473,6 +486,7 @@ def main() -> int:
         "binaries": {variant: {key: {k: v for k, v in entry.items() if k != "script"} for key, entry in xs.items()} for variant, xs in launchers.items()},
         "request_sha256": hashlib.sha256(payload).hexdigest(),
         "cache_prompt": False, "profile_enabled": a.profile, "candidate_activation_required": True, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "draft_max_override": a.draft_max,
         "configuration": "Existing fish templates, SSD/RAM prompt cache off, same settings across variants."
     })
     report, errors = {}, []

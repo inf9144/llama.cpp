@@ -137,3 +137,9 @@ Legend:
 `QSA_SELECT` forms a compact pool/tail union without a dense attention mask. `FLASH_ATTN_SPARSE` consumes per-query cell indices. The CPU backend provides reference implementations; HIP implements Q8_0 K/V, 256-element heads and GQA ratios divisible by four on gfx1100/gfx1101. CUDA, Vulkan and other backends retain the existing Qwen4Exp mask path. HIP execution and performance validation remain pending on physical hardware; no HIP support CSV is claimed from CPU results.
 
 See [the implementation and validation report](development/hip-qsa-sparse-attention.md).
+
+## Internal MoE operations in this fork
+
+`MUL_MAT_ID_STREAM` uses bounded expert-address packets on supported RDNA3 HIP configurations; CPU has a test oracle. `MOE_CACHE_LOOKUP` resolves resident slots and publishes asynchronous demand/miss notifications on RDNA3 HIP with stream-signal graph support. CPU, CUDA, Vulkan and RPC do not execute the lookup operation; model construction retains their existing paths. Both operations contain process-local state and are rejected by RPC. These are implementation capabilities, not generated hardware support CSV results.
+
+See [the MoE implementation and validation report](development/moe-cache-prefill.md).

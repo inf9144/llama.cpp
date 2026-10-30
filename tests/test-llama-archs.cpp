@@ -2425,6 +2425,17 @@ static int test_moe_cache_policy(size_t seed) {
     GGML_ASSERT(phased.score(0, 11000/moe_cache_policy::slice_tokens, 0) > 0);
     GGML_ASSERT(phased.score(0, 11000/moe_cache_policy::slice_tokens, 16) <= moe_cache_policy::window_max_score);
     GGML_ASSERT(phased.needs[0].latency_history == 0);
+    // A delayed device hit must observe demand without reviving an evicted slot.
+    moe_cache_policy delayed; delayed.init(1, experts, 2);
+    std::vector<int32_t> delayed_map(experts, -1); delayed.slot_map[0] = delayed_map.data();
+    delayed.plan(0, initial, 2, fills, hits, 1, true, 1);
+    int32_t replacement[] = {2, 3};
+    delayed.plan(0, replacement, 2, fills, hits, 2, true, 2);
+    const auto after_eviction = delayed_map;
+    GGML_ASSERT(delayed_map[0] < 0 && delayed_map[1] < 0);
+    delayed.plan(0, initial, 2, fills, hits, 2, true, 2, false);
+    GGML_ASSERT(delayed_map == after_eviction && fills.empty());
+    GGML_ASSERT(delayed.needs[0].latency_history > 0);
     printf("MoE window policy: phase clocks, latency protection, remote staging, link selection and 2000 mixed plans passed\n");
     return 0;
 }
@@ -2549,8 +2560,8 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         for (size_t i = 0; i < devices.size(); ++i) {
             auto buft = ggml_backend_dev_buffer_type(devices[i]);
             const size_t allocated = actual_memory.at(buft).context - reference_memory.at(buft).context;
-            // Resident banks stay within the budget; the fixed 33-expert scratch
-            // bank and compact metadata are additional, separately bounded memory.
+            // Resident banks stay within budget. Two fixed packet lanes and
+            // mirrored slot maps are additional, separately bounded memory.
             size_t stride = 0;
             for (int il = 0; il < int(model->layers.size()); ++il) {
                 for (const auto * w : {model->layers[il].ffn_gate_up_exps, model->layers[il].ffn_down_exps}) {
@@ -2558,7 +2569,8 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
                 }
             }
             const size_t alignment = ggml_backend_buft_get_alignment(buft);
-            const size_t scratch = (moe_cache_stage_slots + 1)*stride + 16*(sizeof(uint64_t) + sizeof(int32_t)) + 4*alignment;
+            const size_t scratch = 2*(moe_cache_stage_slots + 1)*stride + 2*16*(sizeof(uint64_t) + sizeof(int32_t)) +
+                model->layers.size()*16*sizeof(int32_t) + 8*alignment;
             GGML_ASSERT(allocated <= budgets[i] + scratch);
         }
         llama_pos pos = 0, ref_pos = 0;
@@ -2580,7 +2592,7 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
             state.resize(size);
             checkpoint.push_back(std::move(state));
         }
-        for (int width : {1, 4, 8}) { step(width); }
+        for (int width : {1, 4, 5, 7, 8}) { step(width); }
         int index = 0;
         for (auto * ctx : {reference.get(), actual.get()}) {
             const auto & state = checkpoint[index++];

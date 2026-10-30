@@ -1246,6 +1246,7 @@ ggml_cgraph * llama_context::graph_reserve_worst_case(const llama_memory_context
 bool llama_context::sched_recover() {
     // Finish async work before graph_reserve() releases graph metadata and reuses allocation addresses.
     ggml_backend_sched_synchronize(sched.get());
+    if (moe_cache) moe_cache->synchronize();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1265,6 +1266,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (moe_cache) moe_cache->synchronize();
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -3235,6 +3237,7 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
     MOE_MEASURE(llama_moe_measure::graph = ++llama_moe_measure::sequence; llama_moe_measure::record r("graph_begin"));
+    if (moe_cache) moe_cache->begin_compute();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

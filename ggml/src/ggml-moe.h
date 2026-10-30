@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+struct ggml_backend;
+
 // Native MMQ formats used by mixed expert models; FP4 formats with separate
 // activation-scale semantics retain the ordinary path.
 #ifdef __cplusplus
@@ -38,7 +40,7 @@ static inline bool ggml_moe_stream_weight_supported(const struct ggml_tensor * w
 
 // Addresses are indexed by the model's logical expert ID, never by cache capacity.
 // Only experts in this packet are active. Every selected expert must occur once.
-// prepare queues uploads on the executing backend stream before its kernels run.
+// prepare queues uploads before its kernels, optionally on a fenced upload stream.
 // Pointers remain valid until that stream has finished consuming the packet.
 struct ggml_moe_packet {
     const uint64_t * addresses;
@@ -50,7 +52,42 @@ struct ggml_moe_packet {
     // Clear this read guard on the executing stream before consuming the packet.
     void * padding;
     size_t padding_bytes;
+    // Optional backend events: uploads complete before reads; reuse follows reads.
+    void * ready;
+    void * consumed;
 };
+
+// Internal HIP service. Slot maps stay on device; only admission needs a host
+// decision. Notifications also observe hits without blocking device execution.
+typedef void (*ggml_moe_resolve_t)(void * userdata, int32_t layer, const int32_t * ids, int32_t count, bool miss);
+struct ggml_moe_pipeline {
+    void * context;
+    bool device_lookup;
+    void (*destroy)(void * context);
+    void (*begin)(void * context);
+    void (*flush)(void * context);
+    void (*upload)(void * context, struct ggml_tensor * dst, const void * src, size_t offset, size_t bytes);
+    void (*packet_begin)(void * context, int32_t lane);
+    void (*packet_end)(void * context, int32_t lane, struct ggml_moe_packet * packet);
+    void * (*lookup_job)(void * context, int32_t layer);
+};
+typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t layers,
+    ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);
+
+static inline struct ggml_tensor * ggml_moe_cache_lookup(struct ggml_context * ctx,
+        struct ggml_tensor * map, struct ggml_tensor * ids, void * job) {
+    GGML_ASSERT(map->type == GGML_TYPE_I32 && job);
+    struct ggml_tensor * res = ggml_get_rows(ctx, map, ids);
+    res->op = GGML_OP_MOE_CACHE_LOOKUP;
+    memcpy(res->op_params, &job, sizeof(job));
+    return res;
+}
+
+static inline void * ggml_moe_get_lookup_job(const struct ggml_tensor * t) {
+    void * job;
+    memcpy(&job, t->op_params, sizeof(job));
+    return job;
+}
 typedef bool (*ggml_moe_prepare_t)(void * userdata, int32_t packet, struct ggml_moe_packet * out);
 struct ggml_moe_stream {
     ggml_moe_prepare_t prepare;

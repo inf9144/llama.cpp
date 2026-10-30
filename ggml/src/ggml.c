@@ -1111,9 +1111,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QSA_SELECT",
     "FLASH_ATTN_SPARSE",
     "MUL_MAT_ID_STREAM",
+    "MOE_CACHE_LOOKUP",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1230,9 +1231,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qsa_select(top_k, score, pools, tail)",
     "flash_attn_sparse(q, k, v, indices)",
     "mul_mat_id_stream(bank, x, ids)",
+    "moe_cache_lookup(map, ids)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

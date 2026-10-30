@@ -606,6 +606,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_SPARSE,
 
         GGML_OP_MUL_MAT_ID_STREAM, // process-local bounded expert streaming
+        GGML_OP_MOE_CACHE_LOOKUP, // process-local device cache lookup / admission
 
         GGML_OP_COUNT,
     };

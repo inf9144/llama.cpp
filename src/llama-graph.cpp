@@ -2710,9 +2710,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
-    // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
-    // the callback reads the selected experts, uploads the missing ones and updates the slot map
-    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
+    // Device maps keep hit lookups in the graph. Host maps retain the existing
+    // split/copy callback for unsupported shapes and backends.
+    ggml_tensor * slots = moe_cache->lookup_slots(ctx0, slot_map, ids, il); // [1, n_expert_used*n_tokens]
     auto backend = moe_cache->backend(il, selected_experts->ne[1]);
     if (!ggml_backend_supports_op(backend, slots)) {
         return nullptr;

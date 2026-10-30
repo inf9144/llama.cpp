@@ -386,13 +386,14 @@ void ggml_cuda_mul_mat_q(
     if (streaming) {
         ggml_moe_packet packet = {};
         for (int32_t p = 0; ggml_cuda_moe_prepare_packet(*streaming, p, packet, stream); ++p) {
-            if (!packet.count) continue;
+            if (!packet.count) { ggml_cuda_moe_consume_packet(packet, stream); continue; }
             GGML_ASSERT(packet.count > 0 && packet.count <= logical_experts && packet.max_tokens > 0);
             args.addresses = packet.addresses;
             args.active_experts = packet.experts;
             args.n_active = packet.count;
             args.ncols_max = packet.max_tokens;
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+            ggml_cuda_moe_consume_packet(packet, stream);
         }
     } else {
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);

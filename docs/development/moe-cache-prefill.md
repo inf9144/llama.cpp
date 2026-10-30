@@ -1,9 +1,9 @@
 # Window-based MoE admission and bounded HIP expert streaming
 
 Review branch: `feature/moe-cache-prefill`. Production `codex-compat` is not changed.
-The production-model run at `58c330f` no longer shows the zero-acceptance failure
-of `f82020d`. Its warm performance regression motivates the topology and demand
-correction below, which still requires GPU validation before merge.
+The `21ddbbac` hardware run validates redirected prefill and lower peak device
+allocation on the supplied workload. The additional decode/verify and transfer
+pipeline package below still needs numerical and performance validation on GPUs.
 The branch includes the earlier, default-off `LLAMA_MOE_MEASURE` build instrumentation.
 No new application option, runtime environment variable or cache budget is introduced.
 
@@ -24,8 +24,10 @@ and output reduction retain their existing semantics. One host planner observes
 all supported cached requests. The configured resident banks and their capacities
 remain in place; SLRU admission/eviction is replaced by window-based demand.
 
-The existing slot-map copy boundary still reads the selected IDs and synchronizes
-that backend once per layer. It deduplicates the selection and plans three classes:
+Large requests retain the slot-map copy boundary: it reads the selected IDs and
+synchronizes that backend once per layer. Supported requests with at most eight
+queries instead resolve slots on the GPU and notify a host admission worker.
+Both use the same policy and three weight classes:
 
 | Class | Weight location | Work-weight copy |
 | --- | --- | --- |
@@ -34,8 +36,9 @@ that backend once per layer. It deduplicates the selection and plans three class
 | Bypassed miss | At most 32 experts in shared device scratch | Reused after its readers |
 
 Every resident selected by the layer is pinned through all its gate/up/down
-operations. Admission fills all weight banks of the expert bundle. The next
-slot-map callback synchronizes the owning backend before it may evict those slots.
+operations. Admission fills all weight banks of the expert bundle. A host
+slot-map callback synchronizes the owning backend before eviction; a device miss
+is published only after the preceding layer's readers have completed on its stream.
 Admission ranking and physical placement are separate: ascending admitted experts
 are placed in ascending freed slots to retain coalesced H2D copies. Consecutive
 bypassed experts are uploaded together too.
@@ -60,8 +63,8 @@ prefill admissions into it. All selected weights are streamed from host memory;
 the remote bank remains available for small decode/verify. Demand is still
 observed for admission on later local requests. Local groups retain direct cache
 reads, direct admission and miss staging. Startup logs announce each owner's
-prefill execution device. No peer access, extra stream or remote weight cache is
-introduced, and the graph cannot switch execution devices during a request.
+prefill execution device. No peer access or remote weight cache is introduced,
+and the graph cannot switch execution devices during a request.
 
 For more than 32 query tokens, the process-local `MUL_MAT_ID_STREAM` operation
 consumes **logical model IDs**, a lookup dependency and a backend packet callback.
@@ -85,14 +88,15 @@ native MMQ formats; MMB remains selected by its existing shape/type predicate.
 
 Gate/up/down are ordinary separate graph operations, or the existing merged
 `gate_up` weight operation. A staged weight matrix is uploaded once when that
-operation consumes it. Its storage can be reused by the next packet/matrix on the
-same stream. This implementation does not add a streaming-specific gate+up/GLU
+operation consumes it. Two bounded lanes overlap the next upload with the current
+packet's computation; ready/consumed events protect every lane's storage and metadata.
+This implementation does not add a streaming-specific gate+up/GLU
 fusion or split one FFN into a separate scheduling subsystem.
 
 The GGML graph and reservation remain fixed for a given shape. Runtime packet
 counts do not add graph nodes or reserve full expert working tensors. These splits
 execute outside HIP graph capture because their H2D uploads and launch counts vary.
-Small all-resident decode/verify retains its existing kernels and graph eligibility.
+Small decode/verify retains graph eligibility, including the device lookup wait.
 
 ## Demand window and small batches
 
@@ -132,13 +136,14 @@ cannot guarantee residency use the existing host-weight fallback.
 The additional persistent device scratch is bounded by:
 
 ```
-33 * largest_single_weight_matrix_bytes_per_expert_on_device
-+ max_logical_experts_on_device * (sizeof(uint64_t) + sizeof(int32_t))
+2 * 33 * largest_single_weight_matrix_bytes_per_expert_on_device
++ 2 * max_logical_experts_on_device * (sizeof(uint64_t) + sizeof(int32_t))
++ sum(cached_streaming_layers * logical_experts * sizeof(int32_t))
 + backend alignment
 ```
 
-There is one 32-slot scratch bank plus one read-padding guard per execution device, shared
-across layers and gate/up/down banks. It is not 32 complete expert bundles per
+Each execution device has two 32-slot scratch banks with one read-padding guard each, shared
+across layers and gate/up/down banks. They are not complete expert bundles per
 layer. Resident bank budgets are unchanged. Both allocations are included in
 `llama_context::memory_breakdown()` and reported separately at initialization.
 The scratch is outside the configured resident-cache budget; increasing the
@@ -160,19 +165,20 @@ is never sent to RPC: the client and server reject its process-local callbacks.
 CPU supports a scalar test oracle; model construction enables streaming only on
 supported HIP devices. Vulkan uses the existing operations.
 
-Work stays on the bank's owning GPU. This does not implement cross-device routing
-of misses, peer weight reads or separate transfer/compute-stream overlap. In
-particular, the 7800 XT still has to receive its missing weights over its x4 link.
+Small-batch work stays on the bank's owning GPU; large-batch placement follows the
+link estimate above. There are no cross-device cache reads. Small misses owned by
+the 7800 XT still upload over its x4 link. A nonblocking upload stream overlaps
+large packet transfers with computation, without changing the cache's capacity.
 The SSD prompt cache, mmap malloc-stage-pool workaround, DFlash device inputs,
 Vision, prompt-tail ingest and checkpoint/rollback mechanisms are not modified.
 
 ## Validation and current evidence
 
-Implementation environment: CPU Release builds with measurement enabled and disabled;
-the latter also builds the RPC backend. All three targeted CTest entries and ten
-measurement/runner tests pass. No HIP compiler or GPU is present;
-HIP configure fails with `Failed to find HIP root directory`. Consequently the HIP
-build, kernel numerics and end-to-end speed/VRAM results below remain hardware gates.
+The initial implementation was validated in CPU Release with measurement enabled
+and disabled, including the RPC backend, three targeted CTest entries and ten
+measurement/runner tests. Subsequent sections record each revision's checks.
+An official ROCm SDK is now available for compilation, but no GPU is available;
+kernel numerics and end-to-end speed/VRAM remain hardware gates for new changes.
 
 - Window-policy tests: 2000 mixed plans, duplicate routes, pinned hits, cross-layer
   eviction, forced admission, bypass beyond capacity, hysteresis, retry suppression,
@@ -494,3 +500,145 @@ Python tests, targeted Python type checks, EditorConfig, model-naming checks and
 HIP compilation, the redirected GPU model fixture, output/acceptance consistency,
 activation-transfer overhead, new VRAM peaks and actual throughput remain to be
 checked on gfx1100/gfx1101; the implementation environment has no HIP SDK or GPU.
+
+## Combined decode/verify and upload pipeline package
+
+This package starts from `21ddbbac` and keeps its placement and demand policy.
+The supplied `20261030-130143-635571` archive finally announces ROCm0 prefill for
+both owners. Its uninstrumented warm prefill is 549.19 versus 444.65 tokens/s;
+the decode comparison has different completion hashes and speculative work.
+In `02-measure/warm`, all 2490 routing histograms, completion hashes and DFlash
+counts match. There, prefill is 549.70 versus 466.56 tokens/s and generation is
+38.10 versus 37.28 tokens/s. Measurement-build timings are not uninstrumented
+throughput results.
+
+That measured warm candidate has 2197 all-hit small requests out of 2255, with
+89.19 ms of CPU routing wait and 7.13 ms of host planning. Deleting those times
+alone cannot explain a large multiple of its 3.33-second generation time. Larger
+benefits would have to come from less graph fragmentation or better verify work
+reuse and must be measured. The profiler's simultaneous device-allocation peak
+falls by 471.71 MiB on that older revision, while resident cache sizes stay fixed.
+The cold baseline is substantially slower than its next same-binary run, so the
+large cold headline delta is not credited as an implementation speedup.
+
+### Device slot lookup and asynchronous admission
+
+For supported streaming groups with one to eight queries and at most 256 selected
+IDs, `MOE_CACHE_LOOKUP` replaces the host map-copy boundary. The layer's I32 slot
+map resides on its owning GPU. A wave32 block gathers physical slots and publishes
+the logical IDs and a miss bit into a small coherent mapped notification.
+
+An all-hit lookup continues without a CPU routing readback or admission decision.
+A worker later observes demand using the same window policy. A delayed hit can
+update demand but cannot revive a slot already evicted by a later request. A miss
+waits on an HSA signal while the worker pins existing hits, admits the missing
+experts directly into their final banks and uploads the group's complete mapping,
+including invalidations of evicted experts in other layers. The upload stream
+releases the signal after those copies; the GPU then re-gathers the slots.
+There is no GPU spin kernel and no CPU stream synchronization inside admission.
+The next layer cannot publish a miss before the preceding layer's readers finish.
+
+The wait is an explicit HIP BatchMemOp graph node during capture. A plain
+`hipStreamWaitValue64` call is not automatically captured. Its parameter arrays,
+signals and notifications outlive all graphs; destruction clears those graphs
+before releasing them. The implementation requires HIP 6.4 or newer, checks the
+device stream-wait capability and probes an already-signaled graph wait at
+initialization. Unavailable support retains host routing. Context synchronization,
+batch/clock changes, graph recovery and destruction drain observers before reuse.
+Each enabled GPU has one worker, asleep outside small-batch execution. This is
+cache metadata, not another weight cache or a speculative expert predictor.
+
+### Bounded transfer/compute overlap
+
+Each prefill execution GPU now alternates two 32-expert staging lanes instead of
+one. A separate nonblocking upload stream waits for a lane's consumed event,
+uploads weights and descriptors, and records its ready event. MMQ/MMB wait for
+ready, clear the same quantized read guard, compute, and record consumed. Empty
+packets are handled too. The next lane can upload while the current packet runs;
+reuse across layers and gate/up/down banks remains bounded and event ordered.
+
+Uploads use the existing backend's malloc-stage pool and mutex, including its
+mmap workaround and optional tensor filter. There is no second host-stage pool.
+On the supplied placement, another lane adds approximately 29.01 MiB on ROCm0,
+plus less than 0.1 MiB of device maps across both GPUs; the resident banks remain
+unchanged. This is an allocation-size estimate, not a new measured peak saving.
+ROCm1 needs no large-packet staging when all its prefill groups redirect to ROCm0.
+Large-batch routing still reads back IDs once per layer. Transfers of the next
+layer's experts cannot precede knowledge of its router result.
+
+### Grouped verify candidate
+
+Five to eight query `MUL_MAT_ID` operations get a narrowly dispatched RDNA3
+candidate for the actual K/M shapes: K=2560 with M=640/1280, or K=640 with M=2560.
+It supports Q8_0, Q2_0, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, contiguous
+weights/inputs, and at most 32 selected experts per query. Each unique selected
+physical expert has one leader; four weight rows remain in LDS while matching
+queries consume them. Unsorted IDs and repeated experts across queries are valid.
+The existing native Q8_1 conversion, quantized dot products and wave reductions
+are reused. Kernels for one to four queries, fused operations and other layouts
+retain their previous dispatch. This candidate changes floating-point reduction
+order relative to MMQ/MMB; it is not asserted to be bit-identical or faster.
+Moving an operation from MMQ/MMB to MMVQ requires default/Q8 activation precision;
+existing MMVQ eligibility is unchanged.
+
+The normal draft width stays unchanged. `decode-ab.py` runs the existing A/B
+fixture at draft maxima 3, 5 and 7, corresponding to target verify widths up to
+4, 6 and 8. Each width is applied equally to baseline and candidate; all other
+Fish/JSON settings stay unchanged. No application flag or environment switch is
+introduced. The existing main-model mixed quantization remains native.
+
+### Validation and the next hardware round
+
+The GPU packet fixture also uses both lanes, poisons every reused lane, and checks
+the final partial guard. Twenty added real-shape verify cases compare the grouped
+kernel against streamed MMQ/MMB on exactly Q8/BF16-representable activations.
+A separate two-layer fixture runs the same lookup graph twelve times without an
+evaluation callback, exercising cold admission, all-hit continuation, eviction,
+duplicate/unsorted IDs and graph capture/replay against a dequantized CPU oracle.
+Unsupported signal graphs print a skip; they do not pass as device-lookup proof.
+The integrated model fixture adds widths five and seven to its existing prefill,
+checkpoint and sequence-reset comparisons. CPU policy tests cover a delayed
+hit observation after eviction without changing residency.
+
+New HIP kernels, graph waits, event ordering, production logits/DFlash acceptance,
+Vision/save/restore/rollback compatibility, end-to-end gains and peak VRAM are
+still GPU tests to be run on the two physical cards. Existing attention, KV,
+prompt-tail ingest, SSD cache and Vulkan construction are unchanged. CPU model
+equality does not validate the new device kernels.
+
+Keep the baseline binaries. Rebuild both candidate build directories and the two
+test targets with the normal ROCm configuration, then run:
+
+```sh
+./build-rocm-moe-candidate-reference/bin/test-moe-stream --backend ROCm0
+./build-rocm-moe-candidate-reference/bin/test-moe-stream --backend ROCm1
+./build-rocm-moe-candidate-reference/bin/test-llama-archs --test-moe-cache-prefill -s 42
+python3 scripts/moe-measure/decode-ab.py --profile
+```
+
+The suite forwards the existing A/B runner options, writes one handoff for all
+widths, and preserves partial results on failure. It requires device routing and
+the transfer pipeline on all cache GPUs, retains placement/working-copy and
+zero-acceptance gates, and stops at the first failing width. Runtime fallback
+remains safe; this controlled test rejects it instead of calling it a successful
+three-part benchmark. `--draft-widths 3` can run the existing width alone.
+Host reports now separate device all-hit layers, worker planning time and legacy
+CPU routing wait. A zero CPU routing wait does not mean a zero-duration GPU signal
+wait or zero observer cost. Inspect profiler kernel/transfer overlap and actual
+allocation lifetimes separately from host enqueue measurements.
+
+Implementation checks: CPU Release with measurement enabled passes the three
+targeted CTest entries. The CPU model logits remain exact (NMSE 0); the 27 packet
+cases have worst NMSE 7.18e-15 and maximum absolute difference 3.06e-5. Release
+without measurement also builds `llama` and the RPC backend; RPC's operation-count
+protocol patch is bumped to 8.0.3, and both process-local operations stay rejected.
+All 18 measurement/runner tests, targeted Python type checks, EditorConfig and
+`git diff --check` pass. These results do not execute device lookup or the new
+verify kernel; the dedicated GPU fixtures are provided for the local hardware run.
+
+The final Release HIP build succeeds for both `gfx1100;gfx1101`, including
+`ggml-hip`, `llama-server`, `test-moe-stream` and `test-llama-archs`. Compilation
+uses the official ROCm 10.3.0a20261030 SDK (Clang 24), not the production machine's
+ROCm 10.1. That SDK warns about the context-query API's deprecation; it remains
+available for the HIP 6.4-compatible BatchMemOp setup. No physical GPU is exposed
+in this environment, so the new GPU fixtures are compiled but not executed.
