@@ -138,6 +138,8 @@ Legend:
 
 See [the implementation and validation report](development/hip-qsa-sparse-attention.md).
 
+The custom CUDA/HIP radix `TOP_K` path resolves identical cutoff keys by lower input-column index. Its output order remains unspecified; the bitonic, NVIDIA CUB and other backend paths retain their existing tie handling. This stabilizes QSA pool membership without changing unequal-score ranking. See [the physical replay result and cutoff regression](development/moe-cache-prefill.md#physical-topk-result-and-deterministic-cutoff-selection). No new support CSV result is claimed without hardware validation.
+
 ## Internal MoE operations in this fork
 
 `MUL_MAT_ID_STREAM` uses bounded expert-address packets on supported RDNA3 HIP configurations; CPU has a test oracle. `MOE_CACHE_LOOKUP` resolves resident slots and publishes asynchronous demand/miss notifications on RDNA3 HIP with stream-signal graph support. CPU, CUDA, Vulkan and RPC do not execute the lookup operation; model construction retains their existing paths. Both operations contain process-local state and are rejected by RPC. These are implementation capabilities, not generated hardware support CSV results.

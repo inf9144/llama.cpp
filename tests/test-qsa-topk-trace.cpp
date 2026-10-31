@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -68,7 +69,8 @@ static std::vector<row_info> inspect(const std::vector<float> & scores, const st
 }
 
 static json frozen_replay(ggml_backend_dev_t dev, const std::vector<float> & scores,
-                          const std::vector<row_info> & original, int cols, int k) {
+                          const std::vector<row_info> & original, int cols, int k,
+                          const std::vector<int32_t> * expected = nullptr) {
     ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
     if (!backend) throw std::runtime_error("Cannot initialize frozen-replay backend");
     ggml_context_ptr ctx(ggml_init({16*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
@@ -98,6 +100,13 @@ static json frozen_replay(ggml_backend_dev_t dev, const std::vector<float> & sco
             throw std::runtime_error("Frozen TOP_K input changed");
         }
         auto rows = inspect(scores, ids, cols, k);
+        if (expected) {
+            auto sorted = ids;
+            for (size_t r = 0; r < rows.size(); ++r) {
+                std::sort(sorted.begin() + r*k, sorted.begin() + (r + 1)*k);
+            }
+            if (sorted != *expected) throw std::runtime_error("TOP_K cutoff ties do not prefer lower column indices");
+        }
         int changed_original = 0, changed_previous = 0;
         for (size_t r = 0; r < rows.size(); ++r) {
             changed_original += rows[r].selected_hash != original[r].selected_hash;
@@ -109,6 +118,48 @@ static json frozen_replay(ggml_backend_dev_t dev, const std::vector<float> & sco
     }
     result["input_unchanged"] = true;
     return result;
+}
+
+static void test_radix_cutoff(ggml_backend_dev_t dev) {
+    const bool hip = std::strncmp(ggml_backend_dev_name(dev), "ROCm", 4) == 0;
+    struct shape { int cols, rows, k; };
+    for (const auto & s : {shape{1088, 1024, 512}, {1345, 8, 512}, {65537, 4, 512}, {1025, 1, 1}}) {
+        std::vector<float> scores(size_t(s.cols)*s.rows);
+        std::vector<int32_t> expected(size_t(s.k)*s.rows), order(s.cols);
+        for (int r = 0; r < s.rows; ++r) {
+            auto * row = scores.data() + size_t(r)*s.cols;
+            for (int c = 0; c < s.cols; ++c) {
+                switch (r % 6) {
+                    case 0: row[c] = 0; break;
+                    case 1: row[c] = -INFINITY; break;
+                    case 2: row[c] = -2; break;
+                    case 3: row[c] = float((c*13 + r*37) % s.cols) - s.cols/2; break;
+                    case 4: row[c] = float((c + r) % 17) - 8; break;
+                    case 5: row[c] = c < s.k/2 ? float(c + 1) : -INFINITY; break;
+                }
+            }
+            if (r % 6 == 2) {
+                for (int j = 0; j <= s.k; ++j) {
+                    row[(j*13 + r*37) % s.cols] = j < s.k - 1 ? float(j + 2) : 1;
+                }
+            }
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + s.k, order.end(), [row](int a, int b) {
+                return row[a] > row[b] || (row[a] == row[b] && a < b);
+            });
+            std::sort(order.begin(), order.begin() + s.k);
+            std::copy(order.begin(), order.begin() + s.k, expected.begin() + size_t(r)*s.k);
+        }
+        const auto original = inspect(scores, expected, s.cols, s.k);
+        const auto replay = frozen_replay(dev, scores, original, s.cols, s.k, hip ? &expected : nullptr);
+        for (size_t i = 1; i < replay["repetitions"].size(); ++i) {
+            if (replay["repetitions"][i]["changed_visible_sets_from_previous"].get<int>() != 0) {
+                throw std::runtime_error("Frozen TOP_K selection changed between executions");
+            }
+        }
+        std::printf("%s TOP_K cols=%d rows=%d k=%d: eight frozen replays passed; HIP cutoff order %s\n",
+                    ggml_backend_dev_name(dev), s.cols, s.rows, s.k, hip ? "checked" : "SKIPPED");
+    }
 }
 
 struct snapshot {
@@ -262,6 +313,7 @@ static void self_test() {
         const auto changed_input = trace.collect(output);
         GGML_ASSERT(changed_input["changed_score_rows"].get<int>() == 1 && changed_input["matching_score_hash_changed_visible_set_rows"].get<int>() == 0);
         std::printf("QSA TopK trace: CPU collection, eight frozen-input replays and input/selection classification validated\n");
+        test_radix_cutoff(cpu);
     }
     std::printf("QSA TopK trace: finite cutoff ties, masked ties, order independence and invalid selections checked\n");
 }
@@ -270,9 +322,20 @@ int main(int argc, char ** argv) {
     if (argc == 1) {
         self_test();
         std::printf("Model diagnostic: %s --tokens prompt-tokens.json [existing server model/cache arguments]\n", argv[0]);
+        std::printf("HIP cutoff regression without models: %s --backend ROCm0\n", argv[0]);
         return 0;
     }
     try {
+        if (argc == 3 && std::strcmp(argv[1], "--backend") == 0) {
+            ggml_backend_load_all();
+            auto * dev = ggml_backend_dev_by_name(argv[2]);
+            if (!dev) throw std::runtime_error("Unknown backend device");
+            if (std::strncmp(ggml_backend_dev_name(dev), "ROCm", 4) != 0) {
+                throw std::runtime_error("The cutoff regression requires a ROCm device; run without arguments for CPU self-tests");
+            }
+            test_radix_cutoff(dev);
+            return 0;
+        }
         std::string token_file;
         std::vector<char *> args = {argv[0]};
         for (int i = 1; i < argc; ++i) {
