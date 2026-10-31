@@ -73,12 +73,13 @@ def main() -> int:
         with (out / 'trace.log').open('wb') as log:
             process = subprocess.Popen(['fish', str(launcher)], cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             status = process.wait(timeout=900)
-        events, done = [], {}
+        events, done, native_error = [], {}, ''
         for line in (out / 'trace.log').read_text(errors='replace').splitlines():
             if line.startswith('QSA_TOPK '): events.append(json.loads(line[len('QSA_TOPK '):]))
             if line.startswith('QSA_TOPK_DONE '): done = json.loads(line[len('QSA_TOPK_DONE '):])
+            if line.startswith('QSA TopK trace failed:'): native_error = line
         runner.json_write(out / 'events.json', events)
-        if status != 0: raise RuntimeError(f'Trace exited with status {status}; inspect trace.log')
+        if status != 0: raise RuntimeError(f'Trace exited with status {status}; {native_error or "inspect trace.log"}')
         report.update(summarize(events, done))
         for key in ('topk_devices', 'finite_cutoff_ambiguous_rows', 'changed_score_rows', 'changed_visible_set_rows',
                     'matching_score_hash_changed_visible_set_rows', 'frozen_replay_devices',

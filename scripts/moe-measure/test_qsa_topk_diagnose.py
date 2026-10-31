@@ -75,6 +75,7 @@ class QsaTopkDiagnoseTests(unittest.TestCase):
                 for data in (event(0), event(1)):
                     stdout.write(('QSA_TOPK ' + json.dumps(data) + '\n').encode())
                 stdout.write(b'QSA_TOPK_DONE {"complete":true,"prompt_tokens":3,"calls_per_pass":1}\n')
+                if status != 0: stdout.write(b'QSA TopK trace failed: startup fixture failure\n')
 
             def wait(self, timeout):
                 self.waits += 1
@@ -118,6 +119,7 @@ class QsaTopkDiagnoseTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertFalse(report['complete'])
             self.assertIn('status 1', report['failure'])
+            self.assertIn('startup fixture failure', report['failure'])
             self.assertEqual(len(json.loads((root / 'out/events.json').read_text())), 2)
             self.assertTrue((root / 'out-handoff.tar.gz').is_file())
 

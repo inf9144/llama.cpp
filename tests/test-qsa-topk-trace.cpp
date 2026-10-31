@@ -298,6 +298,13 @@ int main(int argc, char ** argv) {
             if (!id.is_number_integer() || id.get<int64_t>() < 0 || id.get<int64_t>() > INT32_MAX) throw std::runtime_error("Invalid token ID");
             tokens.push_back(id.get<llama_token>());
         }
+        // Server argument parsing defers model resolution to its caller.
+        auto models = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
+        common_models_handler_apply(models, params);
+        if (params.model.path.empty()) throw std::runtime_error("No resolved target model path");
+        if (params.speculative.has_dft() && params.speculative.draft.mparams.path.empty()) {
+            throw std::runtime_error("No resolved draft model path");
+        }
         trace_state trace;
         params.cb_eval = trace_state::callback;
         params.cb_eval_user_data = &trace;
