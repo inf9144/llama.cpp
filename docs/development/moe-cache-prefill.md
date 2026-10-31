@@ -752,3 +752,35 @@ python3 scripts/moe-measure/completion_diagnose.py --draft-max 0
 No build, packet test or profiler is needed. The original launcher remains unchanged. The draft model and its target-feature capture remain configured; this is a control without draft tokens and speculative target verify batches, not a test that removes all DFlash infrastructure. Draft projection/ingestion can still run, so its timings are not a non-speculative performance benchmark. The diagnostic rejects any response reporting nonzero draft tokens, including the repeated generations, and archives incomplete results on failure.
 
 Within-build repeatability in this control distinguishes variation that persists without speculative verify from variation that needs the speculative execution path. It does not alone prove the cache correct. Cross-build differences still include the IQ2_S/IQ3_XXS fractional-scale correction absent from the old baseline, changed prefill placement and different matrix-multiply paths. No kernel, attention arithmetic or cache-policy change is made based on the greedy handoff. Physical execution of the zero-draft control remains open; eleven focused Python tests cover collection, validation and failure handling locally.
+
+## Zero-draft results and real-score TopK isolation
+
+The supplied `moe-completion-diagnose-20261031-002803-346227` handoff completes draft maximum 0 with identical prompt and binary/library provenance to the preceding draft-3 diagnostic. Both repeats within each build produce the same 128 token IDs. Their raw probabilities still differ, including at the first post-prefill token. Removing speculative verify therefore did not eliminate numerical variation; two equal completions are not proof of reproducible logits.
+
+The first cross-build token difference moves to position 125 (zero-based), after 125 identical generated tokens. Baseline repeats choose ` single` at 38.76% and 37.40%; candidate repeats choose ` substantive` at 38.12% and 39.06%. Fixed-prefix prefill replay at 125 chooses ` single` in both builds (37.26% and 38.04%). The candidate still has a prefill/incremental-path difference without speculative verify. This does not identify its cause, and the old baseline's missing fractional-scale correction remains a cross-build confounder.
+
+One concrete shared candidate is ordinary HIP `TOP_K`, before `QSA_SELECT`: `common.cuh` excludes HIP from `GGML_CUDA_USE_CUB`, and `top-k.cu` uses radix selection above the default 1024-column bitonic threshold. At the cutoff, `atomicAdd(equal_count)` admits the first arriving tied cells. The kernel permits different index sets with the same selected score values, which existing backend tests intentionally accept. For QSA, different finite-score pools can contain different K/V values, so valid but changing tied selections can affect attention. Pool padding adds an unused block; the current 5121-token, four-cell-pool prompt reaches this radix path. Neither the presence of finite cutoff ties in the production scores nor their responsibility for the observed logits has yet been measured. Reordering the same pool set or changing choices only among `-inf` pools cannot explain a QSA mask change.
+
+The new `test-qsa-topk-trace` executable uses the existing model/cache/backend arguments and exact prompt token IDs from the zero-draft diagnostic. It runs two prefills in one process with fresh model memory and retained expert-cache state. It collects only named QSA TopK nodes through the existing evaluation callback, validates index bounds, uniqueness and ranking, and records per-row SHA-256 fingerprints of scores and canonical visible pool sets. The second pass distinguishes changed score inputs from changed visible sets with matching score fingerprints. It makes no speculative drafts or decode calls. The configured draft model and target-feature capture are initialized; draft ingestion/projection and server scheduling are not reproduced.
+
+For the first batch with a finite ambiguous cutoff on each observed device, it also copies the entire score matrix unchanged to an independent tensor on that same device and repeats ordinary TopK eight times. It compares visible sets against the original operation and between replays, then byte-compares the frozen input against its original copy. Each input is bounded to 32 MiB; prompt length is bounded to 8192 and rows to 1024. Only small fingerprints and summary counters are retained across calls, and tensor values are not dumped to the log.
+
+Run this focused diagnostic on the existing configured HIP build; a separate server must be stopped first:
+
+```fish
+git pull --ff-only
+and begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    cmake -S . -B build-rocm-moe-stream-reference
+    and cmake --build build-rocm-moe-stream-reference --target test-qsa-topk-trace -j4
+    and python3 scripts/moe-measure/qsa_topk_diagnose.py --source-run results/moe-completion-diagnose-20261031-002803-346227
+end
+```
+
+The Python wrapper preserves the original Fish file and cache budgets. It prints a short summary and creates a handoff containing `events.json`, `report.json`, the generated launcher, prompt IDs and the native log. Nonzero exit, missing coverage, no ROCm coverage or incomplete frozen-input replay is a diagnostic failure. Partial logs are archived on failure. No additional benchmark or `test-moe-stream` run is requested.
+
+Interpretation: `matching_score_hash_changed_visible_set_rows > 0` or changed sets on byte-verified frozen inputs demonstrate selection variability for the captured scores. Finite ambiguous cutoffs without observed changed sets show a possibility, not causation. No finite cutoff ambiguity would reject this candidate for the captured inputs. Changed score rows already have an upstream difference that TopK did not create. The evaluation callback introduces synchronization and can prevent cross-node fusion; absence of drift under this instrumentation does not exclude a race or other uninstrumented execution-path issue. These are numerical diagnostics, not performance measurements, and do not establish production logits or DFlash acceptance equivalence.
+
+Local validation: CPU Release build and the focused CTest pass. Native self-tests cover finite and masked ties, signed zero, output-order independence, invalid selections, eight CPU frozen-input executions, and the distinction between changed inputs and changed selections. Six Python tests cover exact prompt/budget reuse, provenance checks, trace completeness, absence of ROCm coverage, frozen-input validation, timeout cleanup restricted to the owned process group and partial handoff preservation. Targeted type/style checks pass. Physical gfx1100/gfx1101 model execution and the TopK hypothesis remain open. No production backend, kernel, attention arithmetic or cache policy is changed.
