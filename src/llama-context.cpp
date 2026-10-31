@@ -3237,7 +3237,7 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
     MOE_MEASURE(llama_moe_measure::graph = ++llama_moe_measure::sequence; llama_moe_measure::record r("graph_begin"));
-    if (moe_cache) moe_cache->begin_compute();
+    if (moe_cache) moe_cache->begin_compute(gf);
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

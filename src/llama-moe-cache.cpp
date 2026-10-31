@@ -625,10 +625,21 @@ struct llama_moe_cache::impl {
         pending_compute = false;
     }
 
-    void begin_compute() {
+    void begin_compute(ggml_cgraph * graph) {
         synchronize();
         MOE_MEASURE(measure_graph = llama_moe_measure::graph; measure_context = llama_moe_measure::context; measure_type = llama_moe_measure::graph_type);
-        if (batch_tokens <= 8) {
+        bool needs_lookup = batch_tokens <= 8;
+        if (!needs_lookup) {
+            // A large ubatch can crop its last MoE layer to a small output batch.
+            const int n_nodes = ggml_graph_n_nodes(graph);
+            for (int i = 0; i < n_nodes; ++i) {
+                if (ggml_graph_node(graph, i)->op == GGML_OP_MOE_CACHE_LOOKUP) {
+                    needs_lookup = true;
+                    break;
+                }
+            }
+        }
+        if (needs_lookup) {
             for (auto & d : devices) if (d.device_maps && d.pipeline.context) d.pipeline.begin(d.pipeline.context);
         }
         pending_compute = true;
@@ -1005,8 +1016,8 @@ ggml_tensor * llama_moe_cache::lookup_slots(ggml_context * ctx, ggml_tensor * ma
     return pimpl->lookup_slots(ctx, map, ids, il);
 }
 
-void llama_moe_cache::begin_compute() {
-    pimpl->begin_compute();
+void llama_moe_cache::begin_compute(ggml_cgraph * graph) {
+    pimpl->begin_compute(graph);
 }
 
 void llama_moe_cache::synchronize() {

@@ -13,6 +13,20 @@ import subprocess
 
 import completion_diagnose as diagnose
 
+TIMEOUT_SECONDS = 180
+
+
+def read_trace(path: Path, partial: bool = False) -> tuple[list[dict], dict, str]:
+    events, done, native_error = [], {}, ''
+    for raw in path.read_text(errors='replace').splitlines(keepends=True):
+        if partial and not raw.endswith('\n'):
+            continue
+        line = raw.rstrip('\r\n')
+        if line.startswith('QSA_TOPK '): events.append(json.loads(line[len('QSA_TOPK '):]))
+        if line.startswith('QSA_TOPK_DONE '): done = json.loads(line[len('QSA_TOPK_DONE '):])
+        if line.startswith('QSA TopK trace failed:'): native_error = line
+    return events, done, native_error
+
 
 def summarize(events: list[dict], done: dict) -> dict:
     first = [e for e in events if e['pass'] == 0]
@@ -72,12 +86,8 @@ def main() -> int:
         runner.say('QSA TopK trace: two prefills, at most eight frozen replays per device; no generation or profiler')
         with (out / 'trace.log').open('wb') as log:
             process = subprocess.Popen(['fish', str(launcher)], cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            status = process.wait(timeout=900)
-        events, done, native_error = [], {}, ''
-        for line in (out / 'trace.log').read_text(errors='replace').splitlines():
-            if line.startswith('QSA_TOPK '): events.append(json.loads(line[len('QSA_TOPK '):]))
-            if line.startswith('QSA_TOPK_DONE '): done = json.loads(line[len('QSA_TOPK_DONE '):])
-            if line.startswith('QSA TopK trace failed:'): native_error = line
+            status = process.wait(timeout=TIMEOUT_SECONDS)
+        events, done, native_error = read_trace(out / 'trace.log')
         runner.json_write(out / 'events.json', events)
         if status != 0: raise RuntimeError(f'Trace exited with status {status}; {native_error or "inspect trace.log"}')
         report.update(summarize(events, done))
@@ -98,6 +108,14 @@ def main() -> int:
                 try: os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError: pass
                 process.wait(timeout=10)
+        if not (out / 'events.json').exists() and (out / 'trace.log').exists():
+            try:
+                events, _, _ = read_trace(out / 'trace.log', partial=True)
+                runner.json_write(out / 'events.json', events)
+                report['captured_topk_calls'] = len(events)
+                if events: report['last_topk_event'] = events[-1]
+            except (OSError, ValueError) as exc:
+                report['partial_trace_error'] = str(exc)
         runner.json_write(out / 'report.json', report)
         runner.say(f'Handoff: {runner.archive_suite(out)}')
     return int(failure is not None)

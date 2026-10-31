@@ -79,7 +79,7 @@ class QsaTopkDiagnoseTests(unittest.TestCase):
 
             def wait(self, timeout):
                 self.waits += 1
-                if timeout == 900 and timeout_enabled:
+                if timeout == diagnose.TIMEOUT_SECONDS and timeout_enabled:
                     raise subprocess.TimeoutExpired('trace', timeout)
                 return status
 
@@ -130,7 +130,20 @@ class QsaTopkDiagnoseTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn('TimeoutExpired', report['failure'])
             self.assertEqual(kills, [mock.call(123456, diagnose.signal.SIGTERM)])
+            self.assertEqual(report['captured_topk_calls'], 2)
+            self.assertEqual(len(json.loads((root / 'out/events.json').read_text())), 2)
             self.assertTrue((root / 'out-handoff.tar.gz').is_file())
+
+    def test_partial_trace_keeps_complete_events_and_skips_a_truncated_last_line(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / 'trace.log'
+            log.write_text('QSA_TOPK ' + json.dumps(event(0)) + '\nQSA_TOPK {"pass":')
+            events, done, error = diagnose.read_trace(log, partial=True)
+            self.assertEqual(events, [event(0)])
+            self.assertEqual(done, {})
+            self.assertEqual(error, '')
+            with self.assertRaises(json.JSONDecodeError):
+                diagnose.read_trace(log)
 
     def test_prompt_digest_mismatch_stops_before_model_start(self):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stderr(io.StringIO()):

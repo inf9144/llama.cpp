@@ -36,7 +36,7 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
     ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il) const;
-    void begin_compute();
+    void begin_compute(ggml_cgraph * graph);
     void synchronize();
 
     // the experts of w in the cache, nullptr if w is not cached

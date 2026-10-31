@@ -2498,6 +2498,9 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         int cached = 0;
         int redirected = 0;
         int fallback = 0;
+        int device_lookups = 0;
+        int last_layer_device_lookups = 0;
+        int cropped_lookups = 0;
     };
     // Compare the same GPU model with and without caching, with equal and small/zero budgets.
     for (int config = 0; config < (cpu_fixture ? 1 : 3); ++config) {
@@ -2513,8 +2516,16 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         // Observe both contexts at the same operation boundaries.
         cp.cb_eval = [](ggml_tensor * t, bool ask, void * userdata) {
-            if (ask) { return (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT_ID_STREAM); }
+            if (ask) { return (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT_ID_STREAM || t->op == GGML_OP_MOE_CACHE_LOOKUP); }
             auto & cap = *static_cast<capture *>(userdata);
+            if (t->op == GGML_OP_MOE_CACHE_LOOKUP) {
+                ++cap.device_lookups;
+                int il = -1;
+                GGML_ASSERT(sscanf(t->name, "ffn_moe_slots-%d", &il) == 1);
+                if (il == int(cap.model->layers.size()) - 1) ++cap.last_layer_device_lookups;
+                if (cap.prefill) ++cap.cropped_lookups;
+                return true;
+            }
             if (cap.check_locality && cap.prefill && t->ne[2] > moe_cache_max_batch) {
                 const char * name = t->src[0]->name;
                 const char * block = strstr(name, "blk.");
@@ -2575,15 +2586,17 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         }
         llama_pos pos = 0, ref_pos = 0;
         double worst_nmse = 0;
-        auto step = [&](int tokens) {
+        auto step = [&](int tokens, int outputs = -1) {
+            if (outputs < 0) outputs = tokens;
             cap.prefill = tokens > moe_cache_max_batch;
-            const auto expected = recovery_decode(reference.get(), ref_pos, tokens, tokens, false, false);
-            const auto result = recovery_decode(actual.get(), pos, tokens, tokens, false, false);
+            const auto expected = recovery_decode(reference.get(), ref_pos, tokens, outputs, false, false);
+            const auto result = recovery_decode(actual.get(), pos, tokens, outputs, false, false);
             const auto error = nmse(expected, result);
             GGML_ASSERT(std::isfinite(error) && error < 5e-4);
             worst_nmse = std::max(worst_nmse, error);
         };
-        step(64);
+        // A cold large prefill with one output still has a small last-layer lookup.
+        step(64, 1);
         std::vector<std::vector<uint8_t>> checkpoint;
         for (auto * ctx : {reference.get(), actual.get()}) {
             std::vector<uint8_t> state(llama_state_get_size(ctx));
@@ -2608,8 +2621,9 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         }
         const bool any_budget = std::any_of(budgets.begin(), budgets.end(), [](size_t b) { return b != 0; });
         GGML_ASSERT(!any_budget || config != 0 || cap.cached > 0);
-        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, redirected=%d, fallback=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
-            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.redirected, cap.fallback, worst_nmse);
+        GGML_ASSERT(cap.last_layer_device_lookups == 0 || cap.cropped_lookups > 0);
+        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, redirected=%d, fallback=%d, device lookups=%d, cropped=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
+            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.redirected, cap.fallback, cap.device_lookups, cap.cropped_lookups, worst_nmse);
     }
     return 0;
 }
