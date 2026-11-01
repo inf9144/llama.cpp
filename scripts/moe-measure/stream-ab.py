@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MoE stream A/B suite: original 82478ef vs. bounded-stream candidate.
+"""MoE stream A/B suite: selected reference vs. bounded-stream candidate.
 
 Run from ~/src/llama.cpp. Existing Fish templates, model settings, binaries and
 repo's scripts/moe-measure/{run,analyze,profile}.py are used. Prompt cache OFF.
@@ -480,9 +480,9 @@ def main() -> int:
         repo_head = "unknown"
     json_write(suite / "suite.json", {
         "repo_HEAD_during_run": repo_head,
-        "baseline_source_expected_not_verified": "82478efb935b4e6a99946132553435d6f55fe8cb",
+        "baseline_source_expected_not_verified": "unknown",
         "candidate_source_expected_not_verified": repo_head,
-        "binary_provenance_note": "Binary SHA256s recorded. Build-source attribution is NOT verified by this runner; confirm existing baseline builds are from 82478ef.",
+        "binary_provenance_note": "Binary SHA256s recorded. Source revisions are not verified; inspect the selected baseline build ID and configuration. The original and numerically corrected references use separate build directories.",
         "binaries": {variant: {key: {k: v for k, v in entry.items() if k != "script"} for key, entry in xs.items()} for variant, xs in launchers.items()},
         "request_sha256": hashlib.sha256(payload).hexdigest(),
         "cache_prompt": False, "profile_enabled": a.profile, "candidate_activation_required": True, "started": dt.datetime.now(dt.timezone.utc).isoformat(),

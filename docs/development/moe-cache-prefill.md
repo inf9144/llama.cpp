@@ -832,3 +832,76 @@ and python3 scripts/moe-measure/qsa_topk_diagnose.py --source-run results/moe-co
 The finite-ambiguity count need not become zero; equal scores remain equal. Both frozen change counters should be zero. After that check, `python3 scripts/moe-measure/completion_diagnose.py --draft-max 0` tests uninstrumented target repeatability, before repeating with draft maximum 3. The old baseline still lacks the intentional IQ2_S/IQ3_XXS fractional-scale correction and this cutoff fix, so cross-build differences alone cannot establish a MoE-cache regression. No additional performance optimization is bundled with this correction.
 
 Local validation: CPU Release builds of test-qsa-topk-trace and test-backend-ops pass. The focused trace CTest passes in 0.54 seconds, including all four synthetic shape fixtures and their eight CPU replays. The two added backend-op cases pass on CPU. EditorConfig and git diff --check pass. There is no HIP/CUDA SDK or physical GPU here: the modified device kernel is neither compiled nor executed locally. The existing Python wrapper is unchanged, and no model generation or performance suite is run locally.
+
+## 2026-11-01: corrected reference for the next comparison
+
+The supplied physical gfx1100/gfx1101 cutoff regressions pass all four shapes and eight repetitions per shape on each GPU. The real-score trace `qsa-topk-diagnose-20261031-095514-825318` completes both 72-call prefills with unchanged scores and visible sets; all sixteen frozen executions now retain the original selection. The ten finite ambiguous rows still exist, as expected. This validates the cutoff correction for the captured cases, not every model input or its performance.
+
+The two subsequent completion handoffs (`095808-995396`, draft maximum 0, and `100407-664427`, maximum 3) use identical binaries and the same 5121 prompt token IDs. Within the candidate, both repetitions have exactly equal 128 output token IDs and all reported top-32 probability rows. Draft 0 and draft 3 also choose the same 128 tokens. Both draft-3 candidate requests accept 87/118 draft tokens (73.73%), with forty DFlash rounds and mean output length 3.17. The historical baseline still varies between repetitions.
+
+Decode and speculative verify are not established as numerically equivalent: 127 candidate probability rows differ between draft settings. The largest selected-token log-probability difference is 0.12464; the largest shared top-32 difference, 1.42216, concerns a very low-probability candidate. These are reported probabilities, not full-vocabulary logit NMSE. Candidate prefix replays at 0 and 125 are identical across the two draft settings. A numerically aligned legacy execution reference is needed before attributing remaining differences to the MoE changes.
+
+### Reference scope
+
+Reference branch: [diagnostics/moe-reference-correctness](https://github.com/inf9144/llama.cpp/tree/diagnostics/moe-reference-correctness), pinned commit `55ee91f6a6e63c1a47de748e2d20cbc0d6db7c34`, directly on `82478efb935b4e6a99946132553435d6f55fe8cb`.
+
+Only two production files change: the fractional IQ2_S/IQ3_XXS scale correction in `vecdotq.cuh` and the deterministic radix cutoff in `top-k.cu`. Both complete files are byte-identical to the tested candidate at `45d51cb`. The existing `test-qsa-topk-trace.cpp` is copied unchanged and registered in CMake so that the same model-free cutoff regression can run against the reference's own libraries and headers. No MoE streaming operation, device lookup, window policy, cache placement, allocator or model/attention change is copied into the reference. Its original measurement hooks remain available and default-off.
+
+The corrected binaries use new `build-rocm-moe-corrected-reference` and `build-rocm-moe-corrected-measure` directories. Historical build directories and Fish templates are not rewritten. The completion diagnostic accepts the same test-only `--baseline-reference` binary override already available in stream-ab.py. Default paths remain compatible with earlier runs. The A/B report no longer labels an arbitrary selected baseline as source commit 82478ef; executable hashes and startup logs remain the evidence for each selected build.
+
+### Evening build and numerical controls
+
+Run this from the root checkout on `feature/moe-cache-prefill`, with no model server occupying port 8080. The initial-cache script copies the matching candidate CMake compiler, architecture, compile/link flags, backend and llama options through CMake's cache reader. It omits package discovery, build/source paths and version metadata; it rejects embedded candidate build-directory paths and incompatible HIP/instrumentation settings. SDK discovery still uses the same ROCm 10.1 environment below. Existing candidate build caches must be present. The worktree check refuses a different revision or tracked edits instead of resetting an existing checkout.
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+
+    git pull --ff-only
+    and git fetch --no-tags origin diagnostics/moe-reference-correctness
+    and begin
+        if test -e ../llama-moe-reference-correctness
+            test (git -C ../llama-moe-reference-correctness rev-parse HEAD) = 55ee91f6a6e63c1a47de748e2d20cbc0d6db7c34
+            and git -C ../llama-moe-reference-correctness diff --quiet HEAD
+        else
+            git worktree add --detach ../llama-moe-reference-correctness 55ee91f6a6e63c1a47de748e2d20cbc0d6db7c34
+        end
+    end
+    and python3 -m unittest discover -s scripts/moe-measure -p test_completion_diagnose.py
+    and cmake -S ../llama-moe-reference-correctness -B build-rocm-moe-corrected-reference -G Ninja \
+        -C scripts/moe-measure/reference-options.cmake -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-corrected-reference --target llama-server test-qsa-topk-trace ggml-hip -j4
+    and ./build-rocm-moe-corrected-reference/bin/test-qsa-topk-trace --backend ROCm0
+    and ./build-rocm-moe-corrected-reference/bin/test-qsa-topk-trace --backend ROCm1
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server
+end
+```
+
+This builds the corrected reference only and reuses the existing candidate executables. The source files affecting candidate execution are unchanged by this preparation. The Python tests use mocked HTTP/server calls and no GPU/model downloads. The two native checks load no model; each verifies four shapes with eight GPU repetitions. The two completion diagnostics then write separate handoff archives. A successful collection exit is not an equivalence verdict: return both archives to compare within-build stability, identical-prefix baseline/candidate probabilities and draft-0/draft-3 consistency before a performance run.
+
+### Prepared profiler command after numerical review
+
+The existing A/B suite already accepts separate baseline reference/measurement paths. After reviewing the numerical controls, build the corrected measurement binary with options from its matching candidate configuration, then profile only draft maximum 3:
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    cmake -S ../llama-moe-reference-correctness -B build-rocm-moe-corrected-measure -G Ninja \
+        -C scripts/moe-measure/reference-options.cmake -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-corrected-measure --target llama-server ggml-hip -j4
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server \
+        --baseline-measure build-rocm-moe-corrected-measure/bin/llama-server
+end
+```
+
+This performance step is separate from the initial controls. Keep existing model, cache budgets, prompt, batch and device settings unchanged. Throughput must be interpreted together with generated tokens and DFlash work; reference/candidate differences alone do not identify a waiting, transfer or kernel bottleneck.
+
+Validation limits for this preparation: the execution environment is unavailable. No new Python/CMake execution, CPU/HIP build, type/style checker or physical GPU test has run here. Source inspection and repository comparisons verify the four-file reference scope, the two exact production-file matches and the unchanged copied test. Two unit cases are added for relative and absolute/space-containing baseline binary overrides. The native reference build, copied tests, CMake option transfer and new Python cases remain to be executed. The production branch is not merged.

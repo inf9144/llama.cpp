@@ -22,11 +22,17 @@ def response(tokens, tops=None):
 
 
 class CompletionDiagnoseTests(unittest.TestCase):
-    def run_mocked_suite(self, root, fail=False, different_prompt=False, draft_max=3, unexpected_drafts=False):
+    def run_mocked_suite(self, root, fail=False, different_prompt=False, draft_max=3, unexpected_drafts=False, baseline_reference=None):
         for case in diagnose.CASES:
             binary = root / diagnose.runner.BINARIES[case][0]
             binary.parent.mkdir(parents=True)
             binary.write_bytes(case.encode())
+        extra = []
+        if baseline_reference is not None:
+            binary = baseline_reference if baseline_reference.is_absolute() else root / baseline_reference
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_bytes(b'corrected-reference')
+            extra = ['--baseline-reference', str(baseline_reference)]
         (root / 'moe-server-reference.fish').write_text(
             './build-rocm-moe-reference/bin/llama-server --cache-ram 0 '
             '--spec-draft-n-max 3 --moe-cache-mib 15200,9600 --port 8080\n')
@@ -56,11 +62,33 @@ class CompletionDiagnoseTests(unittest.TestCase):
             data['timings']['draft_n'] = 1 if unexpected_drafts else (0 if folder.name == 'replay' else draft_max)
             return data
 
-        with mock.patch.object(sys, 'argv', ['completion_diagnose.py', '--repo', str(root), '--output', 'out', '--draft-max', str(draft_max)]), \
+        with mock.patch.object(sys, 'argv', ['completion_diagnose.py', '--repo', str(root), '--output', 'out', '--draft-max', str(draft_max), *extra]), \
                 mock.patch.object(diagnose, 'server', fake_server), mock.patch.object(diagnose, 'http', fake_http), \
                 contextlib.redirect_stdout(io.StringIO()):
             status = diagnose.main()
         return status, sessions, requests, json.loads((root / 'out/report.json').read_text())
+
+    def test_corrected_baseline_override_selects_and_records_the_requested_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            relative = Path('build-rocm-moe-corrected-reference/bin/llama-server')
+            status, _, _, report = self.run_mocked_suite(root, baseline_reference=relative)
+            self.assertEqual(status, 0)
+            self.assertEqual(report['binaries']['baseline']['binary'], str((root / relative).resolve()))
+            self.assertEqual(report['binaries']['baseline']['binary_sha256'], diagnose.runner.sha(root / relative))
+            self.assertIn(str(root / relative), (root / 'out/baseline.fish').read_text())
+            old = root / diagnose.runner.BINARIES['baseline'][0]
+            self.assertEqual(old.read_bytes(), b'baseline')
+            self.assertEqual(report['binaries']['candidate']['binary'], str(root / diagnose.runner.BINARIES['candidate'][0]))
+
+    def test_absolute_baseline_override_with_spaces_is_quoted_in_the_launcher(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            binary = root / 'corrected reference/server'
+            status, _, _, report = self.run_mocked_suite(root, baseline_reference=binary)
+            self.assertEqual(status, 0)
+            self.assertEqual(report['binaries']['baseline']['binary'], str(binary.resolve()))
+            self.assertIn(diagnose.shlex.quote(str(binary)), (root / 'out/baseline.fish').read_text())
 
     def test_suite_replays_the_same_baseline_prefix_on_both_variants(self):
         with tempfile.TemporaryDirectory() as folder:

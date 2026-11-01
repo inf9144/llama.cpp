@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare repeated greedy tokens and fixed-prefix probabilities, baseline/candidate.
 
-Uses the existing reference binaries and cache budgets. Draft maximum 3 is the
+Uses the existing reference binaries and cache budgets; --baseline-reference can
+select a corrected baseline without replacing the historical build. Draft maximum 3 is the
 default; 0 checks generation without speculative verify batches. This is a
 numerical diagnostic, not a speed benchmark. No backend or sampler code changes.
 """
@@ -170,11 +171,16 @@ def main() -> int:
     parser.add_argument('--repo', type=Path, default=Path.home() / 'src/llama.cpp')
     parser.add_argument('--request', type=Path, default=Path('moe-first-request.json'))
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--baseline-reference', type=Path,
+                        help='Baseline server binary; relative paths are resolved under --repo')
     parser.add_argument('--draft-max', type=int, choices=(0, 3), default=3,
                         help='0 checks single-token target generation; the draft model stays configured')
     args = parser.parse_args()
     root = args.repo.expanduser().resolve()
     binaries = {case: root / runner.BINARIES[case][0] for case in CASES}
+    if args.baseline_reference is not None:
+        baseline = args.baseline_reference.expanduser()
+        binaries['baseline'] = (baseline if baseline.is_absolute() else root / baseline).resolve()
     for binary in binaries.values():
         if not binary.is_file():
             parser.error(f'Missing reference binary: {binary}')
