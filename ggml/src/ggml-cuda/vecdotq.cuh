@@ -1520,9 +1520,10 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (ggml_cuda_mul_small(sumi0, ls0) + ggml_cuda_mul_small(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
+    // Keep the fractional scale until after conversion; integer division truncates the dot product.
+    const int sumi = ggml_cuda_mul_small(sumi0, 2*ls0 + 1) + ggml_cuda_mul_small(sumi1, 2*ls1 + 1);
 
-    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds) * 0.125f;
     return d * sumi;
 }
 
@@ -1557,8 +1558,8 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     }
 
     const int ls = aux32 >> 28;
-    sumi = (ggml_cuda_mul_small(ls, sumi) + sumi/2)/2;
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    sumi = ggml_cuda_mul_small(2*ls + 1, sumi);
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds) * 0.25f;
     return d * sumi;
 }
 
