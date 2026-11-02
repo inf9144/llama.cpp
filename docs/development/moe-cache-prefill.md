@@ -1031,3 +1031,64 @@ end
 No old `test-moe-stream` sweep or extra draft-width sweep is required. The completion control still uses the corrected stock reference at `55ee91f`; the performance baseline is the saved, already tested MoE-feature build. Check tokens, probability rows, acceptance and reservations before attributing any change to performance. In the new GPU profile, eligible routed kernels should use `mul_mat_vec_q_moe<..., true>` and corresponding Q8_1/GLU launches should decline. A numerical backend test alone does not prove activation in the production graph or a throughput improvement. Remaining stream synchronization time must not be interpreted as wholly avoidable waiting.
 
 Local validation: CPU Release builds of `test-backend-ops` and `test-llama-archs` pass. All 16 cache-view numerical cases pass on CPU, and the existing DFlash device/host fixture passes for F16 and Q8_0 KV, including state-byte and selector comparisons. The 26 focused Python cases pass (10 stream-suite, 3 decode-wrapper and 13 completion-diagnostic cases), as do the Python type check, EditorConfig and `git diff --check`. A temporary copy of the CPU `bin` directory resolves all five llama/ggml shared libraries from that copy with the new library-path prefix. The copy is removed after validation. No HIP/CUDA SDK or physical GPU is available here, so the HIP host code is not compiled locally, native fused arithmetic is not executed, and throughput, acceptance, graph reservation and peak allocation effects of this change remain open. No production-branch merge is made.
+
+## 2026-11-02: batch scheduler input transfers
+
+### Hardware results for the parent revision
+
+The two `20261102-121606-804843` / `20261102-121830-683387` completion handoffs validate `2974c134` against the corrected reference at draft maxima 0 and 3. Tokens and complete recorded top-32 probability arrays match within and across builds, including prefix replays at 0 and 32. This does not measure full-vocabulary logits.
+
+Handoff `moe-decode-ab-20261102-122034-456747` compares the preceding MoE feature against `2974c134`, not against stock execution. All requests have the same completion hash and 74/156 accepted drafts. The uninstrumented cold/warm decode rates are 22.30/34.90 versus 23.92/36.57 tokens/s; prefill is 500.24/576.03 versus 493.83/572.24 tokens/s. These single observations show +7.3%/+4.8% decode and -1.3%/-0.7% prefill, not confidence intervals or proof of regression-free performance. In the approximate warm profiler window, decode is slightly slower instead; profiler timing is not an uninstrumented speed verdict.
+
+Fused routed kernels execute on both GPUs. Whole-session kernel dispatches decrease from 555757 to 539779 and Q8_1 quantizations from 55462 to 50136. Host H2D bytes and compute reservations are unchanged, with no material additional GPU allocation-peak reduction. The candidate's approximate warm decode window still contains 10706 `hipStreamSynchronize` calls. Their summed duration includes useful GPU execution and profiler overhead, and must not be treated as removable time.
+
+### Scheduler change
+
+For a scheduler with one copy of its compute storage, non-weight split inputs now share one destination drain. The allocator already places all split-input copies before that split's compute nodes; no computation is submitted between these copies. Repeating the destination drain for each independent input therefore protects the same preceding readers again. Existing asynchronous inter-backend copies retain their source/destination ordering, and a failed asynchronous copy still synchronizes its source before the synchronous fallback.
+
+Host graph inputs up to 64 KiB use the backend's existing asynchronous setter when the destination has its default buffer type. Larger masks and embeddings retain synchronous copies, avoiding large stage-pool allocations and eviction of existing upload slots. One completion wait finishes all borrowed host reads before any expert-copy callback or scheduler return. Caller input storage can still be overwritten immediately after `graph_compute_async()` returns. On HIP this uses the existing malloc stage pool, including its existing settings and tensor filter; no new pool, allocation policy, runtime switch or input cache is added. Other buffer types and backends without an asynchronous setter retain synchronous copies. Three eligible HIP inputs replace three destination drains plus three synchronous buffer-copy waits with two backend drains; this call-count reduction is not a throughput prediction.
+
+Multiple-copy schedulers retain the previous per-input path. Host expert weights and their callbacks retain the original copy helper. Graph construction, allocation lifetimes, reservations, conservative packed-mask coverage, arithmetic, routing, KV contents and cache policy are unchanged. A graph without non-weight split inputs adds no drain.
+
+### Focused validation
+
+`test-backend-sched` uses a CPU-backed deferred queue that borrows source pointers until synchronization. Eighteen cases cover setters present/absent, one/multiple scheduler copies, CPU-produced intermediates, host-weight callbacks, six graph reuses, caller input poisoning immediately after return, pending readers when the next call reuses input-copy storage, and the large-input fallback. The asynchronous single-copy case queues three host writes together and checks that only two backend synchronization calls precede compute submission. Its callback checks an actual preceding graph result. The optional `--backend ROCm0` / `ROCm1` mode runs nine small configurations at widths 1, 4 and 1024 on the selected real backend. With `--peer`, three more cases produce an input on the other GPU, covering asynchronous peer copies alongside host inputs and weight callbacks. This does not run the expensive MoE kernel sweep.
+
+Keep the already validated `2974c134` binaries as the performance baseline. Save both complete `bin` directories before rebuilding. The launcher prefixes each selected binary's own directory in `LD_LIBRARY_PATH`, so the saved shared libraries remain part of that baseline.
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-input-batching
+
+    if test -x $before/reference/llama-server; and test -x $before/measure/llama-server
+        echo "Vorherige Builds werden wiederverwendet: $before"
+    else
+        test ! -e $before
+        and mkdir $before
+        and cp -a build-rocm-moe-stream-reference/bin $before/reference
+        and cp -a build-rocm-moe-stream-measure/bin $before/measure
+    end
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-backend-sched -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched --backend ROCm0 --peer ROCm1
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched --backend ROCm1 --peer ROCm0
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+Local validation: CPU Release and Debug builds pass all 18 deferred-queue cases; the Debug run also enables AddressSanitizer and UBSan. LeakSanitizer cannot run under this environment's process tracing, so leak detection is disabled for that run. All nine real CPU-backend configurations pass. EditorConfig and `git diff --check` pass. No new Python or kernel code is introduced.
+
+The HIP build, both physical backend fixtures, production logits/DFlash acceptance, Vulkan execution and throughput/peak-allocation measurements remain open. This environment has no HIP SDK or physical GPU. No production-branch merge is made.
