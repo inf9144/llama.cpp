@@ -973,3 +973,61 @@ end
 This capture can be compared with the existing corrected-reference profile for the same fixture. Its instrumented request timings remain diagnostic, not a replacement for uninstrumented throughput. A current trace must confirm the warm/cold bottlenecks before changing scheduler synchronization. No execution kernel, cache policy, graph, backend fallback or application runtime option is modified by this update.
 
 Local validation: 25 focused Python cases pass (9 stream-suite, 3 decode-wrapper and 13 completion-diagnostic cases), including a mocked controller run that needs only the candidate measurement binary, starts only `03-profile` and preserves the handoff archive. The Python type check, EditorConfig check, CLI help check and `git diff --check` pass. No native rebuild or GPU/model run is needed for these tooling/documentation changes; the new physical capture remains open. The feature branch is not merged into production.
+
+## 2026-11-02: cache-view fusions and repeated DFlash synchronization
+
+The current candidate capture `moe-stream-ab-20261102-100257-793421` uses `f7cc734` and the same request bytes as the earlier A/B. Both requests produce content hash prefix `93595777` and accept 74/156 draft tokens. All 2874 layer groups per request are complete. Warm small-batch routing has 2639 device lookups, no misses and no expert H2D/D2D bytes. Cold small batches upload 13.5865 GiB of expert weights. Total expert H2D is 115.0606 GiB cold and 100.0683 GiB warm; expert D2D is zero. Target reservations are 676.03 MiB on ROCm0 and 646.23 MiB on ROCm1, retaining the observed 500.72 MiB ROCm0 reduction relative to the corrected reference. The XTX process HSA allocation peak is 445.25 MiB lower, not a direct measurement of driver VRAM.
+
+The approximate warm decode window is 4.116 s. Its host stream-synchronization union is 2.688 s across 10810 calls; 1.643 s of those intervals overlap recorded GPU kernels/copies. The GPU kernel/copy union across both devices is 1.723 s. Device MoE `batchMemOp` unions are 4.02 ms and 2.79 ms. These quantities overlap and do not imply that 2.688 s can be removed. About 223170 kernel dispatches include 26596 Q8_1 quantizations. The host-submission intervals point primarily at target verify, but do not establish call-stack attribution or an achievable speedup.
+
+### Implementation
+
+On RDNA3 HIP, the backend now recognizes `MUL_MAT_ID -> weight VIEW -> MUL_MAT_ID -> GLU` with a shared input and compatible gate/up weights. The view must refer directly to an already allocated WEIGHTS bank with no computed producer. Moving this metadata-only view before the first matmul exposes the existing three-node gate/up/GLU fusion. No weight data is copied, and no new device kernel or quantization arithmetic is introduced. CUDA, Vulkan, dense matmuls and streaming-prefill operations do not enter this reorder.
+
+Before allocation, eligible routed gate/up/GLU inputs are retained through the GLU output. This protects the activation, slot IDs and weight views from output aliasing when the existing fused MMVQ kernel runs. Eligibility for these allocation dependencies does not depend on query count, preserving the reserve/decode topology policy. Runtime dispatch keeps its existing type, batch, padding, graph-use and memory-overlap guards. Unsupported pairs, layouts and larger batches retain their existing dispatch. The actual reservation impact must still be checked on the physical model; longer input lifetimes can increase working memory.
+
+`decode_device_inputs()` now calls the global target synchronization only when `n_queued_tokens` is nonzero. The counter is incremented before target execution and cleared only after scheduler streams, feature copies, MoE workers and performance accounting have finished. Target logits access normally performs that synchronization before DFlash injection. This removes the repeated drain after that completed work, while pending target work keeps the original synchronization and timing behavior. Existing feature-buffer reader events and overwrite protection remain. No additional producer-event system is needed for this case, and useful target execution time is not removed by this change.
+
+The numerical backend fixture covers seven weight formats at widths 1 and 4, strided slot IDs, nonzero-offset bank views, a computed shared activation, width 8 fallback and different-input rejection. Direct backend comparisons pre-expand the weight views to exercise the existing fused arithmetic; they do not run scheduler graph optimization. Actual automatic hoisting and allocation lifetime behavior therefore require the model/scheduler run below. The existing DFlash device-input fixture now honors `--backend ROCm0` or `ROCm1`, using one sequence for the native GPU path; its default CPU two-sequence permutation test remains. It compares F16/Q8_0 KV state bytes, selector outputs, repeated buffer reuse, chunking and invalid-input handling.
+
+### Focused physical validation
+
+Use an incremental build and compare against the current working feature implementation, keeping the model and cache sizes fixed. Before replacing either candidate executable, save both complete `bin` directories once. The A/B launchers now put the selected executable's own directory first in `LD_LIBRARY_PATH`, so the saved baseline uses its saved shared libraries rather than the rebuilt ones. The existing ROCm library path remains available. Reuse the saved directories for repeated measurements of this change.
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-verify-fusions
+
+    if test -x $before/reference/llama-server; and test -x $before/measure/llama-server
+        echo "Vorherige Builds werden wiederverwendet: $before"
+    else
+        test ! -e $before
+        and mkdir $before
+        and cp -a build-rocm-moe-stream-reference/bin $before/reference
+        and cp -a build-rocm-moe-stream-measure/bin $before/measure
+    end
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-backend-ops test-llama-archs -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and ./build-rocm-moe-stream-reference/bin/test-backend-ops -b ROCm0 -o MUL_MAT_ID_CACHE_GLU
+    and ./build-rocm-moe-stream-reference/bin/test-backend-ops -b ROCm1 -o MUL_MAT_ID_CACHE_GLU
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm0 -s 42
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm1 -s 42
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+No old `test-moe-stream` sweep or extra draft-width sweep is required. The completion control still uses the corrected stock reference at `55ee91f`; the performance baseline is the saved, already tested MoE-feature build. Check tokens, probability rows, acceptance and reservations before attributing any change to performance. In the new GPU profile, eligible routed kernels should use `mul_mat_vec_q_moe<..., true>` and corresponding Q8_1/GLU launches should decline. A numerical backend test alone does not prove activation in the production graph or a throughput improvement. Remaining stream synchronization time must not be interpreted as wholly avoidable waiting.
+
+Local validation: CPU Release builds of `test-backend-ops` and `test-llama-archs` pass. All 16 cache-view numerical cases pass on CPU, and the existing DFlash device/host fixture passes for F16 and Q8_0 KV, including state-byte and selector comparisons. The 26 focused Python cases pass (10 stream-suite, 3 decode-wrapper and 13 completion-diagnostic cases), as do the Python type check, EditorConfig and `git diff --check`. A temporary copy of the CPU `bin` directory resolves all five llama/ggml shared libraries from that copy with the new library-path prefix. The copy is removed after validation. No HIP/CUDA SDK or physical GPU is available here, so the HIP host code is not compiled locally, native fused arithmetic is not executed, and throughput, acceptance, graph reservation and peak allocation effects of this change remain open. No production-branch merge is made.

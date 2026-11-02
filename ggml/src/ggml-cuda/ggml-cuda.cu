@@ -5273,6 +5273,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
+#if defined(GGML_USE_HIP)
+    const auto cache_glu_type = [](ggml_type type) {
+        static constexpr std::array<ggml_type, 7> types = {
+            GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S,
+            GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0,
+        };
+        return std::find(types.begin(), types.end(), type) != types.end();
+    };
+#endif
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
@@ -5291,6 +5300,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+#if defined(GGML_USE_HIP)
+        if (GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            for (int i = 0; i + 3 < cgraph->n_nodes; ++i) {
+                ggml_tensor * first = cgraph->nodes[i];
+                ggml_tensor * view = cgraph->nodes[i + 1];
+                ggml_tensor * second = cgraph->nodes[i + 2];
+                ggml_tensor * glu = cgraph->nodes[i + 3];
+                if (first->op != GGML_OP_MUL_MAT_ID || second->op != GGML_OP_MUL_MAT_ID ||
+                        !cache_glu_type(first->src[0]->type) ||
+                        glu->op != GGML_OP_GLU || view->op != GGML_OP_VIEW || second->src[0] != view ||
+                        !view->src[0] || view->src[0]->op != GGML_OP_NONE || !view->buffer ||
+                        ggml_backend_buffer_get_usage(view->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    continue;
+                }
+                const bool pair = (glu->src[0] == first && glu->src[1] == second) ||
+                                  (glu->src[1] == first && glu->src[0] == second);
+                if (pair && ggml_cuda_should_fuse_mul_mat(glu->src[1], glu->src[0], glu)) {
+                    // Cache-bank views have no work or computed dependencies.
+                    std::rotate(cgraph->nodes + i, cgraph->nodes + i + 1, cgraph->nodes + i + 2);
+                }
+            }
+        }
+#endif
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
@@ -5318,6 +5350,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_tensor * gate = glu->src[0];
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
+#if defined(GGML_USE_HIP)
+                // MMVQ also reads the activation and slot IDs until the fused GLU writes.
+                // Keep this independent of token count so reserve and decode agree.
+                if (ok && GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        up->op == GGML_OP_MUL_MAT_ID && cache_glu_type(up->src[0]->type) &&
+                        up->src[1]->type == GGML_TYPE_F32 && up->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+                        ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 })) {
+                    add_alloc_deps(i, i + 2);
+                    i += 2;
+                    continue;
+                }
+#endif
                 if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
                     add_alloc_deps(i, i + 2);
                     i += 2;

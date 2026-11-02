@@ -189,8 +189,11 @@ int llama_context::decode_device_inputs(const llama_batch_ext & batch) {
             return -1;
         }
     }
-    // All source-GPU copies must have reached the staging device before the draft gathers them.
-    target->synchronize();
+    // synchronize() clears this counter only after all target streams, feature
+    // copies and cache workers finish. Logits access normally did that already.
+    if (target->n_queued_tokens != 0) {
+        target->synchronize();
+    }
     cparams.dflash_device_inputs = true;
     struct reset_mode {
         bool & mode;

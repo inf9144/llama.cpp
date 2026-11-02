@@ -75,10 +75,29 @@ class StreamActivationTests(unittest.TestCase):
                     text = launchers[variant][key]['script'].read_text()
                     self.assertIn('--spec-draft-n-max 7', text)
                     self.assertNotIn('--spec-draft-n-max 3', text)
+                    self.assertIn(f'set -lx LD_LIBRARY_PATH {binary.parent} $LD_LIBRARY_PATH\n{binary}', text)
             (root / 'moe-server-reference.fish').write_text(
                 './build-rocm-moe-reference/bin/llama-server --cache-ram 0\n')
             with self.assertRaisesRegex(ValueError, 'nicht eindeutig'):
                 runner.prepare_launchers(root, suite, args)
+
+    def test_snapshot_library_path_is_scoped_to_the_selected_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            suite = root / 'suite'
+            suite.mkdir()
+            previous = root / 'previous build'
+            previous.mkdir()
+            binary = previous / 'llama-server'
+            binary.write_bytes(b'snapshot')
+            (root / 'moe-server-measure.fish').write_text(
+                'set -lx LD_LIBRARY_PATH /opt/rocm/lib $LD_LIBRARY_PATH\n'
+                './build-rocm-moe-measure/bin/llama-server --cache-ram 0 --spec-draft-n-max 3\n')
+            args = argparse.Namespace(draft_max=3, baseline_measure=binary)
+            launchers = runner.prepare_launchers(root, suite, args, ('baseline',), ('measure',))
+            text = launchers['baseline']['measure']['script'].read_text()
+            self.assertIn(f"set -lx LD_LIBRARY_PATH '{previous}' $LD_LIBRARY_PATH\n'{binary}'", text)
+            self.assertLess(text.index('/opt/rocm/lib'), text.index(str(previous)))
 
     def test_scratch_required_on_each_cache_gpu(self):
         caches = ('ROCm0 MoE cache size = 15200.0 MiB\nROCm1 MoE cache size = 9600.0 MiB\n' + LINKS +

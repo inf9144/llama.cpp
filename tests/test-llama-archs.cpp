@@ -1609,7 +1609,7 @@ static void test_dflash_tail_equivalence(
 
 // Exercise device staging/gathers on the CPU backend as a numerical oracle. This
 // deliberately calls the internal staging method: automatic CPU use stays off.
-static int test_dflash_device_inputs(size_t seed, float stdev) {
+static int test_dflash_device_inputs(size_t seed, float stdev, const char * backend_name) {
     auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false);
     const int32_t layers[] = { 0, 1 };
@@ -1623,22 +1623,26 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
     const bool swa[] = { true, true };
     gguf_set_arr_data(draft_meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, swa, 2);
     auto mp = llama_model_default_params();
-    ggml_backend_dev_t devices[] = { nullptr };
+    const auto dev = backend_name == nullptr ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) :
+                                              ggml_backend_dev_by_name(backend_name);
+    GGML_ASSERT(dev);
+    const bool gpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    const int n_seqs = gpu ? 1 : 2;
+    ggml_backend_dev_t devices[] = { gpu ? dev : nullptr, nullptr };
     mp.devices = devices;
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = gpu ? 99 : 0;
     tensor_data_params data = { seed, stdev };
     llama_model_ptr target(llama_model_init_from_user(target_meta.get(), set_tensor_data, &data, mp));
     llama_model_ptr draft(llama_model_init_from_user(draft_meta.get(), set_tensor_data, &data, mp));
     GGML_ASSERT(target && draft);
     const int width = llama_model_n_embd(target.get());
-    const auto cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 
     for (auto kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         auto cp = llama_context_default_params();
         cp.n_ctx = 256;
         cp.n_batch = 32;
         cp.n_ubatch = 4;
-        cp.n_seq_max = 2;
+        cp.n_seq_max = n_seqs;
         cp.n_threads = cp.n_threads_batch = 2;
         cp.type_k = cp.type_v = kv;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -1647,13 +1651,15 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
         for (int lid : layers) {
             llama_set_embeddings_layer_inp(tgt.get(), lid, true);
         }
-        GGML_ASSERT(tgt->prepare_layer_inputs_device(cpu));
+        GGML_ASSERT(tgt->prepare_layer_inputs_device(dev));
         cp.n_ubatch = 16;
         cp.ctx_other = tgt.get();
         llama_context_ptr host(llama_init_from_model(draft.get(), cp));
         llama_context_ptr device(llama_init_from_model(draft.get(), cp));
         GGML_ASSERT(host && device);
-        GGML_ASSERT(!llama_dflash_init_device_inputs(device.get(), tgt.get()));
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        const bool native_inputs = gpu && (strcmp(reg, "ROCm") == 0 || strcmp(reg, "CUDA") == 0);
+        GGML_ASSERT(llama_dflash_init_device_inputs(device.get(), tgt.get()) == native_inputs);
         for (auto * ctx : { host.get(), device.get() }) {
             llama_set_causal_attn(ctx, false);
             llama_set_embeddings_nextn(ctx, true, false);
@@ -1663,7 +1669,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
             common_batch in(tgt.get());
             for (int i = 0; i < count; ++i) {
                 // Interleaving forces the recurrent target to reorder rows across ubatches.
-                for (int seq = 0; seq < 2; ++seq) {
+                for (int seq = 0; seq < n_seqs; ++seq) {
                     in.add(1 + i, pos + i, seq, true);
                 }
             }
@@ -1695,7 +1701,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
             GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
             GGML_ASSERT(llama_process(host.get(), LLAMA_PROCESS_TYPE_DECODE, host_in.get()) == 0);
             pos += count;
-            for (int seq = 0; seq < 2; ++seq) {
+            for (int seq = 0; seq < n_seqs; ++seq) {
                 const size_t bytes = llama_state_seq_get_size(host.get(), seq);
                 std::vector<uint8_t> a(bytes), b(bytes);
                 GGML_ASSERT(bytes && llama_state_seq_get_size(device.get(), seq) == bytes);
@@ -1708,7 +1714,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
             int which = 0;
             for (auto * ctx : { host.get(), device.get() }) {
                 common_batch noise(ctx);
-                for (int seq = 0; seq < 2; ++seq) {
+                for (int seq = 0; seq < n_seqs; ++seq) {
                     for (int i = 0; i < 4; ++i) {
                         noise.add(i == 0 ? 1 : 127, pos + i, seq, false);
                     }
@@ -1716,8 +1722,8 @@ static int test_dflash_device_inputs(size_t seed, float stdev) {
                 GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, noise.get()) == 0);
                 const auto * embd = llama_get_embeddings_nextn(ctx);
                 GGML_ASSERT(embd);
-                lattice[which++].assign(embd, embd + 8*llama_model_n_embd_out(draft.get()));
-                for (int seq = 0; seq < 2; ++seq) {
+                lattice[which++].assign(embd, embd + n_seqs*4*llama_model_n_embd_out(draft.get()));
+                for (int seq = 0; seq < n_seqs; ++seq) {
                     GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), seq, pos, -1));
                 }
             }
@@ -2957,7 +2963,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (dflash_device_inputs) {
-            return test_dflash_device_inputs(seed, stdev);
+            return test_dflash_device_inputs(seed, stdev, target_backend);
         }
         if (dflash_vision) {
             return test_dflash_vision(seed, stdev);

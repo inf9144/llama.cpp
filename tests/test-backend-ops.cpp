@@ -6000,6 +6000,54 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_id_cache_glu : public test_case {
+    const ggml_type type;
+    const int64_t tokens;
+    const bool distinct_input;
+    ggml_tensor * out = nullptr;
+
+    test_mul_mat_id_cache_glu(ggml_type type, int64_t tokens, bool distinct_input = false)
+        : type(type), tokens(tokens), distinct_input(distinct_input) {}
+
+    std::string vars() override { return VARS_TO_STR3(type, tokens, distinct_input); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_CACHE_GLU"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+    bool use_weight_context() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, tokens);
+        input = ggml_rms_norm(ctx, input, 1e-5f);
+        input = ggml_reshape_3d(ctx, input, 512, 1, tokens);
+        auto * gate_input = distinct_input ? ggml_scale(ctx, input, 1.125f) : input;
+        auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, tokens);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, 4, tokens, ids->nb[1], 0);
+        auto make_bank = [&] {
+            auto * bank = ggml_new_tensor_3d(ctx_weights, type, 512, 128, 10);
+            auto * view = ggml_view_3d(ctx, bank, 512, 128, 8, bank->nb[1], bank->nb[2], bank->nb[2]);
+            // Direct backend comparisons do not run the scheduler's view hoist.
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, view);
+            }
+            return view;
+        };
+        auto * gate = ggml_mul_mat_id(ctx, make_bank(), gate_input, ids);
+        auto * up = ggml_mul_mat_id(ctx, make_bank(), input, ids);
+        out = ggml_swiglu_split(ctx, gate, up);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
@@ -11709,6 +11757,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
     }
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
+                            GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0 }) {
+        for (int64_t tokens : { 1, 4 }) {
+            test_cases.emplace_back(new test_mul_mat_id_cache_glu(type, tokens));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_cache_glu(GGML_TYPE_Q8_0, 8));
+    test_cases.emplace_back(new test_mul_mat_id_cache_glu(GGML_TYPE_Q8_0, 4, true));
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

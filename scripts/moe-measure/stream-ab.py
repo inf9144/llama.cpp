@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -402,7 +403,9 @@ def prepare_launchers(root: Path, suite: Path, arguments: argparse.Namespace,
                 raise ValueError(f"Binary fehlt: {binary}. Zuerst mit cmake bauen.")
             if len(re.findall(pattern, text)) != 1:
                 raise ValueError(f"{source}: alter llama-server-Pfad nicht eindeutig gefunden")
-            result = re.sub(pattern, str(binary), text)
+            # Snapshotted build directories must use their own shared libraries.
+            replacement = f"set -lx LD_LIBRARY_PATH {shlex.quote(str(binary.parent))} $LD_LIBRARY_PATH\n{shlex.quote(str(binary))}"
+            result = re.sub(pattern, lambda _: replacement, text)
             target = suite / f"launch-{variant}-{key}.fish"
             target.write_text(result)
             generated[variant][key] = {"script": target, "binary": str(binary), "binary_sha256": sha(binary)}
