@@ -1089,6 +1089,13 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
+    if (dflash_reserve_tokens == 0 && model.arch == LLM_ARCH_DFLASH &&
+            model.hparams.dflash_selector_top_k > 0 && model.hparams.dsv4_hc_mult == 0 &&
+            cparams.n_seq_max == 1 && model.split_mode() != LLAMA_SPLIT_MODE_TENSOR &&
+            model.hparams.dflash_block_size > 0) {
+        dflash_reserve_tokens = std::min(n_tokens, model.hparams.dflash_block_size);
+    }
+
     // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
     // reachable in this context - see kq_mask_packed_reachable()
     const bool packed_kq_mask = kq_mask_packed_reachable();
@@ -1134,17 +1141,21 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    const auto reserve_pp = [&]() {
+        size_t * sizes = model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr;
+        return dflash_reserve_tokens > 0 ? graph_reserve_dflash(mctx.get(), model.hparams.no_alloc, sizes) :
+                graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, sizes, packed_kq_mask);
+    };
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
-                packed_kq_mask);
+        auto * gf = reserve_pp();
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask);
+                gf = reserve_pp();
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1220,7 +1231,7 @@ void llama_context::sched_reserve() {
 }
 
 ggml_cgraph * llama_context::graph_reserve_worst_case(const llama_memory_context_i * mctx, bool split_only) {
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = dflash_reserve_tokens > 0 ? dflash_reserve_tokens : std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
     uint32_t n_seqs = cparams.n_seq_max;
 
@@ -1244,6 +1255,31 @@ ggml_cgraph * llama_context::graph_reserve_worst_case(const llama_memory_context
         sched_need_recover = false;
     }
     return gf;
+}
+
+ggml_cgraph * llama_context::graph_reserve_dflash(const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const bool packed_kq_mask = kq_mask_packed_reachable();
+    std::vector<size_t> measured(backend_ptrs.size());
+    if (sizes) {
+        std::fill(sizes, sizes + measured.size(), 0);
+    }
+    const auto reserve = [&](uint32_t tokens, llama_dflash_input input) {
+        auto * gf = graph_reserve(tokens, 1, std::min(tokens, cparams.n_outputs_max), mctx,
+                split_only, sizes ? measured.data() : nullptr, packed_kq_mask, input);
+        if (sizes) {
+            for (size_t i = 0; i < measured.size(); ++i) {
+                sizes[i] = std::max(sizes[i], measured[i]);
+            }
+        }
+        return gf;
+    };
+
+    // F1 has a large input batch but no LM head. Reserve its host and device input layouts.
+    if (!reserve(n_tokens, llama_dflash_input::HOST) || !reserve(n_tokens, llama_dflash_input::DEVICE)) {
+        return nullptr;
+    }
+    return reserve(dflash_reserve_tokens, llama_dflash_input::NOISE);
 }
 
 bool llama_context::sched_recover() {
@@ -1393,7 +1429,8 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get(), /*split_only =*/ false, nullptr, kq_mask_packed_reachable());
+        auto * gf = dflash_reserve_tokens > 0 ? graph_reserve_worst_case(mctx.get()) :
+                graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get(), /*split_only =*/ false, nullptr, kq_mask_packed_reachable());
         sched_need_recover = !gf;
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
@@ -1915,6 +1952,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (moe_cache) moe_cache->set_batch(ubatch);
 
     const bool text_graph = ubatch.token && !cparams.dflash_device_inputs && !ubatch.is_mixed() && gtype == ctx_type_to_graph_type(cparams.ctx_type);
+    if (text_graph && dflash_reserve_tokens > 0 && ubatch.n_tokens > dflash_reserve_tokens) {
+        // Nonstandard noise batches keep the normal full-graph fallback and retain its larger bound.
+        dflash_reserve_tokens = ubatch.n_tokens;
+        sched_need_recover = true;
+    }
     if (!text_graph) {
         // Embedding and auxiliary graphs can replace the text allocation plan, including on single-buffer schedulers.
         sched_need_recover = true;
@@ -3086,7 +3128,7 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
-        bool packed_kq_mask) {
+        bool packed_kq_mask, llama_dflash_input dflash_input) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3114,11 +3156,20 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
+    if (dflash_input == llama_dflash_input::HOST) {
+        ubatch.token = nullptr;
+        // Reservation builds shapes and never reads embedding values.
+        ubatch.data->embd.resize(1);
+        ubatch.embd = ubatch.data->embd.data();
+    }
+
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     auto * res = gf_res_reserve.get();
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.reserve = true;
+    gparams.cparams.dflash_device_inputs = dflash_input == llama_dflash_input::DEVICE;
 
     // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
     // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a

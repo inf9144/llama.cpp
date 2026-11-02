@@ -189,12 +189,11 @@ static bool host_experts_test(const llm_arch arch) {
     }
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, uint32_t n_vocab = 128) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
 
-    uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
@@ -1607,11 +1606,86 @@ static void test_dflash_tail_equivalence(
     }
 }
 
+static void test_dflash_reservation(llama_model * model, llama_model * measure_model, llama_context_params cp) {
+    cp.n_seq_max = 1;
+    cp.n_ubatch = cp.n_batch;
+    cp.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+    llama_context_ptr compact(llama_init_from_model(model, cp));
+    llama_context_ptr reference(llama_init_from_model(model, cp));
+    llama_context_ptr measured(llama_init_from_model(measure_model, cp));
+    GGML_ASSERT(compact && reference && measured);
+    const auto compute_bytes = [](llama_context * ctx) {
+        size_t total = 0;
+        for (const auto & entry : ctx->memory_breakdown()) {
+            total += entry.second.compute;
+        }
+        return total;
+    };
+    const size_t compact_bytes = compute_bytes(compact.get());
+    const auto estimate = measured->memory_breakdown();
+    for (const auto & entry : compact->memory_breakdown()) {
+        const auto it = estimate.find(entry.first);
+        GGML_ASSERT(it != estimate.end() && it->second.compute >= entry.second.compute);
+    }
+    GGML_ASSERT(compact->kq_mask_packed_reachable());
+    GGML_ASSERT(compact->get_gf_res_reserve()->get_logits()->ne[1] == 4);
+    auto mctx = reference->get_memory()->init_full();
+    GGML_ASSERT(reference->graph_reserve(cp.n_ubatch, 1, cp.n_ubatch, mctx.get(), false, nullptr,
+            reference->kq_mask_packed_reachable()));
+    const size_t reference_bytes = compute_bytes(reference.get());
+    GGML_ASSERT(compact_bytes < reference_bytes);
+
+    int pos = 0;
+    int bound = 4;
+    const int width = model->hparams.n_embd_inp_enc();
+    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    for (int tokens : { 4, 8, 4 }) {
+        bound = std::max(bound, tokens);
+        std::vector<float> logits[2];
+        std::vector<uint8_t> state[2];
+        int which = 0;
+        for (auto * ctx : { compact.get(), reference.get() }) {
+            common_batch ingest(ctx);
+            std::vector<float> features(12 * width, 0.01f);
+            for (int i = 0; i < 12; ++i) {
+                const llama_pos p[4] = { pos + i, pos + i, pos + i, 0 };
+                ingest.add_embd({ features.data() + i * width, 1, (size_t) width }, p, 0, false);
+            }
+            GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, ingest.get()) == 0);
+            common_batch noise(ctx);
+            for (int i = 0; i < tokens; ++i) {
+                noise.add(i == 0 ? 1 : 127, pos + 12 + i, 0, true);
+            }
+            GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, noise.get()) == 0);
+            for (int i = 0; i < tokens; ++i) {
+                const float * row = llama_get_logits_ith(ctx, i);
+                GGML_ASSERT(row);
+                for (int j = 0; j < vocab; ++j) {
+                    GGML_ASSERT(std::isfinite(row[j]));
+                    logits[which].push_back(row[j]);
+                }
+            }
+            GGML_ASSERT(ctx->get_gf_res_reserve()->get_logits()->ne[1] == bound);
+            GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), 0, pos + 12, -1));
+            state[which].resize(llama_state_seq_get_size(ctx, 0));
+            GGML_ASSERT(llama_state_seq_get_data(ctx, state[which].data(), state[which].size(), 0) == state[which].size());
+            ++which;
+        }
+        GGML_ASSERT(logits[0] == logits[1] && state[0] == state[1]);
+        if (tokens == 4 && bound == 4) {
+            GGML_ASSERT(compute_bytes(compact.get()) == compact_bytes);
+        }
+        pos += 12;
+    }
+    printf("DFlash2 reserve: compact=%zu full-noise=%zu bytes; F1/F2 logits, rollback and larger-noise fallback passed\n",
+            compact_bytes, reference_bytes);
+}
+
 // Exercise device staging/gathers on the CPU backend as a numerical oracle. This
 // deliberately calls the internal staging method: automatic CPU use stays off.
 static int test_dflash_device_inputs(size_t seed, float stdev, const char * backend_name) {
-    auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
-    auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false);
+    auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, 4096);
+    auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false, 4096);
     const int32_t layers[] = { 0, 1 };
     gguf_set_arr_data(draft_meta.get(), "dflash.target_layers", GGUF_TYPE_INT32, layers, 2);
     gguf_set_val_u32(draft_meta.get(), "dflash.block_size", 4);
@@ -1620,6 +1694,8 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
     gguf_set_val_u32(draft_meta.get(), "dflash.selector_rank", 8);
     gguf_set_val_u32(draft_meta.get(), "dflash.selector_top_k", 2);
     gguf_set_val_u32(draft_meta.get(), "tokenizer.ggml.mask_token_id", 127);
+    const uint32_t sections[] = { 64, 0, 0, 0 };
+    gguf_set_arr_data(draft_meta.get(), "dflash.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
     const bool swa[] = { true, true };
     gguf_set_arr_data(draft_meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, swa, 2);
     auto mp = llama_model_default_params();
@@ -1635,6 +1711,10 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
     llama_model_ptr target(llama_model_init_from_user(target_meta.get(), set_tensor_data, &data, mp));
     llama_model_ptr draft(llama_model_init_from_user(draft_meta.get(), set_tensor_data, &data, mp));
     GGML_ASSERT(target && draft);
+    auto measure_mp = mp;
+    measure_mp.no_alloc = true;
+    llama_model_ptr measure_draft(llama_model_init_from_user(draft_meta.get(), set_tensor_data, &data, measure_mp));
+    GGML_ASSERT(measure_draft);
     const int width = llama_model_n_embd(target.get());
 
     for (auto kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
@@ -1654,6 +1734,9 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
         GGML_ASSERT(tgt->prepare_layer_inputs_device(dev));
         cp.n_ubatch = 16;
         cp.ctx_other = tgt.get();
+        if (kv == GGML_TYPE_F16) {
+            test_dflash_reservation(draft.get(), measure_draft.get(), cp);
+        }
         llama_context_ptr host(llama_init_from_model(draft.get(), cp));
         llama_context_ptr device(llama_init_from_model(draft.get(), cp));
         GGML_ASSERT(host && device);
@@ -1663,7 +1746,9 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
         for (auto * ctx : { host.get(), device.get() }) {
             llama_set_causal_attn(ctx, false);
             llama_set_embeddings_nextn(ctx, true, false);
+            ctx->sched_reserve();
         }
+        const auto device_reserve = device->memory_breakdown();
         int pos = 0;
         for (int count : { 7, 1, 4 }) {
             common_batch in(tgt.get());
@@ -1728,6 +1813,12 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                 }
             }
             GGML_ASSERT(lattice[0] == lattice[1]);
+            if (gpu) {
+                for (const auto & entry : device->memory_breakdown()) {
+                    const auto it = device_reserve.find(entry.first);
+                    GGML_ASSERT(it != device_reserve.end() && entry.second.compute <= it->second.compute);
+                }
+            }
         }
         common_batch invalid(device.get());
         invalid.add(31, pos, 0, false);

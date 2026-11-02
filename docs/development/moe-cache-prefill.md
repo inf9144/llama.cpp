@@ -1168,3 +1168,71 @@ end
 ```
 
 The new HIP build, physical peer tests, production numerical/acceptance comparison, Vulkan execution, end-to-end performance and allocation peaks remain hardware checks. No HIP SDK or physical GPU is available here. No production-branch merge is made.
+
+## 2026-11-02: dense verify GLU and separate DFlash reserves
+
+### Parent hardware results
+
+The `20261102-173033-138119` completion handoff validates `b8b49e07` against `22552b3a`: tokens and all recorded probability rows match, including prefix replays. The corresponding `173230-321333` A/B has identical completion hashes and 74/156 accepted drafts. Uninstrumented cold decode is 23.31 -> 24.52 tokens/s; warm decode is 37.36 -> 37.60 tokens/s. The single warm observation (+0.6%) is not evidence of a stable speedup.
+
+Warm target-submission intervals shrink from 1.444 s to 0.223 s, but much of the stream wait moves to result retrieval. Transfer bytes, kernel counts and GPU allocation peaks do not change. Removing more synchronization calls is not equivalent to removing the GPU work they wait for.
+
+### Dense verify fusion
+
+On RDNA3 HIP, contiguous two-dimensional Q6_K/Q8_0 gate/up pairs without bias can use the existing fused MMVQ/GLU routines at widths 2-4. This also covers eligible DFlash dense layers. Gate and up share one Q8_1 input quantization; the separate GLU launch and second input quantization disappear. Dot products, reductions and quantization use the existing implementations. One-token dispatch, routed MoE paths and unsupported/bias/batched layouts retain their previous behavior. This is a candidate for hardware measurement, not a demonstrated throughput gain.
+
+Allocation dependencies keep the weights and activation alive through the fused output. This policy is independent of query width so reserve and runtime plans agree; it can modestly increase the target's conservative reservation. There are no new runtime controls or caches.
+
+### DFlash2 reservation
+
+Single-sequence DFlash2 with selector metadata and layer splitting reserves full-sized host F1 ingestion, full-sized device F1 ingestion, and the F2 noise graph at the GGUF block size. The F1 device measure graph includes gathers, concatenations and conservative source storage on the FC device before the target's device inputs exist. The no-allocation fit pass takes the maximum per backend across all three layouts. Large F1 batches keep the configured batch/ubatch sizes.
+
+Recovery after F1 reserves only bounded F2; it does not repeat the F1 measurements. A noise batch larger than the current bound extends it before execution and retains the larger bound for later recoveries. Such nonstandard batches can grow the compute buffers and require additional free memory. Multi-sequence contexts, tensor splitting, and drafts without the selector keep the original reservation policy. The target reserve and its packed KQ mask protection are unchanged; bounded F2 still reserves its packed mask whenever required, including M-RoPE.
+
+The old 1024 x 248320 F32 noise-logit tensor is nominally 970 MiB. Actual production savings require per-GPU measurement: F1 workspaces, small F2, allocator overlap and padding still need memory. The existing MoE cache is not enlarged automatically.
+
+### Validation and physical run
+
+Local CPU Release validation passes the 17 focused `MUL_MAT_VERIFY_GLU` cases, the DFlash device/host fixture, graph recovery, and existing DFlash vision tests. The reservation fixture uses a 4096-token vocabulary, M-RoPE and 32-row ingest capacity. Compute reservation is 164992 versus 589824 bytes with full-noise reserve. F1/F2 logits and serialized rollback state match exactly through widths 4, 8, 4; the larger bound is retained, normal F1/F2 does not grow the buffers, and per-buffer-type no-allocation estimates cover actual reservations. F16/Q8_0 device/host KV and selector comparisons and the two-sequence fallback remain covered. These CPU tests do not execute HIP arithmetic.
+
+The DFlash fixture also passes in Debug with AddressSanitizer and UndefinedBehaviorSanitizer; leak detection is disabled because it cannot run under the local ptrace setup. Native device-input cases assert that alternating F1/F2 does not grow the initial per-buffer-type compute reserves. That assertion remains a physical GPU check.
+
+No HIP SDK or physical GPU is available here. The HIP build, fused numerical results, full-model acceptance, throughput and GPU peaks remain open. Vulkan runtime validation is also unavailable. Compare against saved `b8b49e07` binaries with unchanged cache budgets. The existing suite records reservations and peak allocations per device; its uninstrumented run decides speed.
+
+Save the current binaries before pulling, then run this in fish:
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-verify-reserve
+
+    if test -x $before/reference/llama-server; and test -x $before/measure/llama-server
+        echo "Vorherige Builds werden wiederverwendet: $before"
+    else
+        test ! -e $before
+        and mkdir $before
+        and cp -a build-rocm-moe-stream-reference/bin $before/reference
+        and cp -a build-rocm-moe-stream-measure/bin $before/measure
+    end
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-backend-ops test-llama-archs -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and ./build-rocm-moe-stream-reference/bin/test-backend-ops -b ROCm0 -o MUL_MAT_VERIFY_GLU
+    and ./build-rocm-moe-stream-reference/bin/test-backend-ops -b ROCm1 -o MUL_MAT_VERIFY_GLU
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm0 -s 42
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm1 -s 42
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+Eligible dense kernels should change to `mul_mat_vec_q<..., true, ...>` at widths 2-4, with fewer Q8_1 and GLU launches. Routed `mul_mat_vec_q_moe` is already fused and is not evidence for this change. Check draft and target reservations separately: the target can retain or slightly increase its reserve while the draft shrinks. The two implementation commits can be reviewed or reverted separately. No production-branch merge is made.

@@ -43,6 +43,12 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+enum class llama_dflash_input {
+    NOISE,
+    HOST,
+    DEVICE,
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -272,7 +278,7 @@ public:
     //   support probes must NOT set it - they verify the derived form is present in the graph.
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
-        bool packed_kq_mask = false);
+        bool packed_kq_mask = false, llama_dflash_input dflash_input = llama_dflash_input::NOISE);
 
     // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
     // compute reserve must be sized for the packed mask - see the definition for the full reasoning
@@ -297,6 +303,8 @@ private:
     bool sched_recover();
 
     ggml_cgraph * graph_reserve_worst_case(const llama_memory_context_i * mctx, bool split_only = false);
+
+    ggml_cgraph * graph_reserve_dflash(const llama_memory_context_i * mctx, bool split_only, size_t * sizes);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -390,6 +398,8 @@ private:
     bool sched_need_reserve = true;
 
     bool sched_need_recover = false;
+
+    uint32_t dflash_reserve_tokens = 0;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

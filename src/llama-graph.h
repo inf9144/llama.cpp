@@ -868,6 +868,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    bool reserve = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -932,6 +934,7 @@ struct llm_graph_params {
         }
 
         return
+            reserve                         == other.reserve                         &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&

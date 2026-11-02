@@ -21,7 +21,7 @@ public:
     }
 };
 
-static ggml_tensor * dflash_target_features(llm_graph_context & g, const llama_model & model, int64_t width, int64_t tokens) {
+static ggml_tensor * dflash_target_features(llm_graph_context & g, const llama_model & model, int64_t width, int64_t tokens, bool reserve) {
     if (!g.cparams.dflash_device_inputs) {
         auto inp = std::make_unique<llm_graph_input_embd>(width);
         inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, width, tokens);
@@ -30,7 +30,7 @@ static ggml_tensor * dflash_target_features(llm_graph_context & g, const llama_m
         g.res->add_input(std::move(inp));
         return features;
     }
-    GGML_ASSERT(g.cparams.ctx_other);
+    GGML_ASSERT(reserve || g.cparams.ctx_other);
     auto inp = std::make_unique<llm_graph_input_dflash_rows>();
     inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, tokens);
     ggml_set_input(inp->rows);
@@ -39,7 +39,22 @@ static ggml_tensor * dflash_target_features(llm_graph_context & g, const llama_m
 
     ggml_tensor * features = nullptr;
     for (int32_t lid : model.target_layer_ids) {
-        auto * layer = g.cparams.ctx_other->get_layer_input_device(lid);
+        ggml_tensor * layer;
+        if (reserve) {
+            // Include source storage as well as gathers before target device inputs exist.
+            layer = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, model.hparams.n_embd, tokens);
+            ggml_set_input(layer);
+            const auto dev = model.fc->buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.fc->buffer)) : model.dev_output();
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(g.sched); ++i) {
+                auto * backend = ggml_backend_sched_get_backend(g.sched, i);
+                if (ggml_backend_get_device(backend) == dev) {
+                    ggml_backend_sched_set_tensor_backend(g.sched, layer, backend);
+                    break;
+                }
+            }
+        } else {
+            layer = g.cparams.ctx_other->get_layer_input_device(lid);
+        }
         GGML_ASSERT(layer);
         auto * gathered = ggml_get_rows(g.ctx0, layer, rows);
         features = features ? ggml_concat(g.ctx0, features, gathered, 0) : gathered;
@@ -896,7 +911,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd || cparams.dflash_device_inputs) {
-        ggml_tensor * inp_target = dflash_target_features(*this, model, n_embd_inp, n_tokens);
+        ggml_tensor * inp_target = dflash_target_features(*this, model, n_embd_inp, n_tokens, params.reserve);
         cb(inp_target, "inp_target_features", -1);
 
         // fuse the target features through the encoder
