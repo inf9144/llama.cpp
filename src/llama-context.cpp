@@ -1275,9 +1275,14 @@ ggml_cgraph * llama_context::graph_reserve_dflash(const llama_memory_context_i *
         return gf;
     };
 
-    // F1 has a large input batch but no LM head. Reserve its host and device input layouts.
-    if (!reserve(n_tokens, llama_dflash_input::HOST) || !reserve(n_tokens, llama_dflash_input::DEVICE)) {
-        return nullptr;
+    // A nearly full F1 batch can need more storage due to allocator placement.
+    for (auto input : { llama_dflash_input::HOST, llama_dflash_input::DEVICE }) {
+        if (n_tokens > 1 && !reserve(n_tokens - 1, input)) {
+            return nullptr;
+        }
+        if (!reserve(n_tokens, input)) {
+            return nullptr;
+        }
     }
     return reserve(dflash_reserve_tokens, llama_dflash_input::NOISE);
 }

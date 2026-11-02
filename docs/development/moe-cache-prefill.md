@@ -1179,13 +1179,13 @@ Warm target-submission intervals shrink from 1.444 s to 0.223 s, but much of the
 
 ### Dense verify fusion
 
-On RDNA3 HIP, contiguous two-dimensional Q6_K/Q8_0 gate/up pairs without bias can use the existing fused MMVQ/GLU routines at widths 2-4. This also covers eligible DFlash dense layers. Gate and up share one Q8_1 input quantization; the separate GLU launch and second input quantization disappear. Dot products, reductions and quantization use the existing implementations. One-token dispatch, routed MoE paths and unsupported/bias/batched layouts retain their previous behavior. This is a candidate for hardware measurement, not a demonstrated throughput gain.
+The initial RDNA3 HIP implementation enabled contiguous two-dimensional Q6_K/Q8_0 gate/up pairs without bias at widths 2-4. The hardware results below narrow this to Q6_K. Gate and up share one Q8_1 input quantization; the separate GLU launch and second input quantization disappear. Dot products, reductions and quantization use the existing implementations. One-token dispatch, routed MoE paths and unsupported/bias/batched layouts retain their previous behavior.
 
 Allocation dependencies keep the weights and activation alive through the fused output. This policy is independent of query width so reserve and runtime plans agree; it can modestly increase the target's conservative reservation. There are no new runtime controls or caches.
 
 ### DFlash2 reservation
 
-Single-sequence DFlash2 with selector metadata and layer splitting reserves full-sized host F1 ingestion, full-sized device F1 ingestion, and the F2 noise graph at the GGUF block size. The F1 device measure graph includes gathers, concatenations and conservative source storage on the FC device before the target's device inputs exist. The no-allocation fit pass takes the maximum per backend across all three layouts. Large F1 batches keep the configured batch/ubatch sizes.
+Single-sequence DFlash2 with selector metadata and layer splitting reserves host/device F1 ingestion and the F2 noise graph at the GGUF block size. F1 covers both the full ubatch and one fewer row, following the hardware results below. The device measure graph includes gathers, concatenations and conservative source storage on the FC device before the target's device inputs exist. The no-allocation fit pass takes the maximum per backend across these layouts. Large F1 batches keep the configured batch/ubatch sizes.
 
 Recovery after F1 reserves only bounded F2; it does not repeat the F1 measurements. A noise batch larger than the current bound extends it before execution and retains the larger bound for later recoveries. Such nonstandard batches can grow the compute buffers and require additional free memory. Multi-sequence contexts, tensor splitting, and drafts without the selector keep the original reservation policy. The target reserve and its packed KQ mask protection are unchanged; bounded F2 still reserves its packed mask whenever required, including M-RoPE.
 
@@ -1236,3 +1236,67 @@ end
 ```
 
 Eligible dense kernels should change to `mul_mat_vec_q<..., true, ...>` at widths 2-4, with fewer Q8_1 and GLU launches. Routed `mul_mat_vec_q_moe` is already fused and is not evidence for this change. Check draft and target reservations separately: the target can retain or slightly increase its reserve while the draft shrinks. The two implementation commits can be reviewed or reverted separately. No production-branch merge is made.
+
+## 2026-11-02: physical results, Q8 rollback and partial F1 reserve
+
+The `233917-924358` and `234140-876004` completion handoffs compare `b8b49e07` with `a5cf563b` at draft maxima 0 and 3. All tokens and complete recorded top-32 probability arrays match within and across builds, including prefix replays at 0 and 32. This is not a full-vocabulary logit comparison. The `moe-decode-ab-20261102-234333-737798` performance requests have identical hashes, 5121 prompt tokens, 128 completions and 74/156 accepted drafts.
+
+Uninstrumented decode is 23.45 -> 23.60 tokens/s cold and 36.37 -> 37.39 warm. The instrumented warm controls are effectively unchanged (37.25 -> 37.30 and 31.72 -> 31.75); these are diagnostic controls, not independent production speed measurements. The 10.1% warm prefill gain in the uninstrumented pair is not repeated in the instrumented pair. A stable larger end-to-end speedup is not established.
+
+The draft's measured compute high-water and total traced GPU allocation peaks both decrease. Target compute reservations and expert H2D/D2D bytes are unchanged; cache budgets remain 15200/9600 MiB.
+
+| GPU | Draft compute before | Draft compute after | Reduction in traced GPU allocation peak |
+| --- | ---: | ---: | ---: |
+| RX 7900 XTX | 161.37 MiB | 18.10 MiB | 143.28 MiB |
+| RX 7800 XT | 1041.38 MiB | 109.90 MiB | 931.48 MiB |
+
+The sum of the per-device peak reductions is 1074.76 MiB (1.05 GiB). The tracer reports no coverage warnings or unknown frees; this is observed process allocation data, not an OS-wide VRAM reading. Draft host-compute reservation increases by about 50 MiB to cover host F1 fallback.
+
+### Fusion decision from complete sections
+
+Kernel-launch correlations identify matching warm decode sections, including input quantization and the GLU epilogue. The table sums GPU spans from the first quantization start to the last epilogue/fused-matmul end; these spans are not an end-to-end speedup bound.
+
+| Section, width 4 | Count | Before | Fused |
+| --- | ---: | ---: | ---: |
+| Q6_K, RX 7900 XTX | 208 | 5.372 ms | 4.176 ms |
+| Q6_K, RX 7800 XT | 104 | 3.622 ms | 2.462 ms |
+| Q8_0 draft FFN, RX 7900 XTX | 208 | 19.459 ms | 23.925 ms |
+| Q8_0 draft FFN, RX 7800 XT | 52 | 6.949 ms | 6.706 ms |
+
+The Q6_K path is retained. Dense multi-token Q8_0 gate/up returns to its original dispatch: its dominant XTX workload regresses despite fewer launches, and the XT improvement is small. This keeps a simple type guard instead of a new per-shape/per-device tuning table. One-token and routed Q8_0 fusions are unaffected. Whole-session kernel counts fell by 3501 at `a5cf563b`; this alone did not establish a throughput gain. Performance of widths 2 and 3 remains unmeasured here.
+
+### Nearly full F1 batches
+
+The draft's XTX reserve stays at 18.10 MiB, but its XT reserve grows from 100.0039 to 109.8965 MiB at graph 7, a 1023-token F1 ingest. Reserving only the 1024-row layout missed that allocator placement. Initialization now measures both `n_ubatch` and `n_ubatch - 1` for host and device F1, merging per-backend maxima in the fit pass as well. F2 recovery still does not repeat F1 measurements. Global target and packed-mask reservation policy are unchanged.
+
+The focused fixture now uses five feature streams, 1024-row capacity and F1 widths 1023, 1024 and 12 with F2 widths 4, 8 and 4, for F16 and Q8_0 KV. Native device-input coverage adds a 31-row batch split into 16 and 15 rows. It checks logits, serialized rollback state, retained larger-noise bounds, per-buffer-type fit estimates and normal-cycle allocation growth. The physical 2560-wide two-GPU allocation behavior still needs validation; CPU passing alone does not reproduce that GPU allocator boundary.
+
+The updated fixture passes locally in CPU Release and Debug ASan/UBSan builds (LeakSanitizer disabled because of the container's ptrace restriction). Compact/full-noise CPU compute reservations are 15765504/22188032 bytes with F16 KV and 15847424/22925312 bytes with Q8_0 KV; these fixture sizes are not production VRAM measurements. Logits and serialized rollback states match exactly. EditorConfig and `git diff --check` pass. No HIP compiler or supported GPU is available locally.
+
+Re-use the saved `build-rocm-moe-before-verify-reserve` reference from `b8b49e07` and unchanged cache budgets. No new baseline copy or draft-width sweep is needed. Run this incremental fish block:
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-verify-reserve
+
+    test -x $before/reference/llama-server
+    and test -x $before/measure/llama-server
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-llama-archs -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm0 -s 42
+    and ./build-rocm-moe-stream-reference/bin/test-llama-archs --test-dflash-device-inputs --backend ROCm1 -s 42
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+Check that the normal 1023-row ingest no longer grows the draft reserve, Q8_0 dense kernels return to the original path, and Q6_K fused sections remain active. Updated HIP compilation, native fixture results, production probabilities/acceptance and performance remain physical checks. No production-branch merge is made.

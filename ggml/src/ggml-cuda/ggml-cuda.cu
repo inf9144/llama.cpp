@@ -5355,7 +5355,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
 #if defined(GGML_USE_HIP)
                 if (ok && up->op == GGML_OP_MUL_MAT &&
-                        (up->src[0]->type == GGML_TYPE_Q6_K || up->src[0]->type == GGML_TYPE_Q8_0) &&
+                        up->src[0]->type == GGML_TYPE_Q6_K &&
                         GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
                         ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
                         ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {

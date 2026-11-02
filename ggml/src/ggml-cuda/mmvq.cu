@@ -1077,7 +1077,7 @@ static void mul_mat_vec_q_switch_fusion(
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
     if constexpr (c_ncols_dst == 1
 #if defined(GGML_USE_HIP)
-            || (c_ncols_dst <= 4 && (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0))
+            || (c_ncols_dst <= 4 && type == GGML_TYPE_Q6_K)
 #endif
             ) {
         if (has_fusion) {
