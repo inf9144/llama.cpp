@@ -20,6 +20,7 @@ struct deferred_backend {
     int writes = 0;
     int writes_pending = 0;
     int writes_max = 0;
+    int event_waits = 0;
 
     explicit deferred_backend(bool async) {
         GGML_ASSERT(cpu);
@@ -46,6 +47,17 @@ struct deferred_backend {
         device.iface.supports_op = [](ggml_backend_dev_t dev, const ggml_tensor * op) {
             return ggml_backend_supports_op(static_cast<deferred_backend *>(dev->context)->cpu.get(), op);
         };
+        device.iface.event_new = [](ggml_backend_dev_t dev) {
+            return new ggml_backend_event{dev, nullptr};
+        };
+        device.iface.event_free = [](ggml_backend_dev_t, ggml_backend_event_t event) {
+            delete event;
+        };
+        device.iface.event_synchronize = [](ggml_backend_dev_t, ggml_backend_event_t event) {
+            if (event->context) {
+                ggml_backend_synchronize(static_cast<ggml_backend_t>(event->context));
+            }
+        };
         buft.device = &device;
 
         backend.device = &device;
@@ -67,6 +79,20 @@ struct deferred_backend {
             });
             return GGML_STATUS_SUCCESS;
         };
+        backend.iface.get_tensor_async = [](ggml_backend_t b, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+            auto * self = static_cast<deferred_backend *>(b->context);
+            self->pending.push_back([tensor, data, offset, size] {
+                memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+            });
+        };
+        backend.iface.event_record = [](ggml_backend_t b, ggml_backend_event_t event) {
+            event->context = b;
+        };
+        backend.iface.event_wait = [](ggml_backend_t b, ggml_backend_event_t event) {
+            // This fixture uses one deferred queue; FIFO order already satisfies its own events.
+            GGML_ASSERT(event->context == nullptr || event->context == b);
+            ++static_cast<deferred_backend *>(b->context)->event_waits;
+        };
         if (async) {
             backend.iface.set_tensor_async = [](ggml_backend_t b, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
                 auto * self = static_cast<deferred_backend *>(b->context);
@@ -84,12 +110,17 @@ struct copy_check {
     int calls = 0;
     float first = 0;
 
-    static bool check(ggml_backend_t, const ggml_tensor *, ggml_tensor *, ggml_cgraph * graph, void * data) {
+    static bool check(ggml_backend_t backend, const ggml_tensor *, ggml_tensor *, ggml_cgraph * graph, void * data) {
         auto & self = *static_cast<copy_check *>(data);
         auto * add = ggml_graph_node(graph, 0);
         GGML_ASSERT(add->op == GGML_OP_ADD);
         float first;
-        ggml_backend_tensor_get(add->src[0], &first, 0, sizeof(first));
+        // Order the read after queued compute, including GPU-only event waits.
+        ggml_backend_tensor_get_async(backend, add->src[0], &first, 0, sizeof(first));
+        ggml_backend_synchronize(backend);
+        if (first != self.first) {
+            fprintf(stderr, "%s scheduler callback: expected %g, got %g\n", ggml_backend_name(backend), self.first, first);
+        }
         GGML_ASSERT(first == self.first);
         ++self.calls;
         return false;
@@ -139,6 +170,9 @@ static void test_inputs(ggml_backend_t backend, bool parallel, bool computed, bo
     auto * graph = ggml_new_graph_custom(ctx.get(), 128, false);
     ggml_build_forward_expand(graph, result);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    if (deferred) {
+        deferred->event_waits = 0;
+    }
 
     copy_check check;
     if (weights) {
@@ -187,6 +221,9 @@ static void test_inputs(ggml_backend_t backend, bool parallel, bool computed, bo
     ggml_backend_sched_synchronize(sched.get());
     const bool transfers = !ggml_backend_supports_buft(backend, ggml_backend_get_default_buffer_type(cpu.get()));
     GGML_ASSERT(check.calls == (weights && transfers ? 6 : 0));
+    if (deferred && parallel && (computed || weights)) {
+        GGML_ASSERT(deferred->event_waits > 0);
+    }
     printf("%s scheduler inputs: width=%d parallel=%d computed=%d weights=%d async_set=%d producer=%s passed\n",
             ggml_backend_name(backend), width, parallel, computed, weights, backend->iface.set_tensor_async != nullptr,
             producer ? ggml_backend_name(producer) : "CPU");

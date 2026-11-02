@@ -1092,3 +1092,11 @@ end
 Local validation: CPU Release and Debug builds pass all 18 deferred-queue cases; the Debug run also enables AddressSanitizer and UBSan. LeakSanitizer cannot run under this environment's process tracing, so leak detection is disabled for that run. All nine real CPU-backend configurations pass. EditorConfig and `git diff --check` pass. No new Python or kernel code is introduced.
 
 The HIP build, both physical backend fixtures, production logits/DFlash acceptance, Vulkan execution and throughput/peak-allocation measurements remain open. This environment has no HIP SDK or physical GPU. No production-branch merge is made.
+
+### Test callback stream ordering
+
+The first physical run passes all deferred cases, the four ROCm0 width-1 configurations and the first two width-4 configurations, then fails the width-4 multiple-copy callback assertion. That scheduler branch retains the old execution path. The test's direct buffer getter does not order its read after the backend's queued compute: a GPU event wait orders the GPU queue, not the callback's CPU read. The callback now queues `tensor_get_async` on the supplied backend and synchronizes that backend before checking the value, matching the existing production MoE callback's readback pattern. Production code and numerical tolerances are unchanged.
+
+The deferred fixture now implements same-queue GPU events and queued reads. Its event wait preserves FIFO ordering without draining the CPU queue, while event synchronization can conservatively drain the queue. With these events the original callback reproduces the same assertion locally; after the readback correction all 18 cases pass again in Release and under ASan/UBSan (leak detection remains unavailable), as do the nine CPU configurations. Event-use assertions prevent silently falling back to the earlier no-event fixture.
+
+Only `test-backend-sched` needs rebuilding for this correction, with `-j28`. Keep the saved `build-rocm-moe-before-input-batching` baseline and the already built server binaries. Rerun the deferred fixture and both `--backend ... --peer ...` GPU commands, then resume the two completion controls and draft-3 A/B command above. The corrected physical GPU tests and subsequent model/performance results remain open.
