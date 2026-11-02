@@ -1100,3 +1100,71 @@ The first physical run passes all deferred cases, the four ROCm0 width-1 configu
 The deferred fixture now implements same-queue GPU events and queued reads. Its event wait preserves FIFO ordering without draining the CPU queue, while event synchronization can conservatively drain the queue. With these events the original callback reproduces the same assertion locally; after the readback correction all 18 cases pass again in Release and under ASan/UBSan (leak detection remains unavailable), as do the nine CPU configurations. Event-use assertions prevent silently falling back to the earlier no-event fixture.
 
 Only `test-backend-sched` needs rebuilding for this correction, with `-j28`. Keep the saved `build-rocm-moe-before-input-batching` baseline and the already built server binaries. Rerun the deferred fixture and both `--backend ... --peer ...` GPU commands, then resume the two completion controls and draft-3 A/B command above. The corrected physical GPU tests and subsequent model/performance results remain open.
+
+## 2026-11-02: finish small host uploads before peer dependencies
+
+### Results of the input-batching round
+
+The supplied console log passes all 18 deferred fixtures and all twelve configurations on each physical GPU, including peer copies in both directions. Completion handoffs `20261102-163129-895170` and `20261102-163359-542526` compare the saved input-batching baseline against the candidate at draft maxima 0 and 3. All repeated tokens, complete recorded top-32 probability arrays and prefix replays at 0 and 32 match exactly. The greedy draft-3 fixture accepts 87/118 drafts in both builds; the different performance request accepts 74/156 in all phases.
+
+Handoff `moe-decode-ab-20261102-163548-631482` has native build IDs `2974c1347` and `22552b3a7` in both measurement phases and the uninstrumented runs. The repository HEAD `050641b` is the later test-only correction, not a different server execution path. The numerical handoffs record different `libggml-base` hashes and the expected saved-library path prefixes despite identical main-executable hashes.
+
+| Uninstrumented metric | Baseline | Input batching |
+| --- | ---: | ---: |
+| Cold prefill tokens/s | 504.04 | 504.99 |
+| Warm prefill tokens/s | 574.51 | 584.78 |
+| Cold decode tokens/s | 22.97 | 23.56 |
+| Warm decode tokens/s | 36.38 | 37.09 |
+| Cold request seconds | 15.7226 | 15.5627 |
+| Warm request seconds | 12.4346 | 12.2101 |
+
+This is one A/B pair, not a stable-throughput or long-context guarantee. The profiled cold decode is slower instead. H2D bytes, compute reservations, GPU allocation peaks and all 539779 whole-session kernel dispatches are unchanged. The warm host trace has 2639 device lookups with no misses in both builds. Cache admission cannot remove more expert uploads from that captured warm-decode workload.
+
+Approximate decode windows again use HTTP monotonic end minus native `predicted_ms`. Warm stream synchronizations decrease from 10706 to 4053, but their time union only decreases from 2652.65 to 2592.45 ms. Intervals overlapping recorded GPU activity account for 1632.90 and 1610.37 ms, respectively. The durations include useful GPU work and profiler overhead, not removable CPU overhead. Grouping by graph-begin and first-reservation timestamps places 1223.93 ms of candidate waits longer than 0.5 ms inside target graph submission and 999.62 ms after it. Draft submission and its subsequent interval contain 147.83 and 108.62 ms. These are graph regions, not captured call stacks.
+
+### Transfer-order correction
+
+The source confirms an avoidable ordering in the single-copy input helper. A peer copy can enqueue an event wait on the destination stream before small host-input uploads. Completing the borrowed host reads at the end of that group then also waits for the earlier peer dependency. The CPU cannot submit the split's GPU work until that wait completes. The trace's peer/event/upload sequences are consistent with this mechanism; they do not establish a speedup bound.
+
+The helper now completes eligible small host-input uploads first, then submits all remaining non-weight inputs in their previous relative order. Only the existing asynchronous host-input path is moved: the 64-KiB limit, buffer-type checks, stage-pool settings, large-copy fallback, host expert callbacks and multiple-copy path are retained. The initial destination drain still protects previous readers. Borrowed host storage is fully read before caller return; existing device-copy events and source ordering protect peer data. No graph compute occurs between these input copies, and the allocator already places every split input before the split's compute nodes. No allocation plan, graph topology, arithmetic, cache policy or runtime switch changes. GPU calculation time remains necessary even when its CPU wait is moved out of graph submission.
+
+The new deferred peer fixture snapshots on the producer queue after its compute and consumes the snapshot on the destination queue. It reproduces the old host-upload completion draining that peer dependency, then verifies that the corrected helper submits compute without such a drain. It also checks six graph reuses, previous-reader protection and immediate host-input poisoning without timing thresholds. There are now 19 default cases. With `--peer`, the real-backend fixture adds a peer case without a host-weight callback at each width, retaining the existing callback case: fifteen configurations per selected GPU.
+
+Local validation passes all 19 cases in CPU Release and Debug with ASan/UBSan, plus all nine real CPU-backend configurations. Leak detection remains disabled because LeakSanitizer cannot run under this environment's process tracing. The old transfer order fails the new peer-drain assertion before this correction. EditorConfig, ASCII checks for changed C++ lines and `git diff --check` pass.
+
+### Hardware check
+
+Save the currently validated complete `bin` directories as a new baseline before rebuilding. Keep the earlier baseline folders. This round needs the short scheduler tests, one draft-3 completion diagnostic (including its non-speculative fixed-prefix replays), and the existing draft-3 A/B profile. It does not need a new MoE kernel or draft-width sweep.
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-host-input-order
+
+    if test -x $before/reference/llama-server; and test -x $before/measure/llama-server
+        echo "Vorherige Builds werden wiederverwendet: $before"
+    else
+        test ! -e $before
+        and mkdir $before
+        and cp -a build-rocm-moe-stream-reference/bin $before/reference
+        and cp -a build-rocm-moe-stream-measure/bin $before/measure
+    end
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-backend-sched -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched --backend ROCm0 --peer ROCm1
+    and ./build-rocm-moe-stream-reference/bin/test-backend-sched --backend ROCm1 --peer ROCm0
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+The new HIP build, physical peer tests, production numerical/acceptance comparison, Vulkan execution, end-to-end performance and allocation peaks remain hardware checks. No HIP SDK or physical GPU is available here. No production-branch merge is made.

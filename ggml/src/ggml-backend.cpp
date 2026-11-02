@@ -1866,46 +1866,57 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, struct gg
     // Keep large masks and embeddings out of upload staging.
     constexpr size_t input_size_max = 64*1024;
     ggml_backend_t backend = sched->backends[split->backend_id];
-    bool dst_ready = false;
-    bool inputs_pending = false;
-
-    for (int i = 0; i < split->n_inputs; ++i) {
-        struct ggml_tensor * input = split->inputs[i];
-        if (ggml_backend_sched_is_host_weight(input)) {
-            continue;
-        }
-        if (sched->n_copies != 1) {
-            ggml_backend_sched_copy_input(sched, split, input);
-            continue;
-        }
-
-        // No compute is submitted between these copies. Drain prior users of their storage once.
-        if (!dst_ready) {
-            ggml_backend_synchronize(backend);
-            dst_ready = true;
-        }
-
-        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
-        if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-            if (ggml_nbytes(input) <= input_size_max && ggml_backend_buffer_is_host(input->buffer) && backend->iface.set_tensor_async &&
-                    input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(backend)) {
-                ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
-                inputs_pending = true;
-            } else {
-                ggml_backend_tensor_copy(input, input_cpy);
-            }
-        } else {
-            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
-            if (!backend->iface.cpy_tensor_async || !backend->iface.cpy_tensor_async(input_backend, backend, input, input_cpy)) {
-                ggml_backend_synchronize(input_backend);
-                ggml_backend_tensor_copy(input, input_cpy);
+    if (sched->n_copies != 1) {
+        for (int i = 0; i < split->n_inputs; ++i) {
+            if (!ggml_backend_sched_is_host_weight(split->inputs[i])) {
+                ggml_backend_sched_copy_input(sched, split, split->inputs[i]);
             }
         }
+        return;
     }
 
-    // Complete borrowed host reads before callbacks or the caller can change the inputs.
-    if (inputs_pending) {
-        ggml_backend_synchronize(backend);
+    bool dst_ready = false;
+    // Finish borrowed host reads before other copies can enqueue waits for another GPU.
+    for (int pass = 0; pass < 2; ++pass) {
+        bool inputs_pending = false;
+        for (int i = 0; i < split->n_inputs; ++i) {
+            struct ggml_tensor * input = split->inputs[i];
+            if (ggml_backend_sched_is_host_weight(input)) {
+                continue;
+            }
+
+            struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+            const bool async_input = (input->flags & GGML_TENSOR_FLAG_INPUT) && ggml_nbytes(input) <= input_size_max &&
+                ggml_backend_buffer_is_host(input->buffer) && backend->iface.set_tensor_async &&
+                input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(backend);
+            if (async_input != (pass == 0)) {
+                continue;
+            }
+
+            // No compute is submitted between these copies. Drain prior users of their storage once.
+            if (!dst_ready) {
+                ggml_backend_synchronize(backend);
+                dst_ready = true;
+            }
+
+            if (async_input) {
+                ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                inputs_pending = true;
+            } else if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                ggml_backend_tensor_copy(input, input_cpy);
+            } else {
+                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+                if (!backend->iface.cpy_tensor_async || !backend->iface.cpy_tensor_async(input_backend, backend, input, input_cpy)) {
+                    ggml_backend_synchronize(input_backend);
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
+            }
+        }
+
+        // Complete borrowed host reads before callbacks or the caller can change the inputs.
+        if (inputs_pending) {
+            ggml_backend_synchronize(backend);
+        }
     }
 }
 

@@ -21,6 +21,8 @@ struct deferred_backend {
     int writes_pending = 0;
     int writes_max = 0;
     int event_waits = 0;
+    int peer_copies = 0;
+    int peer_drains = 0;
 
     explicit deferred_backend(bool async) {
         GGML_ASSERT(cpu);
@@ -66,6 +68,9 @@ struct deferred_backend {
         backend.iface.synchronize = [](ggml_backend_t b) {
             auto * self = static_cast<deferred_backend *>(b->context);
             ++self->synchronizations;
+            if (self->peer_copies > 0) {
+                ++self->peer_drains;
+            }
             for (auto & work : self->pending) {
                 work();
             }
@@ -187,6 +192,7 @@ static void test_inputs(ggml_backend_t backend, bool parallel, bool computed, bo
         check.first = expected;
         if (deferred) {
             deferred->synchronizations = deferred->writes = deferred->writes_max = 0;
+            deferred->peer_copies = deferred->peer_drains = 0;
         }
         GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
         if (deferred) {
@@ -194,6 +200,9 @@ static void test_inputs(ggml_backend_t backend, bool parallel, bool computed, bo
             GGML_ASSERT(deferred->writes == expected && deferred->writes_max == expected);
             if (!parallel && !weights) {
                 GGML_ASSERT(deferred->synchronizations == (expected ? 2 : 1));
+                if (producer) {
+                    GGML_ASSERT(deferred->peer_copies == 1 && deferred->peer_drains == 0);
+                }
             }
         }
 
@@ -245,6 +254,7 @@ int main(int argc, char ** argv) {
             test_inputs(backend.get(), false, true, true, width);
             test_inputs(backend.get(), true, false, true, width);
             if (peer) {
+                test_inputs(backend.get(), false, true, false, width, nullptr, peer.get());
                 test_inputs(backend.get(), false, true, true, width, nullptr, peer.get());
             }
         }
@@ -262,4 +272,25 @@ int main(int argc, char ** argv) {
         }
         test_inputs(&backend.backend, false, false, false, 1024, &backend);
     }
+    // A peer snapshot follows source compute; the destination wait must not enter host-upload completion.
+    deferred_backend producer(true), consumer(true);
+    consumer.backend.iface.cpy_tensor_async = [](ggml_backend_t src_backend, ggml_backend_t dst_backend,
+            const ggml_tensor * src, ggml_tensor * dst) {
+        if (src_backend == dst_backend || src_backend->iface.graph_compute != dst_backend->iface.graph_compute) {
+            return false;
+        }
+        auto * source = static_cast<deferred_backend *>(src_backend->context);
+        auto * target = static_cast<deferred_backend *>(dst_backend->context);
+        auto snapshot = std::make_shared<std::vector<uint8_t>>(ggml_nbytes(src));
+        source->pending.push_back([snapshot, src] {
+            memcpy(snapshot->data(), src->data, snapshot->size());
+        });
+        ++target->peer_copies;
+        target->pending.push_back([snapshot, src_backend, dst] {
+            ggml_backend_synchronize(src_backend);
+            memcpy(dst->data, snapshot->data(), snapshot->size());
+        });
+        return true;
+    };
+    test_inputs(&consumer.backend, false, true, false, 4, &consumer, &producer.backend);
 }
