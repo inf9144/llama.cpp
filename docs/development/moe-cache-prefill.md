@@ -774,7 +774,7 @@ and begin
     set -lx HIP_PATH $ROCM_PATH
     set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
     cmake -S . -B build-rocm-moe-stream-reference
-    and cmake --build build-rocm-moe-stream-reference --target test-qsa-topk-trace -j4
+    and cmake --build build-rocm-moe-stream-reference --target test-qsa-topk-trace -j28
     and python3 scripts/moe-measure/qsa_topk_diagnose.py --source-run results/moe-completion-diagnose-20261031-002803-346227
 end
 ```
@@ -823,7 +823,7 @@ On the existing configured HIP build, stop any running model server and run:
 
 ```fish
 git pull --ff-only
-and cmake --build build-rocm-moe-stream-reference --target llama-server test-qsa-topk-trace -j4
+and cmake --build build-rocm-moe-stream-reference --target llama-server test-qsa-topk-trace -j28
 and ./build-rocm-moe-stream-reference/bin/test-qsa-topk-trace --backend ROCm0
 and ./build-rocm-moe-stream-reference/bin/test-qsa-topk-trace --backend ROCm1
 and python3 scripts/moe-measure/qsa_topk_diagnose.py --source-run results/moe-completion-diagnose-20261031-002803-346227
@@ -872,7 +872,7 @@ begin
     and python3 -m unittest discover -s scripts/moe-measure -p test_completion_diagnose.py
     and cmake -S ../llama-moe-reference-correctness -B build-rocm-moe-corrected-reference -G Ninja \
         -C scripts/moe-measure/reference-options.cmake -DLLAMA_BUILD_TESTS=ON
-    and cmake --build build-rocm-moe-corrected-reference --target llama-server test-qsa-topk-trace ggml-hip -j4
+    and cmake --build build-rocm-moe-corrected-reference --target llama-server test-qsa-topk-trace ggml-hip -j28
     and ./build-rocm-moe-corrected-reference/bin/test-qsa-topk-trace --backend ROCm0
     and ./build-rocm-moe-corrected-reference/bin/test-qsa-topk-trace --backend ROCm1
     and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
@@ -893,9 +893,11 @@ begin
     set -lx ROCM_PATH $HOME/opt/rocm-10.1
     set -lx HIP_PATH $ROCM_PATH
     set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
-    cmake -S ../llama-moe-reference-correctness -B build-rocm-moe-corrected-measure -G Ninja \
+    cmake -S . -B build-rocm-moe-stream-measure -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and cmake -S ../llama-moe-reference-correctness -B build-rocm-moe-corrected-measure -G Ninja \
         -C scripts/moe-measure/reference-options.cmake -DLLAMA_BUILD_TESTS=ON
-    and cmake --build build-rocm-moe-corrected-measure --target llama-server ggml-hip -j4
+    and cmake --build build-rocm-moe-corrected-measure --target llama-server ggml-hip -j28
     and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
         --baseline-reference build-rocm-moe-corrected-reference/bin/llama-server \
         --baseline-measure build-rocm-moe-corrected-measure/bin/llama-server
@@ -905,3 +907,69 @@ end
 This performance step is separate from the initial controls. Keep existing model, cache budgets, prompt, batch and device settings unchanged. Throughput must be interpreted together with generated tokens and DFlash work; reference/candidate differences alone do not identify a waiting, transfer or kernel bottleneck.
 
 Validation limits for this preparation: the execution environment is unavailable. No new Python/CMake execution, CPU/HIP build, type/style checker or physical GPU test has run here. Source inspection and repository comparisons verify the four-file reference scope, the two exact production-file matches and the unchanged copied test. Two unit cases are added for relative and absolute/space-containing baseline binary overrides. The native reference build, copied tests, CMake option transfer and new Python cases remain to be executed. The production branch is not merged.
+
+## 2026-11-02: aligned correctness and first comparable throughput
+
+Build instructions for this Ryzen 9 7950X setup use `-j28`. The earlier profiler recipe omitted rebuilding the candidate measurement binary; it is corrected above. The executable bit on `stream-ab.py`, lost during the previous tooling-only update, is restored.
+
+### Numerical controls on gfx1100 and gfx1101
+
+The corrected reference at `55ee91f` passes all four synthetic cutoff fixtures and eight repetitions per fixture on each GPU. Completion handoffs `moe-completion-diagnose-20261102-091419-294786` and `moe-completion-diagnose-20261102-091652-931861` compare that reference against the unchanged candidate executable at `45d51cb`. Both use the same 5121 prompt token IDs. At draft maximum 0 and 3, both repetitions and both builds produce exactly the same 128 token IDs and all recorded top-32 probability rows. The prefix replays at 0 and 32 also match exactly between builds. All four draft-3 generations accept 87/118 draft tokens, or 73.73%, over forty rounds.
+
+Draft 0 and draft 3 choose the same output tokens, but their probability rows are not identical. The largest chosen-token log-probability difference is 0.12464; the largest shared top-32 difference is 1.42216. The corrected stock reference now reproduces the same differences exactly. This removes the evidence for an additional MoE-path numerical difference in these captured controls; it does not establish full-vocabulary logit equivalence, general acceptance invariance or equivalence for every input.
+
+### Throughput and build provenance
+
+Handoff `moe-decode-ab-20261102-091934-511712`, draft maximum 3, uses `55ee91f` against `45d51cb` for the uninstrumented `01-reference` phases. All four requests have 5121 prompt tokens, 128 completion tokens, content hash prefix `93595777`, and 74/156 accepted draft tokens (47.44%). These are comparable generation workloads within this run:
+
+| State | Metric | Corrected reference | Candidate | Change |
+| --- | --- | ---: | ---: | ---: |
+| Cold | Prefill tokens/s | 351.05 | 498.96 | +42.14% |
+| Warm | Prefill tokens/s | 456.12 | 579.40 | +27.03% |
+| Cold | Decode tokens/s | 22.00 | 23.05 | +4.76% |
+| Warm | Decode tokens/s | 34.93 | 36.06 | +3.22% |
+| Cold | Request seconds | 20.3910 | 15.8057 | -22.49% |
+| Warm | Request seconds | 14.8927 | 12.3901 | -16.80% |
+
+Changes use the underlying timing precision; rounded console rates can differ slightly. These are single cold/warm observations, not confidence intervals or long-context measurements. The different acceptance percentage from the numerical fixture belongs to a different request, not a contradiction between builds in this A/B run.
+
+The candidate `02-measure` and `03-profile` executables are still at `579880d`, before the cutoff and cropped-lookup service fixes. Their completions and draft counts differ from `01-reference`. The baseline uses the corrected `55ee91f` in all three phases. Therefore the candidate host byte counts, allocation peaks and GPU profile must not be presented as measurements of `45d51cb` or joined with its throughput as a current-build efficiency result. No profiler coverage warnings, unknown frees or unsupported allocation events are reported.
+
+### Decode timeline evidence and next target
+
+Raw profiler timestamps align with the HTTP monotonic request timestamps. Approximate decode windows use `monotonic_end_us - predicted_ms` through `monotonic_end_us`; the small HTTP/serialization tail is included. GPU durations below are interval unions per agent, not sums of overlapping activity. They describe the older candidate `579880d` and indicate where to inspect the current implementation:
+
+| Older candidate activity | Cold decode, 8.279 s | Warm decode, 4.238 s |
+| --- | ---: | ---: |
+| XTX non-`batchMemOp` kernel union | 0.850 s | 0.963 s |
+| XT non-`batchMemOp` kernel union | 0.931 s | 0.720 s |
+| XTX `batchMemOp` wait union | 2.715 s | 0.00389 s |
+| XT `batchMemOp` wait union | 1.301 s | 0.00279 s |
+| Host `hipStreamSynchronize` union | 6.751 s / 10854 calls | 2.708 s / 10849 calls |
+
+These are not additive wall-time components. Other wait helpers are included in the non-`batchMemOp` category; in particular, the cold XT window contains 0.218 s of `streamOpsWait`. Warm host-to-device copy unions are only 3.42 ms for the XTX and 4.76 ms for the XT; the XT-to-host copy union is 32.42 ms. The warm host records contain 2639 small-batch device lookups and no lookup misses. The corrected reference also has high host synchronization time: 2.782 s over 15690 calls in its 4.474 s warm decode window. Reducing the call count alone has not removed most of the waiting.
+
+In the older candidate's warm HIP trace, 212 synchronizations immediately follow an event-record/event-wait pair and occupy 1.430 s; many such waits last about 24 ms. A second group immediately follows memcpy/synchronize and occupies 1.104 s. API adjacency is not a call stack or proof of causality. These timings include useful GPU execution and instrumentation overhead, and are not an achievable speedup estimate. They prioritize inspection of backend-copy/split barriers and DFlash input/state handoffs ahead of further warm-cache admission tuning or another small GEMM specialization. Cross-layer dependencies, copy completion, slot lifetime and buffer reuse still require ordering.
+
+The older profile also records target compute reservations of 1176.75 -> 676.03 MiB on ROCm0, a 500.72 MiB difference, with ROCm1 unchanged at 646.23 MiB. The XTX process allocation peak differs by 445.25 MiB. These are old-build observations, not current physical-VRAM savings; allocation peaks include all HSA allocations and the two process peaks need not occur at corresponding execution points. Cache budgets remain unchanged.
+
+### One focused current-candidate profile
+
+No new native change is needed for the next capture. Rebuild only the candidate measurement executable using its existing ROCm cache, then collect only its `03-profile` phase. The test-tool-only `--candidate-profile-only` selection starts one fresh server with the same cold/warm fixture and archives the result; it requires no baseline or uninstrumented executable and emits no A/B throughput table. All candidate activation, acceptance, trace-completeness and profiler checks remain in place. Existing suite defaults are unchanged. Do not rerun the native correctness controls or the six-phase suite for this capture.
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+
+    git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-measure -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server ggml-hip -j28
+    and python3 scripts/moe-measure/stream-ab.py --candidate-profile-only --draft-max 3
+end
+```
+
+This capture can be compared with the existing corrected-reference profile for the same fixture. Its instrumented request timings remain diagnostic, not a replacement for uninstrumented throughput. A current trace must confirm the warm/cold bottlenecks before changing scheduler synchronization. No execution kernel, cache policy, graph, backend fallback or application runtime option is modified by this update.
+
+Local validation: 25 focused Python cases pass (9 stream-suite, 3 decode-wrapper and 13 completion-diagnostic cases), including a mocked controller run that needs only the candidate measurement binary, starts only `03-profile` and preserves the handoff archive. The Python type check, EditorConfig check, CLI help check and `git diff --check` pass. No native rebuild or GPU/model run is needed for these tooling/documentation changes; the new physical capture remains open. The feature branch is not merged into production.

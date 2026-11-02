@@ -375,12 +375,13 @@ def print_comparison(variants: dict) -> None:
     print("Bytezahlen sind HOST-instrumentiert, keine PCIe-Laufzeiten. Gleiche Hashes/Completion/DFlash prüfen.")
 
 
-def prepare_launchers(root: Path, suite: Path, arguments: argparse.Namespace) -> dict:
+def prepare_launchers(root: Path, suite: Path, arguments: argparse.Namespace,
+                      variants=("baseline", "candidate"), kinds=("reference", "measure")) -> dict:
     generated = {}
     pattern = r"(?m)^\s*\./build-rocm-moe-(?:reference|measure)/bin/llama-server(?=\s|$)"
-    for variant in ("baseline", "candidate"):
+    for variant in variants:
         generated[variant] = {}
-        for key in ("reference", "measure"):
+        for key in kinds:
             source = root / f"moe-server-{key}.fish"
             text = source.read_text()
             draft_max = getattr(arguments, "draft_max", None)
@@ -422,6 +423,7 @@ def main() -> int:
     p.add_argument("--output", type=Path)
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--profile", action="store_true", help="Auch ROCprofv3 auf beiden Varianten (Gesamt-Session) ausführen")
+    p.add_argument("--candidate-profile-only", action="store_true", help="Nur das Kandidaten-Profil mit Cold/Warm erfassen; keine Referenz- oder A/B-Durchläufe")
     p.add_argument("--draft-max", type=int, choices=range(1, 8), help="Bestehenden Draft-Parameter für beide Varianten gleich überschreiben")
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--startup-timeout", type=int, default=900)
@@ -431,13 +433,17 @@ def main() -> int:
         p.add_argument(f"--{key}-reference", type=Path, default=Path(paths[0]))
         p.add_argument(f"--{key}-measure", type=Path, default=Path(paths[1]))
     a = p.parse_args()
+    a.profile = a.profile or a.candidate_profile_only
+    variants = ("candidate",) if a.candidate_profile_only else ("baseline", "candidate")
+    phases = PHASES[2:] if a.candidate_profile_only else PHASES if a.profile else PHASES[:2]
+    kinds = tuple(dict.fromkeys(kind for _, kind, _ in phases))
     global PORT
     PORT = a.port
     root = a.repo.expanduser().resolve()
     if not root.is_dir():
         p.error(f"Repository nicht gefunden: {root}")
     needed = ["scripts/moe-measure/run.py", "scripts/moe-measure/analyze.py", "scripts/moe-measure/profile.py",
-              "moe-server-reference.fish", "moe-server-measure.fish"]
+              *(f"moe-server-{kind}.fish" for kind in kinds)]
     for path in needed:
         if not (root / path).is_file():
             p.error(f"Fehlende Datei: {root / path}")
@@ -468,10 +474,10 @@ def main() -> int:
     suite = (suite if suite.is_absolute() else root / suite).resolve()
     suite.mkdir(parents=True, exist_ok=False)
     (suite / "request.json").write_bytes(payload)
-    for name in ("reference", "measure"):
+    for name in kinds:
         shutil.copy2(root / f"moe-server-{name}.fish", suite / f"template-{name}.fish")
     try:
-        launchers = prepare_launchers(root, suite, a)
+        launchers = prepare_launchers(root, suite, a, variants, kinds)
     except ValueError as exc:
         p.error(str(exc))
     try:
@@ -486,13 +492,13 @@ def main() -> int:
         "binaries": {variant: {key: {k: v for k, v in entry.items() if k != "script"} for key, entry in xs.items()} for variant, xs in launchers.items()},
         "request_sha256": hashlib.sha256(payload).hexdigest(),
         "cache_prompt": False, "profile_enabled": a.profile, "candidate_activation_required": True, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "candidate_profile_only": a.candidate_profile_only,
         "draft_max_override": a.draft_max,
         "configuration": "Existing fish templates, SSD/RAM prompt cache off, same settings across variants."
     })
     report, errors = {}, []
-    phases = PHASES if a.profile else PHASES[:2]
     try:
-        for variant in ("baseline", "candidate"):
+        for variant in variants:
             report[variant] = {}
             for name, kind, profiler in phases:
                 say(f"=== {variant} / {name} ===")
@@ -514,7 +520,10 @@ def main() -> int:
     finally:
         json_write(suite / "suite-result.json", {"complete": not errors, "failures": errors})
         json_write(suite / "comparison.json", report)
-        print_comparison(report)
+        if a.candidate_profile_only:
+            say("Nur Kandidaten-Profil erfasst; keine uninstrumentierte A/B-Geschwindigkeitsmessung.")
+        else:
+            print_comparison(report)
         if not a.no_archive:
             try:
                 target = archive_suite(suite)

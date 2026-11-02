@@ -10,7 +10,7 @@ Keep your existing ROCm compiler, gfx1100/gfx1101, Flash Attention and all model
 
 ```sh
 cmake -S . -B build-rocm-moe-measure -DLLAMA_MOE_MEASURE=ON
-cmake --build build-rocm-moe-measure -j 4
+cmake --build build-rocm-moe-measure -j28
 ```
 
 The first command is illustrative: pass the same HIP/toolchain/options as the existing build when creating a new directory. A fresh configuration does not inherit another directory's settings. `LLAMA_MOE_MEASURE` defaults OFF and is private to libllama; no runtime environment variable or CLI switch is added. OFF compiles all hooks out.

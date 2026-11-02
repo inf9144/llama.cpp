@@ -2,9 +2,13 @@ import contextlib
 import argparse
 import importlib.util
 import io
+import json
 from pathlib import Path
+import sys
+import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('stream_ab', Path(__file__).with_name('stream-ab.py'))
 assert spec is not None and spec.loader is not None
@@ -18,6 +22,41 @@ LINKS = ('ROCm0 host link = 16.0 GT/s x16, limiting device 0000:03:00.0 (GPU 000
 
 
 class StreamActivationTests(unittest.TestCase):
+    def test_candidate_profile_only_needs_no_baseline_or_reference_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / 'scripts/moe-measure').mkdir(parents=True)
+            for name in ('run.py', 'analyze.py', 'profile.py'):
+                (root / 'scripts/moe-measure' / name).touch()
+            binary = root / 'candidate-measure'
+            binary.write_bytes(b'candidate measurement binary')
+            (root / 'moe-server-measure.fish').write_text(
+                './build-rocm-moe-measure/bin/llama-server --cache-ram 0 --spec-draft-n-max 3\n')
+            (root / 'request.json').write_text(json.dumps({'cache_prompt': False, 'stream': False, 'seed': 42}))
+            argv = ['stream-ab.py', '--repo', str(root), '--output', 'suite', '--request', 'request.json',
+                    '--candidate-profile-only', '--draft-max', '3', '--candidate-measure', str(binary)]
+            with patch.object(sys, 'argv', argv), patch.object(runner, 'port_open', return_value=False), \
+                    patch.object(runner.shutil, 'which', return_value='/mock/tool'), \
+                    patch.object(runner.subprocess, 'check_output', return_value='test-head\n'), \
+                    patch.object(runner, 'run_phase', return_value={'requests': {}}) as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.main(), 0)
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[2], '03-profile')
+            self.assertTrue(run.call_args.args[4])
+            self.assertTrue(run.call_args.kwargs['candidate'])
+            suite = root / 'suite'
+            self.assertEqual(list(json.loads((suite / 'comparison.json').read_text())), ['candidate'])
+            self.assertTrue(json.loads((suite / 'suite-result.json').read_text())['complete'])
+            metadata = json.loads((suite / 'suite.json').read_text())
+            self.assertEqual(list(metadata['binaries']), ['candidate'])
+            self.assertEqual(list(metadata['binaries']['candidate']), ['measure'])
+            self.assertTrue(metadata['profile_enabled'])
+            self.assertTrue(metadata['candidate_profile_only'])
+            self.assertNotIn('A/B-VERGLEICH', output.getvalue())
+            with tarfile.open(root / 'suite-handoff.tar.gz') as archive:
+                self.assertIn('suite/launch-candidate-measure.fish', archive.getnames())
+
     def test_draft_override_is_identical_for_both_variants(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
