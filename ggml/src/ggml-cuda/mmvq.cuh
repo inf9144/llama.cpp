@@ -4,6 +4,18 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+static inline bool ggml_cuda_mmvq_dense_glu_batch(ggml_type type, int cc, int64_t ncols) {
+#if defined(GGML_USE_HIP)
+    return GGML_CUDA_CC_IS_RDNA3_0(cc) && ncols >= 2 && ncols <= 4 &&
+           (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0);
+#else
+    GGML_UNUSED(type);
+    GGML_UNUSED(cc);
+    GGML_UNUSED(ncols);
+    return false;
+#endif
+}
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

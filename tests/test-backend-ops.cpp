@@ -8168,6 +8168,14 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_verify_glu : public test_mul_mat_vec_fusion {
+    test_mul_mat_verify_glu(ggml_type type, int64_t tokens, int64_t rows, int64_t cols, bool bias = false)
+        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, rows, cols,
+                false, 1, 1, false, bias, true, false, { 1, 1 }) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_VERIFY_GLU"; }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12800,6 +12808,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
+
+    for (auto type : { GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (int tokens : { 1, 2, 3, 4, 5, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_verify_glu(type, tokens, 33, 2560));
+        }
+        test_cases.emplace_back(new test_mul_mat_verify_glu(type, 4, 1536, 2560));
+        test_cases.emplace_back(new test_mul_mat_verify_glu(type, 4, 33, 2560, true));
+    }
+    test_cases.emplace_back(new test_mul_mat_verify_glu(GGML_TYPE_Q8_0, 3, 33, 640));
 
     // Fused gate/up + GLU on the MMQ path, only used if its tiling is efficient: ~1280 tiles per case, one case per type and GLU op.
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17, 81920, 256, false, 1, 1, false, false, true, false, { 1, 1 }));

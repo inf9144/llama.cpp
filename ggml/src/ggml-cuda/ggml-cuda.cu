@@ -2060,7 +2060,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool dense_glu_batch = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2077,9 +2077,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
-        return false;
+        if (!dense_glu_batch || !ggml_cuda_mmvq_dense_glu_batch(src0->type, cc, dst->ne[1]) ||
+                !ggml_is_matrix(src0) || !ggml_is_matrix(src1) ||
+                !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+            return false;
+        }
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -4682,7 +4685,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -5351,6 +5354,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
 #if defined(GGML_USE_HIP)
+                if (ok && up->op == GGML_OP_MUL_MAT &&
+                        (up->src[0]->type == GGML_TYPE_Q6_K || up->src[0]->type == GGML_TYPE_Q8_0) &&
+                        GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+                    add_alloc_deps(i, i + 2);
+                    i += 2;
+                    continue;
+                }
                 // MMVQ also reads the activation and slot IDs until the fused GLU writes.
                 // Keep this independent of token count so reserve and decode agree.
                 if (ok && GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
