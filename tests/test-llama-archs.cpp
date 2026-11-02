@@ -1687,7 +1687,7 @@ static void test_dflash_reservation(llama_model * model, llama_model * measure_m
 
 // Exercise device staging/gathers on the CPU backend as a numerical oracle. This
 // deliberately calls the internal staging method: automatic CPU use stays off.
-static int test_dflash_device_inputs(size_t seed, float stdev, const char * backend_name) {
+static int test_dflash_device_inputs(size_t seed, float stdev, const char * backend_name, int n_seqs) {
     auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, 4096);
     auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false, 4096);
     // Five feature streams keep the target small while exercising F1 concatenation.
@@ -1709,7 +1709,9 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                                               ggml_backend_dev_by_name(backend_name);
     GGML_ASSERT(dev);
     const bool gpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
-    const int n_seqs = gpu ? 1 : 2;
+    if (gpu && n_seqs != 1) {
+        return 0;
+    }
     ggml_backend_dev_t devices[] = { gpu ? dev : nullptr, nullptr };
     mp.devices = devices;
     mp.n_gpu_layers = gpu ? 99 : 0;
@@ -1723,6 +1725,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
     GGML_ASSERT(measure_draft);
     const int width = llama_model_n_embd(target.get());
 
+    bool reserve_ok = true;
     for (auto kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         auto cp = llama_context_default_params();
         cp.n_ctx = 256;
@@ -1740,7 +1743,9 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
         GGML_ASSERT(tgt->prepare_layer_inputs_device(dev));
         cp.n_ubatch = 16;
         cp.ctx_other = tgt.get();
-        test_dflash_reservation(draft.get(), measure_draft.get(), cp);
+        if (n_seqs == 1) {
+            test_dflash_reservation(draft.get(), measure_draft.get(), cp);
+        }
         llama_context_ptr host(llama_init_from_model(draft.get(), cp));
         llama_context_ptr device(llama_init_from_model(draft.get(), cp));
         GGML_ASSERT(host && device);
@@ -1753,8 +1758,28 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
             ctx->sched_reserve();
         }
         const auto device_reserve = device->memory_breakdown();
+        auto previous_compute = device_reserve;
+        const auto check_reserve = [&](const char * phase, int count, int offset) {
+            if (n_seqs != 1) {
+                return;
+            }
+            for (const auto & entry : device->memory_breakdown()) {
+                const auto initial = device_reserve.find(entry.first);
+                const auto previous = previous_compute.find(entry.first);
+                if (initial == device_reserve.end() || entry.second.compute > initial->second.compute) {
+                    reserve_ok = false;
+                    if (previous == previous_compute.end() || entry.second.compute > previous->second.compute) {
+                        fprintf(stderr, "DFlash2 reserve growth: backend=%s KV=%s phase=%s tokens=%d offset=%d buft=%s initial=%zu previous=%zu current=%zu bytes\n",
+                                ggml_backend_dev_name(dev), ggml_type_name(kv), phase, count, offset,
+                                ggml_backend_buft_name(entry.first), initial == device_reserve.end() ? 0 : initial->second.compute,
+                                previous == previous_compute.end() ? 0 : previous->second.compute, entry.second.compute);
+                    }
+                }
+                previous_compute[entry.first].compute = entry.second.compute;
+            }
+        };
         int pos = 0;
-        for (int count : { gpu ? 31 : 15, 1, 4 }) {
+        for (int count : { n_seqs == 1 ? 31 : 15, 1, 4 }) {
             common_batch in(tgt.get());
             for (int i = 0; i < count; ++i) {
                 // Interleaving forces the recurrent target to reorder rows across ubatches.
@@ -1792,6 +1817,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                 const int32_t n_chunk = std::min(n_ubatch, in.size() - offset);
                 GGML_ASSERT(llama_dflash_inject_device(device.get(), dev_in.get_sub_batch(offset, n_chunk)) == 0);
                 GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
+                check_reserve("F1-device", n_chunk, offset);
                 GGML_ASSERT(llama_process(host.get(), LLAMA_PROCESS_TYPE_DECODE, host_in.get_sub_batch(offset, n_chunk)) == 0);
             }
             pos += count;
@@ -1803,6 +1829,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                 GGML_ASSERT(llama_state_seq_get_data(device.get(), b.data(), bytes, seq) == bytes);
                 GGML_ASSERT(a == b);
             }
+            check_reserve("state-readback", count*n_seqs, 0);
             // Alternate row-index injections and noise token batches of the same width.
             std::vector<float> lattice[2];
             int which = 0;
@@ -1814,6 +1841,9 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                     }
                 }
                 GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, noise.get()) == 0);
+                if (ctx == device.get()) {
+                    check_reserve("F2-noise", noise.size(), 0);
+                }
                 const auto * embd = llama_get_embeddings_nextn(ctx);
                 GGML_ASSERT(embd);
                 lattice[which++].assign(embd, embd + n_seqs*4*llama_model_n_embd_out(draft.get()));
@@ -1822,20 +1852,18 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                 }
             }
             GGML_ASSERT(lattice[0] == lattice[1]);
-            if (gpu) {
-                for (const auto & entry : device->memory_breakdown()) {
-                    const auto it = device_reserve.find(entry.first);
-                    GGML_ASSERT(it != device_reserve.end() && entry.second.compute <= it->second.compute);
-                }
-            }
+            check_reserve("rollback", count*n_seqs, 0);
         }
         common_batch invalid(device.get());
         invalid.add(31, pos, 0, false);
         GGML_ASSERT(llama_dflash_inject_device(device.get(), invalid.get()) == -1);
         GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
-        printf("DFlash2 device/host inputs: permuted rows, chunking, K/V bytes, selector lattice and graph-mode transitions KV=%s passed\n", ggml_type_name(kv));
+        printf("DFlash2 device/host inputs: numerical checks passed, KV=%s n_seqs=%d\n", ggml_type_name(kv), n_seqs);
     }
-    return 0;
+    if (!reserve_ok) {
+        fprintf(stderr, "DFlash2 reserve check failed: compute buffers grew beyond their initial reservation\n");
+    }
+    return reserve_ok ? 0 : 1;
 }
 
 static int test_dflash_vision(size_t seed, float stdev, int tail_mode = -1) {
@@ -3063,7 +3091,10 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (dflash_device_inputs) {
-            return test_dflash_device_inputs(seed, stdev, target_backend);
+            if (test_dflash_device_inputs(seed, stdev, target_backend, 1) != 0) {
+                return 1;
+            }
+            return test_dflash_device_inputs(seed, stdev, target_backend, 2);
         }
         if (dflash_vision) {
             return test_dflash_vision(seed, stdev);

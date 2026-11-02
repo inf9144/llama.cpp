@@ -1275,6 +1275,10 @@ The updated fixture passes locally in CPU Release and Debug ASan/UBSan builds (L
 
 Fixture correction on 2026-11-03: the initial 31-row GPU case incorrectly submitted all rows in one non-causal call with `n_ubatch=16`. The test now splits both device and host F1 calls at the ubatch boundary, matching the speculative caller. Its two-sequence CPU case uses 15 positions per sequence (30 rows), reproducing the same assertion before the fix and checking 16/14-row calls afterward; the single-sequence GPU case uses 16/15-row calls. Only the test and this document change; native GPU validation remains open.
 
+The next hardware trial at `66867df` reaches the compute-buffer no-growth assertion. Its stack trace does not identify the buffer type, phase or byte increase, so the cause remains unresolved. The fixture now reports each new high-water beyond the initial bound after device F1 chunks, state readback, F2 noise and rollback, including backend, KV type, chunk width/offset and initial/previous/current bytes. It completes the remaining numerical checks and returns a failure code if any compute buffer exceeded the original bound. The bound is not relaxed. These reports exist only in the test binary; production execution and reservation are unchanged.
+
+CPU coverage now includes both single-sequence optimized reservation and the existing two-sequence fallback. Both F16/Q8_0 cases pass in Release and Debug ASan/UBSan builds. The single-sequence CPU compute reservation remains unchanged through the tested cycles (246336 bytes for F16, 328256 for Q8_0). This does not reproduce the GPU growth. The next required input is the native `DFlash2 reserve growth:` report, not another end-to-end benchmark.
+
 Re-use the saved `build-rocm-moe-before-verify-reserve` reference from `b8b49e07` and unchanged cache budgets. No new baseline copy or draft-width sweep is needed. Run this incremental fish block:
 
 ```fish
