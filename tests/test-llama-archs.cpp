@@ -1754,7 +1754,7 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
         }
         const auto device_reserve = device->memory_breakdown();
         int pos = 0;
-        for (int count : { gpu ? 31 : 7, 1, 4 }) {
+        for (int count : { gpu ? 31 : 15, 1, 4 }) {
             common_batch in(tgt.get());
             for (int i = 0; i < count; ++i) {
                 // Interleaving forces the recurrent target to reorder rows across ubatches.
@@ -1786,9 +1786,14 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
                 const llama_pos p[4] = { tok.pos[0], tok.pos[0], tok.pos[0], 0 };
                 host_in.add_embd({ features.data() + (size_t) i*width*n_features, 1, (size_t) width*n_features }, p, tok.seq_id, false);
             }
-            GGML_ASSERT(llama_dflash_inject_device(device.get(), dev_in.get()) == 0);
-            GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
-            GGML_ASSERT(llama_process(host.get(), LLAMA_PROCESS_TYPE_DECODE, host_in.get()) == 0);
+            // Non-causal F1 calls must fit in one ubatch, as in the speculative caller.
+            const int32_t n_ubatch = (int32_t) llama_n_ubatch(device.get());
+            for (int32_t offset = 0; offset < in.size(); offset += n_ubatch) {
+                const int32_t n_chunk = std::min(n_ubatch, in.size() - offset);
+                GGML_ASSERT(llama_dflash_inject_device(device.get(), dev_in.get_sub_batch(offset, n_chunk)) == 0);
+                GGML_ASSERT(!device->get_cparams().dflash_device_inputs);
+                GGML_ASSERT(llama_process(host.get(), LLAMA_PROCESS_TYPE_DECODE, host_in.get_sub_batch(offset, n_chunk)) == 0);
+            }
             pos += count;
             for (int seq = 0; seq < n_seqs; ++seq) {
                 const size_t bytes = llama_state_seq_get_size(host.get(), seq);

@@ -1273,6 +1273,8 @@ The focused fixture now uses five feature streams, 1024-row capacity and F1 widt
 
 The updated fixture passes locally in CPU Release and Debug ASan/UBSan builds (LeakSanitizer disabled because of the container's ptrace restriction). Compact/full-noise CPU compute reservations are 15765504/22188032 bytes with F16 KV and 15847424/22925312 bytes with Q8_0 KV; these fixture sizes are not production VRAM measurements. Logits and serialized rollback states match exactly. EditorConfig and `git diff --check` pass. No HIP compiler or supported GPU is available locally.
 
+Fixture correction on 2026-11-03: the initial 31-row GPU case incorrectly submitted all rows in one non-causal call with `n_ubatch=16`. The test now splits both device and host F1 calls at the ubatch boundary, matching the speculative caller. Its two-sequence CPU case uses 15 positions per sequence (30 rows), reproducing the same assertion before the fix and checking 16/14-row calls afterward; the single-sequence GPU case uses 16/15-row calls. Only the test and this document change; native GPU validation remains open.
+
 Re-use the saved `build-rocm-moe-before-verify-reserve` reference from `b8b49e07` and unchanged cache budgets. No new baseline copy or draft-width sweep is needed. Run this incremental fish block:
 
 ```fish
