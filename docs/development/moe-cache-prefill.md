@@ -1560,3 +1560,49 @@ Two local CMake regression tests pass: an existing cache with `/opt/rocm` packag
 The next attempt reveals that the child Fish process supplies `/opt/rocm` despite the parent shell's ROCM_PATH pointing at 10.1. Startup configuration is one possible source, not established from the workstation files. The helper now requires `~/opt/rocm-10.1` explicitly and has no environment-driven fallback to the old SDK. When a benchmark cache records a different compiler, `cmake --fresh` recreates its generated configuration with all required build options. After configuration the script checks HIP, the compiler path and instrumentation mode before building. The baseline snapshot and normal `build-rocm10` are retained. Five tests run the actual Fish script with mock compiler/build commands and cover a startup SDK override, the stale compiler, repeated invocation, preserved baseline, missing SDK and failed post-configuration checks. No HIP compilation or model execution is involved in these tests.
 
 Resume with `git pull --ff-only` followed by `fish --no-config scripts/moe-measure/run_expert_group.fish`. The recovery uses CMake 3.24 or newer for `--fresh`; builds still use `-j28`.
+
+## 2026-11-03: grouped-expert hardware results and sampling
+
+The `moe-expert-group-check-20261103-155645` and `moe-decode-ab-20261103-155855-187602` handoffs compare the saved HC baseline `3aaaa9899` with candidate `8bafd739a`. The recorded build properties and binary-specific library paths identify different implementations. These results supersede the open hardware checks for the grouped candidate above.
+
+### Numerical checks
+
+All 240 native cases on gfx1100/gfx1101 have zero changed values and zero maximum absolute error, across six quantization formats and five routing patterns. The backend cache/GLU cases pass 16/16 on each GPU. At draft maximum 3, all four greedy generations have identical 128-token sequences and complete recorded top-32 probability arrays. The fixed-prefix next-token replays at 0 and 32 also match exactly. This checks the reported probabilities, not full-vocabulary raw logits.
+
+All twelve custom-sampling performance requests produce content hash prefix `93595777` and accept 74/156 draft tokens. All four manufacturer-sampling requests produce hash prefix `cc6836d7` and accept 81/135 drafts. Each request has 5121 prompt tokens, 128 completion tokens and no prompt-cache hit. Different output text between sampling profiles is expected.
+
+### Production timing and dispatch decision
+
+Uninstrumented generation rates and warm request times are:
+
+| Sampling | Build | Cold decode (tokens/s) | Warm decode (tokens/s) | Warm request (s) | Accepted/drafted |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Custom | Baseline | 23.67 | 36.99 | 12.284 | 74/156 (47.4%) |
+| Custom | Grouped candidate | 23.05 | 36.87 | 12.101 | 74/156 (47.4%) |
+| Manufacturer | Baseline | 29.87 | 63.65 | 10.487 | 81/135 (60.0%) |
+| Manufacturer | Grouped candidate | 32.25 | 61.88 | 10.605 | 81/135 (60.0%) |
+
+The grouped path is active in the production GPU trace. The warm request adds 5086 selector launches, totaling 36.93 ms of GPU duration across both devices; their medians are 6.76 us on gfx1100 and 6.96 us on gfx1101. This is summed kernel work, not additive request-wall time. IQ4_NL matmul medians increase from 49.24 to 62.04 us on gfx1100 and from 62.48 to 80.04 us on gfx1101, before including selection. Other formats often save less than the selection cost. Baseline outliers distort summed durations, so those sums do not justify selective per-format activation.
+
+The native performance fixture used K=2560/M=512 for gate/up and K=512/M=2560 for down, with a shared-expert case for gate/up. The production model instead has expert FFN width 640: K=2560/M=640 and K=640/M=2560. The native legacy reference also omits unused bias/scale machinery. These fixtures establish correctness for their tested shapes, but are not a matched production performance comparison. A future grouped candidate must correct that benchmark coverage before using it for dispatch decisions.
+
+The trace shows no memory or transfer saving from grouping. Allocation peaks increase by about 15 KiB on gfx1100 and 9 KiB on gfx1101; expert H2D totals stay at 115.0606 GiB cold and 100.0683 GiB warm, with zero expert D2D bytes for both builds. Small-batch expert uploads are already avoided by cache hits in this warm workload. The large-prefill path is unchanged; the single A/B pair does not establish that its measured prefill variation is caused by grouping. The saved baseline's full CMake cache is not available to establish identical build settings.
+
+The automatic grouped dispatch and its include are removed from `mmvq.cu`. That file is byte-identical to the HC baseline at `3c99b6d38bff6b04cb83c505207008665f998abe`. The experimental header remains reachable only from the native test, for review and possible future work. No runtime switch is added. The earlier cache, bounded staging, prefill placement, HC fusion, deterministic TopK and DFlash reservation changes remain in use. This experiment does not provide a demonstrated end-to-end decode improvement.
+
+### Sampling comparison
+
+On the same candidate, changing the request sampling profile raises warm decode from 36.87 to 61.88 tokens/s (+67.8%) and acceptance from 47.4% to 60.0% (+12.6 percentage points). Warm decode time decreases from 3444.648 to 2052.428 ms; whole-request wall time decreases from 12.1012 to 10.6045 s (-12.4%). The baseline also benefits, so the sampling gain does not depend on the grouped kernel.
+
+The actual sampler traces confirm top-k 20, top-p 0.95 and temperature 1.0, with DynaTemp, DRY and Top Sigma disabled. Target backend sampling is off in both profiles. Server `/props` describes startup defaults rather than per-request overrides; the request bodies and execution logs verify the applied profiles. This single-prompt comparison changes generated text and routing, measures no answer quality, has no manufacturer-profile GPU trace, and does not isolate CPU sampler time or the contribution of individual samplers. Its rates must not be extrapolated to long contexts.
+
+Replacing the entire custom CLI block requires only the following settings with this fork's defaults; the benchmark's explicit `top_k;top_p;temperature` chain is optional because the other stages are inactive by default:
+
+```fish
+    --temp 1.00 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --min-p 0.00 \
+```
+
+The comparison script leaves the user's normal sampling settings unchanged. The restoration is checked with byte comparison against the pre-group source, `git diff --check` and EditorConfig. No local HIP SDK or physical GPU is available, so there is no new local HIP build or GPU run for this restoration. It returns to the implementation already measured as the hardware baseline; another identical full profiling run is not required. The feature branch remains separate from `codex-compat`.
