@@ -869,6 +869,7 @@ struct llm_graph_params {
     llm_graph_result * res;
 
     bool reserve = false;
+    bool dflash_reserve_owned_inputs = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -935,6 +936,7 @@ struct llm_graph_params {
 
         return
             reserve                         == other.reserve                         &&
+            dflash_reserve_owned_inputs      == other.dflash_reserve_owned_inputs      &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&

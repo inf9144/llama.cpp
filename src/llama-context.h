@@ -47,6 +47,7 @@ enum class llama_dflash_input {
     NOISE,
     HOST,
     DEVICE,
+    DEVICE_OWNED,
 };
 
 struct llama_context {

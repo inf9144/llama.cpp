@@ -1306,3 +1306,20 @@ end
 ```
 
 Check that the normal 1023-row ingest no longer grows the draft reserve, Q8_0 dense kernels return to the original path, and Q6_K fused sections remain active. Updated HIP compilation, native fixture results, production probabilities/acceptance and performance remain physical checks. No production-branch merge is made.
+
+## 2026-11-03: external F1 source lifetime
+
+The follow-up on gfx1100 and gfx1101 identifies the same increase on both cards, at the first 16-row device F1 chunk:
+
+| KV | Initial GPU compute | First F1 peak | Increase |
+| --- | ---: | ---: | ---: |
+| F16 | 164480 bytes | 180864 bytes | 16384 bytes |
+| Q8_0 | 246400 bytes | 262784 bytes | 16384 bytes |
+
+All native K/V, selector and graph-transition numerical checks pass. The 1023/1024-row reservation fixture also passes on both GPUs. This failure is at a full F1 chunk, not a new query-width or partial-batch boundary; it does not justify another shape threshold or a fixed 16-KiB margin.
+
+The original device F1 measure graph allocates its synthetic source tensors inside the compute allocator. Runtime source tensors already occupy external target staging. These cases have different source lifetimes and allocator reuse, so the first layout is not a guaranteed upper bound for the second. The reserve now measures both layouts for the full and nearly full F1 widths. The external layout uses a zero-byte backend buffer descriptor owned by the graph input, following ggml's existing no-allocation planning convention. It creates no source payload or VRAM allocation, and the graph is never executed.
+
+The original owned-source measure remains in the per-backend maximum, preserving its conservative source-storage budget for fit. F2 recovery still measures only bounded noise; global packed KQ-mask reservation, runtime attention arithmetic and cache policy are unchanged. There are no new user controls or caches.
+
+The focused fixture additionally verifies that no-allocation fit estimates cover separate owned/external F1 measurements for every backend buffer type. CPU Release and Debug ASan/UBSan pass for F16/Q8_0, single and multiple sequences, full/partial F1 ingestion, logits, selector lattice and serialized rollback (LeakSanitizer disabled because of the container's ptrace restriction). Its compute sizes are unchanged. Native validation of the new source-lifetime measure remains open: the existing GPU no-growth check must now pass with the higher peak covered at initialization. A subsequent production A/B run is still needed; no speedup is claimed for this reservation correction.

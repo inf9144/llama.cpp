@@ -1276,7 +1276,7 @@ ggml_cgraph * llama_context::graph_reserve_dflash(const llama_memory_context_i *
     };
 
     // A nearly full F1 batch can need more storage due to allocator placement.
-    for (auto input : { llama_dflash_input::HOST, llama_dflash_input::DEVICE }) {
+    for (auto input : { llama_dflash_input::HOST, llama_dflash_input::DEVICE_OWNED, llama_dflash_input::DEVICE }) {
         if (n_tokens > 1 && !reserve(n_tokens - 1, input)) {
             return nullptr;
         }
@@ -3174,7 +3174,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
     gparams.reserve = true;
-    gparams.cparams.dflash_device_inputs = dflash_input == llama_dflash_input::DEVICE;
+    gparams.dflash_reserve_owned_inputs = dflash_input == llama_dflash_input::DEVICE_OWNED;
+    gparams.cparams.dflash_device_inputs = dflash_input == llama_dflash_input::DEVICE || gparams.dflash_reserve_owned_inputs;
 
     // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
     // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a

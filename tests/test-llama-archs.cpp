@@ -1628,6 +1628,20 @@ static void test_dflash_reservation(llama_model * model, llama_model * measure_m
         const auto it = estimate.find(entry.first);
         GGML_ASSERT(it != estimate.end() && it->second.compute >= entry.second.compute);
     }
+    // Fit must cover both external sources and the conservative source-storage budget.
+    const auto sched = measured->get_sched();
+    std::vector<size_t> sizes(ggml_backend_sched_get_n_backends(sched));
+    auto measure_mctx = measured->get_memory()->init_full();
+    for (auto input : { llama_dflash_input::DEVICE_OWNED, llama_dflash_input::DEVICE }) {
+        GGML_ASSERT(measured->graph_reserve(cp.n_ubatch, 1, 1, measure_mctx.get(), true, sizes.data(),
+                measured->kq_mask_packed_reachable(), input));
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            const auto backend = ggml_backend_sched_get_backend(sched, i);
+            const auto buft = ggml_backend_sched_get_buffer_type(sched, backend);
+            const auto it = estimate.find(buft);
+            GGML_ASSERT(it != estimate.end() && it->second.compute >= sizes[i]);
+        }
+    }
     GGML_ASSERT(compact->kq_mask_packed_reachable());
     GGML_ASSERT(compact->get_gf_res_reserve()->get_logits()->ne[1] == 4);
     auto mctx = reference->get_memory()->init_full();
