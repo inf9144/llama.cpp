@@ -6,8 +6,9 @@ if test (git branch --show-current) != feature/moe-cache-prefill
     exit 1
 end
 set -l rocm $HOME/opt/rocm-10.1
-if set -q ROCM_PATH
-    set rocm $ROCM_PATH
+if not test -x $rocm/bin/amdclang++; or not test -d $rocm/include/hip
+    echo "Expected ROCm 10.1 SDK at $rocm" >&2
+    exit 1
 end
 set -lx ROCM_PATH $rocm
 set -lx HIP_PATH $rocm
@@ -27,10 +28,38 @@ end
 
 echo "Checking HIP headers from $rocm"
 printf '#include <hip/hip_bf16.h>\n' | $rocm/bin/amdclang++ --rocm-path=$rocm --hip-path=$rocm -I$rocm/include --offload-arch=gfx1100 -D__HIP_PLATFORM_AMD__=1 -std=c++17 -x hip -fsyntax-only -; or exit 1
-cmake -S . -B build-rocm-moe-stream-reference "-DCMAKE_HIP_COMPILER=$rocm/bin/amdclang++" "-DCMAKE_PREFIX_PATH=$rocm" -C scripts/moe-measure/rocm-sdk-options.cmake -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON; or exit 1
-cmake --build build-rocm-moe-stream-reference --target llama-server test-hip-mmvq-moe test-backend-ops -j28; or exit 1
-cmake -S . -B build-rocm-moe-stream-measure "-DCMAKE_HIP_COMPILER=$rocm/bin/amdclang++" "-DCMAKE_PREFIX_PATH=$rocm" -C scripts/moe-measure/rocm-sdk-options.cmake -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON; or exit 1
-cmake --build build-rocm-moe-stream-measure --target llama-server -j28; or exit 1
+for phase in reference measure
+    set -l build build-rocm-moe-stream-$phase
+    set -l measure OFF
+    set -l targets llama-server test-hip-mmvq-moe test-backend-ops
+    if test $phase = measure
+        set measure ON
+        set targets llama-server
+    end
+    set -l fresh
+    if test -f $build/CMakeCache.txt
+        set -l cached_compiler (string match -rg '^CMAKE_HIP_COMPILER:[^=]+=(.*)$' < $build/CMakeCache.txt)
+        if test "$cached_compiler" != "$rocm/bin/amdclang++"
+            echo "Reinitializing CMake metadata for $build (compiler changed)"
+            set fresh --fresh
+        end
+    end
+    cmake -S . -B $build $fresh "-DCMAKE_HIP_COMPILER=$rocm/bin/amdclang++" "-DCMAKE_PREFIX_PATH=$rocm" -C scripts/moe-measure/rocm-sdk-options.cmake -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=$measure -DLLAMA_BUILD_TESTS=ON; or exit 1
+    if not string match -rq '^GGML_HIP:[^=]+=ON$' < $build/CMakeCache.txt
+        echo "HIP is disabled in $build after configuration; stopping before build" >&2
+        exit 1
+    end
+    if not string match -rq "^LLAMA_MOE_MEASURE:[^=]+=$measure\$" < $build/CMakeCache.txt
+        echo "Wrong instrumentation mode in $build; stopping before build" >&2
+        exit 1
+    end
+    set -l configured_compiler (string match -rg '^CMAKE_HIP_COMPILER:[^=]+=(.*)$' < $build/CMakeCache.txt)
+    if test "$configured_compiler" != "$rocm/bin/amdclang++"
+        echo "Wrong HIP compiler in $build: $configured_compiler" >&2
+        exit 1
+    end
+    cmake --build $build --target $targets -j28; or exit 1
+end
 set -l logs
 for backend in ROCm0 ROCm1
     set -l native moe-grouped-$backend.log
