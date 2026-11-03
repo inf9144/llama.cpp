@@ -1384,3 +1384,63 @@ and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
 ```
 
 The expected reference build is `b8b49e07`, with its old 161.37/1041.38-MiB draft reservation. The corrected cross-build top-32 result remains open. No production-branch merge is made.
+
+## 2026-11-03: HC down-projection candidate for target verify
+
+The next change targets the BF16 HC down-projection, not expert transfers. In the latest warm trace all small MoE batches hit the cache. The interval between `publish_lookup` and `finish_lookup` totals 15.45 ms on ROCm0 and 12.54 ms on ROCm1 over 2544 lookups. This includes graph scheduling, not just the memory wait. It is too small to treat the lookup wait as the main remaining bottleneck.
+
+The HC down-projection has K=10240, M=320 and four queries. Its existing MMF launch has only ten blocks, with eight waves in each block. There are 3120 such launches on ROCm0 (92.35 ms) and 1924 on ROCm1 (52.21 ms). The following scale/SiLU kernels add work and graph nodes. These measured costs motivate a candidate; they do not establish its speedup.
+
+### Kernel and dispatch
+
+The candidate assigns each of the old eight warp partitions to its own block, giving 80 blocks for the production shape. It reuses the existing BF16 WMMA loop. Each partition keeps the same K start, K stride and instruction order. A second kernel sums partitions 0 through 7 in the original order, then applies the existing scale/bias expression and SiLU helper. There are two launches instead of the previous matmul, scale and SiLU launches.
+
+Activation conversion, weight types and attention arithmetic are unchanged. The graph retains its original GGML operations; the backend recognizes the adjacent `MUL_MAT -> SCALE -> SILU` chain. Existing subgraph-output and memory-overlap checks protect fusion. Allocation dependencies keep its inputs alive through the last node and are batch independent, as for the existing GLU fusions. No graph reordering, new runtime option or cache is introduced.
+
+Automatic dispatch is limited to RDNA3 wave32, dense contiguous BF16 weights/F32 activations and output, 4-8 queries, 32-512 output rows in multiples of 32, and K=8192-65536 in multiples of 512. The model's K=10240/M=320 case fits. Other types, shapes, backends, hints and observable intermediate outputs keep their existing path. Plain matmuls and widths 1-3 keep their original dispatch. Prefill is not switched to split K. QSA, KV storage, MoE policy, DFlash inputs and checkpoint handling are not changed.
+
+The partial payload is 40 KiB for K=10240/M=320/four queries and at most 128 KiB per eligible operation, using the existing temporary backend pool. Pool allocation rounding and graph allocation dependencies still need checking in production peaks. The previous 1.05-GiB draft-reservation saving is not a measured result for this new candidate yet.
+
+### Validation status
+
+Local CPU CMake configuration/build and the 19 deferred scheduler cases pass. A host index-coverage check verifies unique partial writes for supported row/query boundaries, and checks that the old dispatcher chooses eight warps for every supported K. `git diff --check` and EditorConfig checks pass. No HIP compiler is installed here: configuration stops at `Failed to find HIP root directory`. The new HIP source has not been compiled or run here; GPU numerical equivalence, performance and memory peaks remain open. No inference speedup is claimed.
+
+`test-hip-mmf-thin` checks the production kernel against the existing eight-warp MMF kernel. It also evaluates the actual GGML chain through the scheduler/allocator. It requires bitwise equality, without raising tolerances. Cases cover K=8192/10240/16384/65536, M=32/320/512, widths 4-8, plain and fused results, changing/zero/tiny inputs, poisoned scratch, tail guards, nonzero bias and a retained intermediate that must prevent fusion. Only the fused chain is enabled in inference; the plain split-K comparison is diagnostic.
+
+Its optional `--bench` reports both variants with 64 operations per captured HIP graph and ten interleaved AB/BA samples. Each `split_us` includes the reduction and fused activation when `silu=1`. Median timings avoid timing host submissions of isolated tiny kernels. Reused weights can stay in cache, so the existing full-model A/B remains necessary. The test option does not alter server dispatch.
+
+Save the current working binaries before rebuilding. Use a new snapshot directory to isolate this candidate from the earlier draft-reservation work. The previous saved references remain available for older comparisons. Run this fish block with the usual model/request templates:
+
+```fish
+begin
+    set -lx ROCM_PATH $HOME/opt/rocm-10.1
+    set -lx HIP_PATH $ROCM_PATH
+    set -lx LD_LIBRARY_PATH $ROCM_PATH/lib $LD_LIBRARY_PATH
+    set -l before build-rocm-moe-before-hc-thin
+
+    if test -x $before/reference/llama-server; and test -x $before/measure/llama-server
+        echo "Vorherige Builds werden wiederverwendet: $before"
+    else
+        test ! -e $before
+        and mkdir $before
+        and cp -a build-rocm-moe-stream-reference/bin $before/reference
+        and cp -a build-rocm-moe-stream-measure/bin $before/measure
+    end
+    and git pull --ff-only
+    and cmake -S . -B build-rocm-moe-stream-reference -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON
+    and cmake --build build-rocm-moe-stream-reference --target llama-server test-hip-mmf-thin -j28
+    and cmake -S . -B build-rocm-moe-stream-measure -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON
+    and cmake --build build-rocm-moe-stream-measure --target llama-server -j28
+    and ./build-rocm-moe-stream-reference/bin/test-hip-mmf-thin --backend ROCm0 --bench
+    and ./build-rocm-moe-stream-reference/bin/test-hip-mmf-thin --backend ROCm1 --bench
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```
+
+The corrected completion launcher loads each binary's own libraries. Check `/props` build IDs as well as hashes, recorded probabilities and DFlash counts. In the candidate GPU trace the eligible HC down chain should use `mul_mat_f<..., false, true>` plus `mmf_thin_reduce_f32`; the corresponding separate scale/SiLU launches should disappear. Compare uninstrumented decode and request time, target/draft reservations, per-device peaks and unchanged acceptance before accepting a performance claim. A slower fused production shape needs dispatch adjustment or removal, not a looser correctness threshold. The branch remains for review; no merge to `codex-compat` is made.

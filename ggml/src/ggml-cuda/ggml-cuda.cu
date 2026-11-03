@@ -4106,6 +4106,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if defined(GGML_USE_HIP)
+static bool ggml_cuda_mmf_thin_fusion_matches(const ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_MUL_MAT ||
+            graph->nodes[i + 1]->op != GGML_OP_SCALE || graph->nodes[i + 2]->op != GGML_OP_UNARY) {
+        return false;
+    }
+    const auto * mat = graph->nodes[i];
+    const auto * scale = graph->nodes[i + 1];
+    const auto * silu = graph->nodes[i + 2];
+    return scale->src[0] == mat && silu->src[0] == scale && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+        ggml_get_op_params_i32(mat, 1) == GGML_HINT_NONE &&
+        ggml_cuda_mmf_thin_shape(mat->src[0], mat->src[1], silu) &&
+        ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY }, { i + 2 });
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4114,6 +4130,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#if defined(GGML_USE_HIP)
+    if (GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_mmf_thin_fusion_matches(cgraph, i)) {
+        const int output = i + 2;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &output, 1) &&
+                ggml_cuda_mul_mat_f_thin_silu(*cuda_ctx, node->src[0], node->src[1], cgraph->nodes[output],
+                    ggml_get_op_params_f32(cgraph->nodes[i + 1], 0), ggml_get_op_params_f32(cgraph->nodes[i + 1], 1))) {
+            return 2;
+        }
+    }
+#endif
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5347,6 +5375,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+#if defined(GGML_USE_HIP)
+            if (GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    ggml_cuda_mmf_thin_fusion_matches(cgraph, i)) {
+                add_alloc_deps(i, i + 2);
+                i += 2;
+                continue;
+            }
+#endif
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];

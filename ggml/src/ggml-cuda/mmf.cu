@@ -2,6 +2,33 @@
 #include "mmf.cuh"
 #include "mmid.cuh"
 
+#if defined(GGML_USE_HIP)
+bool ggml_cuda_mul_mat_f_thin_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        float scale, float bias) {
+    const auto & info = ggml_cuda_info().devices[ctx.device];
+    if (!GGML_CUDA_CC_IS_RDNA3_0(info.cc) || info.warp_size != WARP_SIZE ||
+            !ggml_cuda_mmf_thin_shape(src0, src1, dst) ||
+            src1->ne[1] < 4 || src1->ne[1] > 8) {
+        return false;
+    }
+    GGML_ASSERT(src0->ne[0] == src1->ne[0] && dst->ne[0] == src0->ne[1] && dst->ne[1] == src1->ne[1]);
+    ggml_cuda_pool_alloc<float> partial(ctx.pool(), MMF_THIN_NWARPS*ggml_nelements(dst));
+    const auto * x = (const nv_bfloat162 *) src0->data;
+    const auto * y = (const float *) src1->data;
+    auto * out = (float *) dst->data;
+    const int k = src0->ne[0]/2;
+    const int m = src0->ne[1];
+    switch (src1->ne[1]) {
+        case 4: mul_mat_f_thin_cuda<4>(x, y, partial.get(), out, k, m, ctx.stream(), true, scale, bias); break;
+        case 5: mul_mat_f_thin_cuda<5>(x, y, partial.get(), out, k, m, ctx.stream(), true, scale, bias); break;
+        case 6: mul_mat_f_thin_cuda<6>(x, y, partial.get(), out, k, m, ctx.stream(), true, scale, bias); break;
+        case 7: mul_mat_f_thin_cuda<7>(x, y, partial.get(), out, k, m, ctx.stream(), true, scale, bias); break;
+        case 8: mul_mat_f_thin_cuda<8>(x, y, partial.get(), out, k, m, ctx.stream(), true, scale, bias); break;
+    }
+    return true;
+}
+#endif
+
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMF_ROWS_PER_BLOCK_CDNA;

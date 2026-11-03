@@ -3,6 +3,7 @@
 #include "mma.cuh"
 #include "common.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -43,10 +44,23 @@ struct mmf_ids_data {
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+#if defined(GGML_USE_HIP)
+static inline bool ggml_cuda_mmf_thin_shape(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        src0->ne[0] >= 8192 && src0->ne[0] <= 65536 && src0->ne[0] % 512 == 0 &&
+        src0->ne[1] >= MMF_ROWS_PER_BLOCK && src0->ne[1] <= 512 && src0->ne[1] % MMF_ROWS_PER_BLOCK == 0;
+}
+
+bool ggml_cuda_mul_mat_f_thin_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        float scale, float bias);
+#endif
+
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, bool split_k = false>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*(split_k ? 1 : nwarps), 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
@@ -88,7 +102,9 @@ static __global__ void mul_mat_f(
     constexpr int ntA = rows_per_block / tile_A::I;
     constexpr int ntB = (cols_per_block + tile_B::I - 1) / tile_B::I;
 
-    const int row0        = blockIdx.x * rows_per_block;
+    static_assert(!split_k || !has_ids, "split K requires a dense matrix");
+    const int row0        = (split_k ? blockIdx.x / nwarps : blockIdx.x) * rows_per_block;
+    const int warp_id     = split_k ? blockIdx.x % nwarps : threadIdx.y;
 
     int expert_idx = 0;
     [[maybe_unused]] int col_base = 0;
@@ -113,6 +129,9 @@ static __global__ void mul_mat_f(
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
+    if constexpr (split_k) {
+        dst += int64_t(warp_id)*ncols_dst_total*stride_col_dst;
+    }
 
     if constexpr (has_ids) {
         constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
@@ -168,7 +187,7 @@ static __global__ void mul_mat_f(
     }
 
 
-    for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
+    for (int col = warp_id*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
         tile_A A[ntA][warp_size / tile_A::J];
 #pragma unroll
         for (int itA = 0; itA < ntA; ++itA) {
@@ -227,6 +246,24 @@ static __global__ void mul_mat_f(
                 }
             }
         }
+    }
+
+    if constexpr (split_k) {
+#pragma unroll
+        for (int itB = 0; itB < ntB; ++itB) {
+#pragma unroll
+            for (int itA = 0; itA < ntA; ++itA) {
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = itA*tile_C::I + tile_C::get_i(l);
+                    const int j = itB*tile_C::J + tile_C::get_j(l);
+                    if (j < cols_per_block) {
+                        dst[j*stride_col_dst + row0 + i] = C[itA][itB].x[l];
+                    }
+                }
+            }
+        }
+        return;
     }
 
     float * buf_iw = (float *) compute_base;
@@ -301,6 +338,38 @@ static __global__ void mul_mat_f(
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
+
+#if defined(GGML_USE_HIP)
+static constexpr int MMF_THIN_NWARPS = 8;
+
+template <int nwarps>
+static __global__ void mmf_thin_reduce_f32(const float * partial, float * dst, int n, bool silu, float scale, float bias) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int iw = 0; iw < nwarps; ++iw) {
+        sum += partial[iw*n + i];
+    }
+    dst[i] = silu ? ggml_cuda_op_silu_single(scale*sum + bias) : sum;
+}
+
+template <int ncols_dst>
+static void mul_mat_f_thin_cuda(const nv_bfloat162 * x, const float * y, float * partial, float * dst,
+        int ncols_x, int nrows_x, cudaStream_t stream, bool silu = false, float scale = 1.0f, float bias = 0.0f) {
+    const dim3 blocks(nrows_x/MMF_ROWS_PER_BLOCK*MMF_THIN_NWARPS, 1, 1);
+    const dim3 threads(WARP_SIZE, 1, 1);
+    const int shared_bytes = 16*(WARP_SIZE + mmf_get_padding(GGML_CUDA_CC_RDNA3))*sizeof(nv_bfloat162);
+    // Each block computes one of the old kernel's eight warp sums. Keep its K stride and final sum order.
+    mul_mat_f<nv_bfloat162, MMF_ROWS_PER_BLOCK, ncols_dst, MMF_THIN_NWARPS, false, true>
+        <<<blocks, threads, shared_bytes, stream>>>(x, y, nullptr, partial,
+            ncols_x, ncols_dst, 1, ncols_x, ncols_x, nrows_x, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0);
+    const int n = nrows_x*ncols_dst;
+    mmf_thin_reduce_f32<MMF_THIN_NWARPS><<<(n + 127)/128, 128, 0, stream>>>(partial, dst, n, silu, scale, bias);
+}
+#endif
 
 //This kernel is for larger batch sizes of mul_mat_id
 template <typename T, int rows_per_block, int cols_per_block, int nwarps>
