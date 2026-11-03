@@ -1646,3 +1646,39 @@ The corrected benchmark prepends the existing override `--override-tensor '^outp
 This is an explicit common-baseline change, recorded under `shared_head` in `draft-suite.json` and announced before requests. A fresh full four-variant run is required; its rates must not be combined with the first two measurements above as one controlled experiment. ROCm0 needs space for the relocated head and, in the single-device cases, the remaining draft allocations; there is still no automatic cache reduction or memory-fitting workaround. This is a benchmark configuration fix, not a general engine fix for borrowing weights from excluded devices. GPU startup, numerical behavior and performance of the corrected configuration remain to be validated on the workstation.
 
 This correction changes only the benchmark and its documentation/tests. Reuse the existing uninstrumented `50dd19c05` binaries; no native rebuild is needed. Resume with `git pull --ff-only` followed by `python3 scripts/moe-measure/draft-ab.py`. The new report records the current script checkout separately from the unchanged runtime build identity. The full Fish helper remains available if a rebuild is needed later.
+
+### Complete hardware comparison with the shared head on ROCm0
+
+Handoff `moe-draft-ab-20261103-174716-916472` completes all eight server runs and sixteen requests. Script checkout is `8b1464e63`; every runtime reports `b12064-50dd19c05`, using the same saved binary and its own library directory. All requests process 5121 prompt tokens and emit 128 completion tokens without prompt-cache hits. The execution logs confirm the manufacturer sampler chain. The observed draft model allocations match the requested split or ROCm0-only placement. Target model allocations are consistently 3083.81 MiB on ROCm0 and 1341.49 MiB on ROCm1, consistent with moving the shared head from ROCm1 to ROCm0 in every variant.
+
+| Variant | Cold decode median (tokens/s) | Warm decode median [min, max] (tokens/s) | Accepted/drafted per request | Warm request median (s) |
+| --- | ---: | ---: | ---: | ---: |
+| greedy-split | 31.44 | 69.59 [68.95, 70.22] | 81/135 (60.0%) | 10.9620 |
+| prob-split | 35.22 | 79.19 [78.90, 79.48] | 85/125 (68.0%) | 10.3365 |
+| greedy-rocm0 | 32.17 | 74.08 [73.39, 74.76] | 81/135 (60.0%) | 10.4000 |
+| prob-rocm0 | 34.08 | 81.22 [78.43, 84.00] | 85/125 (68.0%) | 10.2849 |
+
+Probabilistic drafting on split devices gains 9.60 warm tokens/s (+13.80%) over greedy-split, with an 8.0-percentage-point acceptance increase and 5.71% shorter whole-request wall time. Combining it with ROCm0-only draft placement gains 11.63 tokens/s (+16.71%) and 6.18% shorter whole-request time against the same control. The extra placement benefit within probabilistic mode is only 2.03 tokens/s (+2.56%) at the median and 51.6 ms of whole-request time. In the first round ROCm0-only is 0.47 tokens/s slower than prob-split; in the second it is 4.52 faster. Two samples with overlapping ranges do not establish that small additional benefit as repeatable. Cold timings vary more and do not show a consistent combined-placement advantage.
+
+Every greedy request has content hash prefix `cc6836d7`; every probabilistic request has `6b6f99fc`. Thus each mode retains the same output text across cold/warm, both repetitions and both device placements. This is not a full-logit comparison or a distribution-correctness proof. Different texts between modes change the work and routing, so the throughput comparison includes more than a pure kernel-speed change. The result concerns one short-context prompt; no long-context rate or answer-quality conclusion follows. The independent effect of relocating the shared head is not measured, because it is a common control in this completed run.
+
+The draft startup reservations are:
+
+| Draft placement | GPU | Model weights (MiB) | KV (MiB) | Compute (MiB) | Sum (MiB) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Split | ROCm0 | 358.99 | 25.50 | 18.10 | 402.59 |
+| Split | ROCm1 | 252.46 | 6.38 | 110.00 | 368.84 |
+| ROCm0 only | ROCm0 | 611.45 | 31.88 | 110.10 | 753.43 |
+
+These startup figures put about 350.84 MiB more draft storage on the XTX in the ROCm0-only case and remove about 368.84 MiB from the XT, with approximately 18 MiB less total draft reservation. They exclude the target/shared head, driver allocations, allocator rounding and any later high-water changes. There is no GPU allocation trace or measured process peak in this suite. Keeping the draft split leaves more XTX headroom for the existing MoE cache; no cache budget was changed in the comparison.
+
+The recommended first real-workload trial is therefore probabilistic drafting with the split draft and the common ROCm0 head placement:
+
+```fish
+    --override-tensor '^output[.](weight|scale|input_scale)$=ROCm0' \
+    --spec-draft-sampling probabilistic \
+    --spec-draft-device ROCm0,ROCm1 \
+    --spec-draft-n-max 3 \
+```
+
+The head rule must precede other matching tensor overrides, including inherited environment rules. ROCm0-only remains an optional tradeoff for maximum short-prompt decode rate, with greater XTX memory use and less certain incremental benefit. No further identical short-prompt suite is needed to record these results. Real-workload and long-context behavior, distribution correctness and process allocation peaks remain open. This entry changes documentation only; the normal defaults and inference code are unchanged, and the feature branch is not merged to `codex-compat`.
