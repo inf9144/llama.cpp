@@ -1,0 +1,28 @@
+# Keep the benchmark compiler headers in the selected SDK, including cached builds.
+if (NOT IS_DIRECTORY "$ENV{ROCM_PATH}/include/hip")
+    message(FATAL_ERROR "ROCM_PATH must contain include/hip: $ENV{ROCM_PATH}")
+endif()
+file(REAL_PATH "$ENV{ROCM_PATH}" _moe_rocm)
+set(_moe_sdk_flags "--rocm-path=\"${_moe_rocm}\" --hip-path=\"${_moe_rocm}\" -I\"${_moe_rocm}/include\"")
+string(REPLACE "${_moe_sdk_flags}" "" _moe_hip_flags "${CMAKE_HIP_FLAGS}")
+string(STRIP "${_moe_hip_flags}" _moe_hip_flags)
+string(STRIP "${_moe_hip_flags} ${_moe_sdk_flags}" _moe_hip_flags)
+set(CMAKE_HIP_FLAGS "${_moe_hip_flags}" CACHE STRING "HIP compiler flags" FORCE)
+
+list(PREPEND CMAKE_PREFIX_PATH "${_moe_rocm}" "${_moe_rocm}/lib64/cmake")
+list(REMOVE_DUPLICATES CMAKE_PREFIX_PATH)
+set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}" CACHE STRING "Package search prefixes" FORCE)
+foreach(_moe_package IN ITEMS hip hip-lang hipblas rocblas)
+    unset(${_moe_package}_DIR CACHE)
+    find_path(_moe_package_dir NAMES "${_moe_package}-config.cmake" "${_moe_package}Config.cmake"
+        PATHS "${_moe_rocm}/lib/cmake/${_moe_package}" "${_moe_rocm}/lib64/cmake/${_moe_package}"
+        NO_DEFAULT_PATH NO_CACHE)
+    if (_moe_package_dir)
+        set(${_moe_package}_DIR "${_moe_package_dir}" CACHE PATH "Selected ROCm package" FORCE)
+        if (_moe_package STREQUAL "hip-lang")
+            set(CMAKE_HIP_COMPILER_ROCM_ROOT "${_moe_rocm}" CACHE PATH "HIP SDK root" FORCE)
+        endif()
+    endif()
+    unset(_moe_package_dir)
+endforeach()
+message(STATUS "MoE benchmark HIP SDK: ${_moe_rocm}")

@@ -25,9 +25,11 @@ else
     cp -a build-rocm-moe-stream-measure/bin $before/measure; or exit 1
 end
 
-cmake -S . -B build-rocm-moe-stream-reference -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON; or exit 1
+echo "Checking HIP headers from $rocm"
+printf '#include <hip/hip_bf16.h>\n' | $rocm/bin/amdclang++ --rocm-path=$rocm --hip-path=$rocm -I$rocm/include --offload-arch=gfx1100 -D__HIP_PLATFORM_AMD__=1 -std=c++17 -x hip -fsyntax-only -; or exit 1
+cmake -S . -B build-rocm-moe-stream-reference "-DCMAKE_HIP_COMPILER=$rocm/bin/amdclang++" "-DCMAKE_PREFIX_PATH=$rocm" -C scripts/moe-measure/rocm-sdk-options.cmake -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=OFF -DLLAMA_BUILD_TESTS=ON; or exit 1
 cmake --build build-rocm-moe-stream-reference --target llama-server test-hip-mmvq-moe test-backend-ops -j28; or exit 1
-cmake -S . -B build-rocm-moe-stream-measure -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON; or exit 1
+cmake -S . -B build-rocm-moe-stream-measure "-DCMAKE_HIP_COMPILER=$rocm/bin/amdclang++" "-DCMAKE_PREFIX_PATH=$rocm" -C scripts/moe-measure/rocm-sdk-options.cmake -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON -DGPU_TARGETS='gfx1100;gfx1101' -DLLAMA_MOE_MEASURE=ON; or exit 1
 cmake --build build-rocm-moe-stream-measure --target llama-server -j28; or exit 1
 set -l logs
 for backend in ROCm0 ROCm1
