@@ -1444,3 +1444,30 @@ end
 ```
 
 The corrected completion launcher loads each binary's own libraries. Check `/props` build IDs as well as hashes, recorded probabilities and DFlash counts. In the candidate GPU trace the eligible HC down chain should use `mul_mat_f<..., false, true>` plus `mmf_thin_reduce_f32`; the corresponding separate scale/SiLU launches should disappear. Compare uninstrumented decode and request time, target/draft reservations, per-device peaks and unchanged acceptance before accepting a performance claim. A slower fused production shape needs dispatch adjustment or removal, not a looser correctness threshold. The branch remains for review; no merge to `codex-compat` is made.
+
+### Native test scheduler correction
+
+Both HIP builds completed on the user's ROCm 10.1 installation. The first test then stopped before launching a kernel: its scheduler had only the selected GPU, whereas `ggml_backend_sched_new()` requires the CPU backend last. This was a test fixture error, not a numerical result.
+
+The fixture now keeps one CPU fallback alive through all cases and uses `{selected GPU, CPU}`. It explicitly assigns the input and all graph nodes to the selected GPU, checks its operator support, and verifies placement after allocation. The fallback cannot silently turn this GPU comparison into a CPU test. Kernels, dispatch, tolerances and benchmark arithmetic are unchanged.
+
+Local checks pass: a smoke test extracted from the fixture setup runs twelve CPU-backed variants with two computes each and checks the selected backend placement; all nineteen existing deferred scheduler tests also pass. The smoke test does not validate HIP execution. GPU numerical and performance results remain open.
+
+The saved `build-rocm-moe-before-hc-thin` baseline remains valid. Rebuild only the test target and resume the interrupted sequence in fish, using the existing ROCm environment:
+
+```fish
+begin
+    set -l before build-rocm-moe-before-hc-thin
+    git pull --ff-only
+    and cmake --build build-rocm-moe-stream-reference --target test-hip-mmf-thin -j28
+    and ./build-rocm-moe-stream-reference/bin/test-hip-mmf-thin --backend ROCm0 --bench
+    and ./build-rocm-moe-stream-reference/bin/test-hip-mmf-thin --backend ROCm1 --bench
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 0 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+        --baseline-reference $before/reference/llama-server
+    and python3 scripts/moe-measure/decode-ab.py --draft-widths 3 --profile \
+        --baseline-reference $before/reference/llama-server \
+        --baseline-measure $before/measure/llama-server
+end
+```

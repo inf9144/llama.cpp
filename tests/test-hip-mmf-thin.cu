@@ -54,7 +54,7 @@ static double time_graph(hipGraphExec_t graph, hipStream_t stream) {
 }
 
 template <int tokens>
-static void run(ggml_backend_t backend, int k, int m, bool bench, bool silu, float bias = 0.0f, bool retain_mat = false) {
+static void run(ggml_backend_t backend, ggml_backend_t cpu, int k, int m, bool bench, bool silu, float bias = 0.0f, bool retain_mat = false) {
     ggml_context_ptr ctx_weights(ggml_init({ggml_tensor_overhead(), nullptr, true}));
     ggml_context_ptr ctx(ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
     auto * weights = ggml_new_tensor_2d(ctx_weights.get(), GGML_TYPE_BF16, k, m);
@@ -73,8 +73,20 @@ static void run(ggml_backend_t backend, int k, int m, bool bench, bool silu, flo
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
     GGML_ASSERT(buffer);
     ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true));
-    GGML_ASSERT(sched && ggml_backend_sched_alloc_graph(sched.get(), graph));
+    ggml_backend_t backends[] = {backend, cpu};
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+    GGML_ASSERT(sched);
+    ggml_backend_sched_set_tensor_backend(sched.get(), input, backend);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto * node = ggml_graph_node(graph, i);
+        GGML_ASSERT(ggml_backend_supports_op(backend, node));
+        ggml_backend_sched_set_tensor_backend(sched.get(), node, backend);
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), input) == backend);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), ggml_graph_node(graph, i)) == backend);
+    }
 
     std::vector<float> wf(size_t(k)*m), xf(size_t(k)*tokens);
     std::vector<ggml_bf16_t> w(wf.size());
@@ -215,6 +227,8 @@ int main(int argc, char ** argv) {
     }
     ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
     GGML_ASSERT(backend && std::strncmp(ggml_backend_name(backend.get()), "ROCm", 4) == 0);
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    GGML_ASSERT(cpu);
     // Select the backend's physical device before using native HIP allocations and streams.
     ggml_backend_buffer_ptr probe(ggml_backend_alloc_buffer(backend.get(), 1));
     GGML_ASSERT(probe);
@@ -228,14 +242,14 @@ int main(int argc, char ** argv) {
     }
     for (const auto shape : {std::pair<int, int>{8192, 32}, {10240, 320}, {16384, 512}, {65536, 32}}) {
         for (bool silu : {false, true}) {
-            run<4>(backend.get(), shape.first, shape.second, bench, silu);
-            run<5>(backend.get(), shape.first, shape.second, bench, silu);
-            run<6>(backend.get(), shape.first, shape.second, bench, silu);
-            run<7>(backend.get(), shape.first, shape.second, bench, silu);
-            run<8>(backend.get(), shape.first, shape.second, bench, silu);
+            run<4>(backend.get(), cpu.get(), shape.first, shape.second, bench, silu);
+            run<5>(backend.get(), cpu.get(), shape.first, shape.second, bench, silu);
+            run<6>(backend.get(), cpu.get(), shape.first, shape.second, bench, silu);
+            run<7>(backend.get(), cpu.get(), shape.first, shape.second, bench, silu);
+            run<8>(backend.get(), cpu.get(), shape.first, shape.second, bench, silu);
         }
     }
-    run<4>(backend.get(), 8192, 32, false, true, 0.125f);
-    run<4>(backend.get(), 8192, 32, false, true, -0.0f, true);
+    run<4>(backend.get(), cpu.get(), 8192, 32, false, true, 0.125f);
+    run<4>(backend.get(), cpu.get(), 8192, 32, false, true, -0.0f, true);
     return 0;
 }
