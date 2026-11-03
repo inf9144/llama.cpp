@@ -38,6 +38,39 @@ BINARIES = {
 PHASES = [("01-reference", "reference", False), ("02-measure", "measure", False), ("03-profile", "measure", True)]
 
 
+MANUFACTURER_SOURCE = 'https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF#usage'
+MANUFACTURER_SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0,
+                             presence_penalty=0.0, frequency_penalty=0.0, repeat_penalty=1.0,
+                             dynatemp_range=0.0, dynatemp_exponent=1.0, top_n_sigma=-1.0,
+                             dry_multiplier=0.0, xtc_probability=0.0, typical_p=1.0,
+                             mirostat=0, adaptive_target=-1.0, min_keep=0,
+                             samplers=['top_k', 'top_p', 'temperature'])
+
+
+SHARED_HEAD_OVERRIDE = '^output[.](weight|scale|input_scale)$=ROCm0'
+
+
+def draft_launcher(text: str, binary: Path, sampling: str, devices: str) -> str:
+    invocation = shlex.quote(str(binary))
+    start = re.search(r'(?m)^' + re.escape(invocation) + r'(?=\s|$)', text)
+    if start is None:
+        raise ValueError('Generated server invocation not found')
+    prefix, command = text[:start.end()], text[start.end():]
+    # Tensor overrides use the first match, so this must precede template overrides.
+    added = ['--override-tensor ' + shlex.quote(SHARED_HEAD_OVERRIDE)]
+    for flags, value in ((('--spec-draft-sampling',), sampling),
+                         (('--spec-draft-device', '--device-draft', '-devd'), devices)):
+        option = '(?:' + '|'.join(map(re.escape, flags)) + ')'
+        pattern = r'(?<!\S)' + option + r'''(?:=|\s+)(?:"[^"\n]*"|'[^'\n]*'|[^\s\\]+)'''
+        command, count = re.subn(pattern, lambda _: flags[0] + ' ' + shlex.quote(value), command)
+        present = len(re.findall(r'(?<!\S)' + option + r'(?=[=\s]|$)', command))
+        if count > 1 or present > 1 or (count == 0 and present):
+            raise ValueError(f'Ambiguous draft option: {flags[0]}')
+        if count == 0:
+            added.append(flags[0] + ' ' + shlex.quote(value))
+    return prefix + (' ' + ' '.join(added) if added else '') + command
+
+
 def say(text: str) -> None:
     print(f"[{dt.datetime.now().astimezone().strftime('%H:%M:%S')}] {text}", flush=True)
 
@@ -409,6 +442,8 @@ def prepare_launchers(root: Path, suite: Path, arguments: argparse.Namespace,
             # Snapshotted build directories must use their own shared libraries.
             replacement = f"set -lx LD_LIBRARY_PATH {shlex.quote(str(binary.parent))} $LD_LIBRARY_PATH\n{shlex.quote(str(binary))}"
             result = re.sub(pattern, lambda _: replacement, text)
+            if getattr(arguments, 'production_controls', False):
+                result = draft_launcher(result, binary, 'probabilistic', 'ROCm0,ROCm1')
             target = suite / f"launch-{variant}-{key}.fish"
             target.write_text(result)
             generated[variant][key] = {"script": target, "binary": str(binary), "binary_sha256": sha(binary)}
@@ -432,6 +467,7 @@ def main() -> int:
     p.add_argument("--candidate-profile-only", action="store_true", help="Nur das Kandidaten-Profil mit Cold/Warm erfassen; keine Referenz- oder A/B-Durchläufe")
     p.add_argument("--reference-only", action="store_true", help="Nur uninstrumentiertes Cold/Warm-A/B; keine Host-Messung oder GPU-Profile")
     p.add_argument("--draft-max", type=int, choices=range(1, 8), help="Bestehenden Draft-Parameter für beide Varianten gleich überschreiben")
+    p.add_argument("--production-controls", action="store_true", help="Hersteller-Sampling, probabilistisches DFlash2 auf beiden GPUs und gemeinsamer Output-Head auf ROCm0; nur erzeugte Testdateien")
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--startup-timeout", type=int, default=900)
     p.add_argument("--request-timeout", type=int, default=900)
@@ -463,6 +499,9 @@ def main() -> int:
     json_request = json.loads(payload)
     if json_request.get("cache_prompt") is not False or json_request.get("stream") is not False or json_request.get("seed") is None:
         p.error("Request muss cache_prompt=false, stream=false, festen seed enthalten")
+    if a.production_controls:
+        json_request.update(MANUFACTURER_SAMPLING)
+        payload = (json.dumps(json_request, ensure_ascii=False) + '\n').encode('utf-8')
     if not shutil.which("fish"):
         p.error("Fish nicht gefunden")
     if PORT <= 0 or PORT > 65535:
@@ -483,6 +522,8 @@ def main() -> int:
     suite = (suite if suite.is_absolute() else root / suite).resolve()
     suite.mkdir(parents=True, exist_ok=False)
     (suite / "request.json").write_bytes(payload)
+    if a.production_controls:
+        shutil.copy2(request_path, suite / 'source-request.json')
     for name in kinds:
         shutil.copy2(root / f"moe-server-{name}.fish", suite / f"template-{name}.fish")
     try:
@@ -504,6 +545,9 @@ def main() -> int:
         "candidate_profile_only": a.candidate_profile_only,
         "reference_only": a.reference_only,
         "draft_max_override": a.draft_max,
+        "production_controls": dict(sampling=MANUFACTURER_SAMPLING, sampling_source=MANUFACTURER_SOURCE,
+                                    draft_sampling='probabilistic', draft_devices='ROCm0,ROCm1',
+                                    head_override=SHARED_HEAD_OVERRIDE) if a.production_controls else None,
         "configuration": "Existing fish templates, SSD/RAM prompt cache off, same settings across variants."
     })
     report, errors = {}, []

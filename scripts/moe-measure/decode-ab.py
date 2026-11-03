@@ -22,13 +22,8 @@ assert spec is not None and spec.loader is not None
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
-MANUFACTURER_SOURCE = 'https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF#usage'
-MANUFACTURER_SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0,
-                             presence_penalty=0.0, frequency_penalty=0.0, repeat_penalty=1.0,
-                             dynatemp_range=0.0, dynatemp_exponent=1.0, top_n_sigma=-1.0,
-                             dry_multiplier=0.0, xtc_probability=0.0, typical_p=1.0,
-                             mirostat=0, adaptive_target=-1.0, min_keep=0,
-                             samplers=['top_k', 'top_p', 'temperature'])
+MANUFACTURER_SOURCE = runner.MANUFACTURER_SOURCE
+MANUFACTURER_SAMPLING = runner.MANUFACTURER_SAMPLING
 
 
 def sampling_comparison(custom: Path, manufacturer: Path) -> dict:

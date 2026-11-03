@@ -197,16 +197,20 @@ struct fixture {
 };
 
 struct lookup_fixture {
-    static constexpr int experts = 13, slots = 8, k = 256, m = 128, tokens = 8, used = 2;
+    static constexpr int experts = 13, slots = 8, k = 256, m = 128, used = 2;
+    int tokens = 4;
     ggml_backend_t backend;
     ggml_moe_pipeline pipeline = {};
     ggml_tensor * map;
+    ggml_tensor * updates;
     ggml_tensor * bank;
     moe_cache_policy policy;
     std::vector<int32_t> maps = std::vector<int32_t>(2*experts, -1);
     std::vector<uint8_t> weights;
     uint64_t clock = 0;
     int hits = 0, misses = 0, cross_layer_evictions = 0;
+    bool sparse_updates = false;
+    std::vector<int32_t> update_data;
 
     static void resolve(void * userdata, int32_t il, const int32_t * ids, int32_t count, bool miss) {
         auto & f = *(lookup_fixture *) userdata;
@@ -224,7 +228,18 @@ struct lookup_fixture {
             f.pipeline.upload(f.pipeline.context, f.bank,
                 f.weights.data() + (il*experts + fill.expert)*f.bank->nb[2], fill.slot*f.bank->nb[2], f.bank->nb[2]);
         }
-        f.pipeline.upload(f.pipeline.context, f.map, f.maps.data(), 0, ggml_nbytes(f.map));
+        if (f.sparse_updates) {
+            f.update_data.assign(1 + 2*f.policy.changed.size(), 0);
+            f.update_data[0] = int32_t(f.policy.changed.size());
+            for (size_t i = 0; i < f.policy.changed.size(); ++i) {
+                const int32_t index = f.policy.changed[i];
+                f.update_data[1 + 2*i] = index;
+                f.update_data[2 + 2*i] = f.maps[index];
+            }
+            f.pipeline.upload(f.pipeline.context, f.updates, f.update_data.data(), 0, f.update_data.size()*sizeof(int32_t));
+        } else {
+            f.pipeline.upload(f.pipeline.context, f.map, f.maps.data(), 0, ggml_nbytes(f.map));
+        }
     }
 
     void run(ggml_moe_pipeline_init_t init) {
@@ -236,6 +251,7 @@ struct lookup_fixture {
         }
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
         map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 2*experts);
+        updates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED);
         bank = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q8_0, k, m, slots + 1);
         auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, used, tokens);
         ggml_tensor * ids[2], * out[2];
@@ -243,7 +259,7 @@ struct lookup_fixture {
         for (int il = 0; il < 2; ++il) {
             ids[il] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, used*tokens);
             auto * view = ggml_view_2d(ctx.get(), map, 1, experts, sizeof(int32_t), il*experts*sizeof(int32_t));
-            auto * selected = ggml_moe_cache_lookup(ctx.get(), view, ids[il], pipeline.lookup_job(pipeline.context, il));
+            auto * selected = ggml_moe_cache_lookup(ctx.get(), view, ids[il], pipeline.lookup_job(pipeline.context, il), sparse_updates ? updates : nullptr);
             out[il] = ggml_mul_mat_id(ctx.get(), bank, x, ggml_reshape_2d(ctx.get(), selected, used, tokens));
             ggml_set_output(out[il]);
             ggml_build_forward_expand(graph, out[il]);
@@ -275,6 +291,9 @@ struct lookup_fixture {
             pipeline.begin(pipeline.context);
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
             pipeline.flush(pipeline.context);
+            std::vector<int32_t> actual_map(maps.size());
+            ggml_backend_tensor_get(map, actual_map.data(), 0, ggml_nbytes(map));
+            GGML_ASSERT(actual_map == maps);
             for (int il = 0; il < 2; ++il) {
                 std::vector<float> actual(m*used*tokens);
                 ggml_backend_tensor_get(out[il], actual.data(), 0, ggml_nbytes(out[il]));
@@ -290,12 +309,81 @@ struct lookup_fixture {
                 worst = std::max(worst, error/std::max(energy, 1e-30));
             }
         }
-        GGML_ASSERT(hits > 0 && misses > 0 && cross_layer_evictions > 0 && worst < 1e-10);
-        printf("%s device lookup: hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
-            ggml_backend_name(backend), hits, misses, cross_layer_evictions, worst);
+        GGML_ASSERT(hits > 0 && misses > 0 && (tokens == 1 || cross_layer_evictions > 0) && worst < 1e-10);
+        printf("%s device lookup: tokens=%d sparse_updates=%d hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
+            ggml_backend_name(backend), tokens, sparse_updates, hits, misses, cross_layer_evictions, worst);
         pipeline.destroy(pipeline.context);
     }
 };
+
+static void test_lookup_updates(ggml_backend_t backend, ggml_moe_pipeline_init_t init) {
+    struct state {
+        ggml_moe_pipeline pipeline = {};
+        ggml_tensor * updates;
+        std::vector<int32_t> map = std::vector<int32_t>(1024, -1);
+        std::vector<int32_t> patch;
+        int max_changes = 0;
+        static void resolve(void * userdata, int32_t il, const int32_t * ids, int32_t count, bool miss) {
+            auto & s = *(state *) userdata;
+            GGML_ASSERT(il == 0 && count == GGML_MOE_LOOKUP_MAX_SELECTED);
+            if (!miss) return;
+            std::vector<bool> selected(s.map.size(), false), occupied(count, false);
+            for (int i = 0; i < count; ++i) selected[512 + ids[i]] = true;
+            s.patch.assign(1, 0);
+            for (size_t i = 0; i < s.map.size(); ++i) {
+                if (s.map[i] < 0) continue;
+                if (selected[i]) occupied[s.map[i]] = true;
+                else { s.map[i] = -1; s.patch.push_back(i); s.patch.push_back(-1); }
+            }
+            int free = 0;
+            for (int i = 0; i < count; ++i) {
+                const int index = 512 + ids[i];
+                if (s.map[index] >= 0) continue;
+                while (free < count && occupied[free]) ++free;
+                GGML_ASSERT(free < count);
+                s.map[index] = free; occupied[free] = true;
+                s.patch.push_back(index); s.patch.push_back(free);
+            }
+            s.patch[0] = (s.patch.size() - 1)/2;
+            s.max_changes = std::max(s.max_changes, s.patch[0]);
+            s.pipeline.upload(s.pipeline.context, s.updates, s.patch.data(), 0, s.patch.size()*sizeof(int32_t));
+        }
+    } s;
+    if (!init(backend, 1, state::resolve, &s, &s.pipeline)) return;
+    if (!s.pipeline.device_lookup) { s.pipeline.destroy(s.pipeline.context); return; }
+    ggml_context_ptr ctx(ggml_init({8*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
+    auto * map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, s.map.size());
+    auto * view = ggml_view_2d(ctx.get(), map, 1, 512, sizeof(int32_t), 512*sizeof(int32_t));
+    auto * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, GGML_MOE_LOOKUP_MAX_SELECTED);
+    s.updates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED);
+    auto * slots = ggml_moe_cache_lookup(ctx.get(), view, ids, s.pipeline.lookup_job(s.pipeline.context, 0), s.updates);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, slots);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    GGML_ASSERT(buffer);
+    for (int i = 0; i < GGML_MOE_LOOKUP_MAX_SELECTED; ++i) s.map[i] = i;
+    ggml_backend_tensor_set(map, s.map.data(), 0, ggml_nbytes(map));
+    for (int step = 0; step < 4; ++step) {
+        std::vector<int32_t> selected(GGML_MOE_LOOKUP_MAX_SELECTED), actual(selected.size()), actual_map(s.map.size());
+        for (int i = 0; i < int(selected.size()); ++i) selected[i] = step == 0 ? i : step == 1 ? 255 - i : step == 2 ? (i < 128 ? i : i + 256) : i + 256;
+        ggml_backend_tensor_set(ids, selected.data(), 0, ggml_nbytes(ids));
+        // A hit must ignore stale update storage, including a destructive patch.
+        if (step == 1) {
+            const int32_t poison[] = {1, 512, -1};
+            ggml_backend_tensor_set(s.updates, poison, 0, sizeof(poison));
+        }
+        s.pipeline.begin(s.pipeline.context);
+        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        s.pipeline.flush(s.pipeline.context);
+        ggml_backend_tensor_get(map, actual_map.data(), 0, ggml_nbytes(map));
+        ggml_backend_tensor_get(slots, actual.data(), 0, ggml_nbytes(slots));
+        GGML_ASSERT(actual_map == s.map);
+        for (int i = 0; i < int(selected.size()); ++i) GGML_ASSERT(actual[i] == s.map[512 + selected[i]] && actual[i] >= 0);
+    }
+    GGML_ASSERT(s.max_changes == 2*GGML_MOE_LOOKUP_MAX_SELECTED);
+    printf("%s sparse map updates: 512 changes, nonzero map offset, mixed hits/misses, last map cell and stale-buffer hit passed\n", ggml_backend_name(backend));
+    s.pipeline.destroy(s.pipeline.context);
+}
 
 // Reproduce the poisoned-tail failure without requiring a GPU: a tiled read
 // dequantizes the next block, then multiplies it by zero activation padding.
@@ -324,8 +412,13 @@ static void test_quantized_padding() {
 }
 
 int main(int argc, char ** argv) {
-    const char * filter = argc == 3 && strcmp(argv[1], "--backend") == 0 ? argv[2] : nullptr;
-    GGML_ASSERT(argc == 1 || filter);
+    const char * filter = nullptr;
+    bool lookup_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) filter = argv[++i];
+        else if (strcmp(argv[i], "--lookup-only") == 0) lookup_only = true;
+        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only]");
+    }
     ggml_backend_load_all();
     test_quantized_padding();
     int tested = 0, gpu = 0;
@@ -339,8 +432,18 @@ int main(int argc, char ** argv) {
         if (!hip && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) continue;
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr)); GGML_ASSERT(backend);
         if (ggml_backend_is_cpu(backend.get())) ggml_backend_cpu_set_n_threads(backend.get(), 2);
-        fixture f; f.backend = backend.get();
         auto init = reg ? (ggml_moe_pipeline_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_pipeline_init") : nullptr;
+        if (lookup_only) {
+            if (hip && init) {
+                for (int width : {1, 4, 8}) for (bool sparse : {false, true}) {
+                    lookup_fixture lookup; lookup.backend = backend.get(); lookup.tokens = width; lookup.sparse_updates = sparse; lookup.run(init);
+                }
+                test_lookup_updates(backend.get(), init);
+            }
+            ++tested; gpu += hip;
+            continue;
+        }
+        fixture f; f.backend = backend.get();
         if (hip && init) init(backend.get(), 1, [](void *, int32_t, const int32_t *, int32_t, bool) {}, nullptr, &f.pipeline);
         for (auto type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q2_0}) {
             f.run(type, 64, true, 8, false, 42); // MMQ, repeated packets and tail
@@ -362,7 +465,12 @@ int main(int argc, char ** argv) {
             }
         }
         if (f.pipeline.context) f.pipeline.destroy(f.pipeline.context);
-        if (hip && init) { lookup_fixture lookup; lookup.backend = backend.get(); lookup.run(init); }
+        if (hip && init) {
+            for (int width : {1, 4, 8}) for (bool sparse : {false, true}) {
+                lookup_fixture lookup; lookup.backend = backend.get(); lookup.tokens = width; lookup.sparse_updates = sparse; lookup.run(init);
+            }
+            test_lookup_updates(backend.get(), init);
+        }
         ++tested; gpu += hip;
     }
     if (!gpu) printf("RDNA3 HIP devices unavailable: GPU kernel tests SKIPPED\n");

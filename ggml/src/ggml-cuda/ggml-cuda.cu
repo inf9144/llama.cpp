@@ -6096,7 +6096,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
                 op->src[1]->type == GGML_TYPE_I32 && ggml_is_vector(op->src[1]) &&
                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-                ggml_nelements(op) > 0 && ggml_nelements(op) <= 256;
+                (!op->src[2] || (op->src[2]->type == GGML_TYPE_I32 && ggml_is_vector(op->src[2]) &&
+                    ggml_is_contiguous(op->src[2]) && ggml_nelements(op->src[2]) == 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED)) &&
+                ggml_nelements(op) > 0 && ggml_nelements(op) <= GGML_MOE_LOOKUP_MAX_SELECTED;
 #else
             return false;
 #endif

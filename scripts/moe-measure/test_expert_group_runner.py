@@ -130,6 +130,28 @@ comparison = dict(tokens_equal=True, rows_with_top_id_changes=0, max_shared_logp
         self.assertIn('Expected ROCm 10.1 SDK', result.stderr)
         self.assertFalse(any(c['program'] in ('cmake', 'amdclang++') for c in self.recorded()))
 
+    def test_miss_handoff_runner_preserves_binaries_and_checks_only_lookup(self):
+        shutil.copy2(Path(__file__).with_name('run_miss_handoff.fish'), self.script.parent)
+        self.script = self.script.with_name('run_miss_handoff.fish')
+        cmake = self.tools / 'cmake'
+        cmake.write_text(cmake.read_text().replace('echo passed', 'echo sparse map updates: 512 changes passed'))
+        result = self.run_script(no_config=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.recorded()
+        builds = [c['args'] for c in calls if c['program'] == 'cmake' and '--build' in c['args']]
+        self.assertEqual(len(builds), 2)
+        self.assertTrue(all('-j28' in args for args in builds))
+        self.assertIn('test-moe-stream', builds[0])
+        self.assertNotIn('test-hip-mmvq-moe', builds[0])
+        diagnoses = [c['args'] for c in calls if c['program'] == 'completion_diagnose.py']
+        self.assertEqual([args[args.index('--draft-max') + 1] for args in diagnoses], ['0', '3'])
+        self.assertTrue(all('--production-controls' in args for args in diagnoses))
+        self.assertIn('--production-controls', calls[-1]['args'])
+        self.assertIn('--profile', calls[-1]['args'])
+        self.assertNotIn('--compare-sampling', calls[-1]['args'])
+        saved = self.repo / 'build-rocm-moe-before-miss-handoff/reference/llama-server'
+        self.assertIn(b'original-reference', saved.read_bytes())
+
     def test_draft_runner_builds_only_reference_with_rocm10_and_j28(self):
         shutil.copy2(Path(__file__).with_name('run_draft_ab.fish'), self.script.parent)
         self.script = self.script.with_name('run_draft_ab.fish')

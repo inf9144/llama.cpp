@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr int max_selected = 256;
+constexpr int max_selected = GGML_MOE_LOOKUP_MAX_SELECTED;
 
 // One notification per cached layer and forward pass. The context drains it
 // before another pass can reuse it. No cache weights live in this allocation.
@@ -101,6 +101,7 @@ struct service {
             changed.wait(lock, [&] { return stopping || active.load(std::memory_order_acquire); });
             if (stopping) return;
             lock.unlock();
+            auto poll_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
             for (;;) {
                 bool progress = false;
                 for (auto & job : jobs) {
@@ -114,12 +115,17 @@ struct service {
                         // A later request cannot arrive until this stream has
                         // uploaded the maps and released the current device wait.
                         CUDA_CHECK(hipStreamWriteValue64(upload, job->ready, 1, 0));
+                        poll_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
                     }
                     job->serviced = version;
                     progress = true;
                 }
                 if (!active.load(std::memory_order_acquire) && !progress) break;
-                if (!progress) std::this_thread::sleep_for(std::chrono::microseconds(10));
+                if (!progress) {
+                    // Avoid a scheduler sleep between closely spaced misses; long gaps still back off.
+                    if (std::chrono::steady_clock::now() < poll_until) std::this_thread::yield();
+                    else std::this_thread::sleep_for(std::chrono::microseconds(10));
+                }
             }
             lock.lock();
             idle = true;
@@ -201,8 +207,19 @@ static __global__ void publish_lookup(const int32_t * map, const int32_t * ids, 
 }
 
 static __global__ void finish_lookup(const int32_t * map, const int32_t * ids, int32_t * out,
-        int32_t count, const notification * request) {
+        int32_t count, const notification * request, const int32_t * updates, int32_t * group_map, int64_t map_size) {
     const int i = threadIdx.x;
+    if (updates && request->miss) {
+        // The stream wait completes both weights and patches before map changes become visible.
+        const int n = updates[0];
+        assert(n >= 0 && n <= 2*max_selected);
+        for (int j = i; j < n; j += blockDim.x) {
+            const int index = updates[1 + 2*j];
+            assert(index >= 0 && index < map_size);
+            group_map[index] = updates[2 + 2*j];
+        }
+        __syncthreads();
+    }
     if (i < count && request->miss) out[i] = map[ids[i]];
 }
 
@@ -288,6 +305,10 @@ void ggml_hip_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     {
         CUDA_CHECK(hipStreamWaitValue64(stream, job.ready, 1, hipStreamWaitValueEq, UINT64_MAX));
     }
-    finish_lookup<<<1, max_selected, 0, stream>>>(map, ids, slots, count, job.device);
+    const auto * map_tensor = dst->src[0];
+    while (map_tensor->view_src) map_tensor = map_tensor->view_src;
+    const auto * updates = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
+    finish_lookup<<<1, max_selected, 0, stream>>>(map, ids, slots, count, job.device, updates,
+        (int32_t *) map_tensor->data, ggml_nelements(map_tensor));
     CUDA_CHECK(cudaGetLastError());
 }

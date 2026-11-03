@@ -101,7 +101,7 @@ def compare(a: dict, b: dict) -> dict:
     return result
 
 
-def launch_text(source: str, binary: Path, draft_max: int = 3) -> str:
+def launch_text(source: str, binary: Path, draft_max: int = 3, production_controls: bool = False) -> str:
     if draft_max not in (0, 3):
         raise ValueError('Draft maximum must be 0 or 3 for this diagnostic')
     if re.search(r'--cache-ssd(?:-\S+)?', source) or '--cache-ram 0' not in source:
@@ -119,7 +119,7 @@ def launch_text(source: str, binary: Path, draft_max: int = 3) -> str:
     values = re.findall(r'--moe-cache-mib\s+([0-9]+(?:,[0-9]+)*)(?=\s|$)', text)
     if len(values) != 1 or not any(int(v) > 0 for v in values[0].split(',')):
         raise ValueError('Expected one positive MoE cache budget in the existing template')
-    return text
+    return runner.draft_launcher(text, binary, 'probabilistic', 'ROCm0,ROCm1') if production_controls else text
 
 
 def http(folder: Path, name: str, endpoint: str, payload: dict | None = None) -> dict:
@@ -176,6 +176,7 @@ def main() -> int:
                         help='Baseline server binary; relative paths are resolved under --repo')
     parser.add_argument('--draft-max', type=int, choices=(0, 3), default=3,
                         help='0 checks single-token target generation; the draft model stays configured')
+    parser.add_argument('--production-controls', action='store_true', help='Use probabilistic split drafting and the shared ROCm0 head; requests remain greedy for numerical checks')
     args = parser.parse_args()
     root = args.repo.expanduser().resolve()
     binaries = {case: root / runner.BINARIES[case][0] for case in CASES}
@@ -203,7 +204,7 @@ def main() -> int:
         libs = {p.resolve() for pattern in ('libllama*.so*', 'libggml*.so*') for p in binary.parent.glob(pattern)}
         provenance[case] = dict(binary=str(binary), binary_sha256=runner.sha(binary),
                                 library_sha256={str(p): runner.sha(p) for p in sorted(libs)})
-    report: dict = dict(complete=False, binaries=provenance, draft_max=args.draft_max,
+    report: dict = dict(complete=False, binaries=provenance, draft_max=args.draft_max, production_controls=args.production_controls,
                         note='Existing baseline/candidate and cache budgets. Plain greedy; no timing conclusions or full-vocabulary logit equivalence.',
                         greedy={}, comparisons={}, replay={})
     prompt = None
@@ -213,7 +214,7 @@ def main() -> int:
     try:
         for case in CASES:
             launcher = out / (case + '.fish')
-            launcher.write_text(launch_text(source, binaries[case], args.draft_max))
+            launcher.write_text(launch_text(source, binaries[case], args.draft_max, args.production_controls))
             launchers[case] = launcher
             folder = out / case / 'greedy'
             runner.say(f'{case}: repeated greedy generation, draft maximum {args.draft_max}')

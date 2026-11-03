@@ -1682,3 +1682,36 @@ The recommended first real-workload trial is therefore probabilistic drafting wi
 ```
 
 The head rule must precede other matching tensor overrides, including inherited environment rules. ROCm0-only remains an optional tradeoff for maximum short-prompt decode rate, with greater XTX memory use and less certain incremental benefit. No further identical short-prompt suite is needed to record these results. Real-workload and long-context behavior, distribution correctness and process allocation peaks remain open. This entry changes documentation only; the normal defaults and inference code are unchanged, and the feature branch is not merged to `codex-compat`.
+
+## Live decode trace and bounded miss-path changes
+
+`live-decode-20261103-191505.tar.gz` contains about 30 seconds, including 180 complete target passes with four queries and five prefill passes (1024, 747, 1020, 490 and 1020 queries). The three small-query intervals span 16.11 seconds. Indexer launch dimensions imply roughly 23K-28K pooled context members, rather than establishing performance at 143K context. Without request logs, these are execution-shape observations, not accepted output-token counts or a throughput measurement.
+
+Within those intervals, GPU wait-operation duration sums are 4.16 seconds on gfx1100 and 1.81 seconds on gfx1101. Recorded CPU-to-GPU copies sum to 0.97 and 1.03 seconds. Sparse attention including its combine kernel sums to 0.077 and 0.084 seconds. These durations overlap and are not additive speedup budgets. In particular, a wait without an overlapping recorded copy does not identify its CPU cause; host staging, admission, runtime scheduling and profiler overhead remain possible contributors.
+
+The candidate reduces work in the existing miss path:
+
+- The policy reuses its bounded CPU scratch vectors and retains a resident score until either token slice advances or that expert is observed. The original ranking, tie-breaks, hysteresis, pinning and sorted physical placement stay the same.
+- Device misses upload only changed map entries. The policy reports the evicted logical keys and admitted keys after final slot placement. The host converts them to group-map indices, including invalidations of other layers.
+- The packed I32 buffer contains a count and unique `(index, slot)` pairs. The existing upload stream transfers weights and the patch before releasing the existing signal wait. The existing lookup completion kernel applies every patch, synchronizes its block, then reads the selected slots. There is no additional kernel launch. Hits ignore stale patch contents; the null-patch fixture retains full-map uploads as a reference. Larger host-routed batches still refresh the full map through their existing path.
+- After activation or a miss, the existing host worker yields while polling for at most one millisecond. Longer gaps retain the previous 10-microsecond sleep. Frequent misses can therefore use more CPU on the existing one worker per device. Request processing order and all GPU dependency waits stay the same; this tradeoff needs GPU A/B validation.
+
+At most two map entries change per admitted expert. Three admissions therefore need at most 52 upload bytes, including the count, instead of a full group map. A group reserves one fixed 4100-byte patch buffer plus backend alignment. This is additional metadata VRAM, not a reduction in weight/KV storage or an increase in cache capacity. Resident-bank sizes, the malloc staging budget and attention/expert arithmetic are unchanged. The lookup gains one preallocated buffer input; its compute operations and their order remain fixed across batches. Only the existing measurement build reports `map_update_entries` and `map_update_bytes` alongside its plan record; no runtime switch or new cache is added.
+
+Local validation:
+
+- CPU builds with and without `LLAMA_MOE_MEASURE` and the policy fixture pass. The fixture checks 2000 mixed plans against an independent full-sort victim oracle and verifies that sparse changes reconstruct every layer map exactly.
+- An additional host-only harness compared 24000 plans at each of 512, 2048 and 4096 slots with the parent `6cf4404` policy. All maps, fills, bypass lists and hit counts matched. In three alternating-order timing rounds, planner-only speedups were 1.21-1.27x, 1.23-1.45x and 1.26-1.47x respectively. These are coding-environment CPU results, not 7950X measurements or GPU/end-to-end gains.
+- The CPU prefill/logit/checkpoint fixture passes with NMSE=0; GPU cache execution is explicitly skipped in that fixture. Python/Fish runner tests cover SDK selection, baseline preservation and identical generated production controls for both binaries.
+- HIP compilation, the new GPU map-update cases, production logits/acceptance, CPU utilization, peak VRAM and end-to-end speed remain untested here because the ROCm SDK and both GPUs are unavailable. Vulkan execution was not available. Do not merge based on the host results alone.
+
+Run once from the feature checkout, before manually rebuilding its existing reference/measurement binaries:
+
+```fish
+git pull --ff-only
+and fish --no-config scripts/moe-measure/run_miss_handoff.fish
+```
+
+The runner first copies the current binaries and libraries to `build-rocm-moe-before-miss-handoff`, retaining that snapshot on repeat runs. It pins `$HOME/opt/rocm-10.1`, sets both compiler and prefix paths, checks the resulting cache and builds with `-j28`. GPU checks use only `test-moe-stream --lookup-only`: full-map and sparse-map fixtures at widths 1/4/8, cross-layer eviction, a nonzero group-map offset, 512 patches, mixed hits/misses, the last map cell and poisoned stale updates on a hit. The previous quantization/GEMM sweep is not run.
+
+Greedy numerical diagnoses at draft maxima 0 and 3 gate the existing cold/warm A/B and profile run. The A/B uses manufacturer sampling, probabilistic drafting on both GPUs, a shared ROCm0 head and draft maximum 3 for both binaries. These controls affect only generated test files and are archived; original launchers, request content and cache budgets are preserved. Compare uninstrumented timings and matching output/acceptance first, then inspect the profiled waits and metadata sizes. An identical replay of the interactive live session is not required.

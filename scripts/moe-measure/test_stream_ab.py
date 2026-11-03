@@ -22,6 +22,40 @@ LINKS = ('ROCm0 host link = 16.0 GT/s x16, limiting device 0000:03:00.0 (GPU 000
 
 
 class StreamActivationTests(unittest.TestCase):
+    def test_production_controls_apply_to_both_variants_and_keep_sources(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / 'scripts/moe-measure').mkdir(parents=True)
+            for name in ('run.py', 'analyze.py', 'profile.py'):
+                (root / 'scripts/moe-measure' / name).touch()
+            binary = root / 'reference'
+            binary.touch()
+            source = './build-rocm-moe-reference/bin/llama-server --cache-ram 0 --spec-draft-n-max 3 --spec-draft-sampling greedy\n'
+            (root / 'moe-server-reference.fish').write_text(source)
+            request = dict(cache_prompt=False, stream=False, seed=42, messages=['same prompt'], max_tokens=128,
+                           temperature=0.7, dry_multiplier=0.2, dynatemp_range=0.4)
+            (root / 'request.json').write_text(json.dumps(request))
+            argv = ['stream-ab.py', '--repo', str(root), '--request', 'request.json', '--output', 'suite', '--reference-only',
+                    '--production-controls', '--draft-max', '3', '--baseline-reference', str(binary), '--candidate-reference', str(binary)]
+            with patch.object(sys, 'argv', argv), patch.object(runner, 'port_open', return_value=False), \
+                    patch.object(runner.shutil, 'which', return_value='/mock/fish'), \
+                    patch.object(runner.subprocess, 'check_output', return_value='head\n'), \
+                    patch.object(runner, 'run_phase', return_value={'requests': {}}) as run, \
+                    patch.object(runner, 'print_comparison'), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(), 0)
+            for call in run.call_args_list:
+                payload = json.loads(call.args[5])
+                self.assertEqual(payload['messages'], request['messages'])
+                self.assertEqual(payload['max_tokens'], request['max_tokens'])
+                self.assertEqual((payload['temperature'], payload['top_p'], payload['top_k'], payload['dry_multiplier']), (1, .95, 20, 0))
+                launcher = call.args[3].read_text()
+                self.assertIn('--spec-draft-sampling probabilistic', launcher)
+                self.assertIn('--spec-draft-device ROCm0,ROCm1', launcher)
+                self.assertIn(runner.SHARED_HEAD_OVERRIDE, launcher)
+            self.assertEqual((root / 'moe-server-reference.fish').read_text(), source)
+            self.assertEqual(json.loads((root / 'request.json').read_text()), request)
+            self.assertEqual(json.loads((root / 'suite/source-request.json').read_text()), request)
+
     def test_reference_only_needs_no_measurement_binary(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()

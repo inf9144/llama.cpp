@@ -114,6 +114,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * addresses = nullptr;
         ggml_tensor * active = nullptr;
         ggml_moe_pipeline pipeline = {};
+        std::vector<moe_cache_policy::fill> admissions;
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -135,6 +136,8 @@ struct llama_moe_cache::impl {
         int32_t prefill_id = -1;
         ggml_tensor * gpu_map = nullptr;
         std::vector<int32_t> gpu_map_host;
+        ggml_tensor * gpu_updates = nullptr;
+        std::vector<int32_t> gpu_updates_host;
     };
 
     struct layer {
@@ -381,7 +384,7 @@ struct llama_moe_cache::impl {
                 if (g.prefill_id != g.id) n_tensors[g.prefill_id] += g.ref.size()*g.layers.size();
             }
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            if (g.streaming) n_tensors[g.id] += 1 + g.layers.size();
+            if (g.streaming) n_tensors[g.id] += 2 + g.layers.size();
             n_tensors_host  += 2*g.layers.size();
         }
         if (n_tensors_host == 0) {
@@ -440,8 +443,12 @@ struct llama_moe_cache::impl {
                 g.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, entries);
                 ggml_format_name(g.gpu_map, "moe_cache.device_maps-%zu", ig);
                 g.gpu_map_host.assign(entries, -1);
+                g.gpu_updates = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED);
+                ggml_format_name(g.gpu_updates, "moe_cache.map_updates-%zu", ig);
+                g.gpu_updates_host.resize(g.gpu_updates->ne[0]);
                 devices[g.id].device_maps = true;
-                devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.gpu_map), ggml_backend_buft_get_alignment(devices[g.id].buft));
+                const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+                devices[g.id].buf_size += GGML_PAD(ggml_nbytes(g.gpu_map), alignment) + GGML_PAD(ggml_nbytes(g.gpu_updates), alignment);
             }
             for (const ggml_tensor * t : g.ref) {
                 ggml_tensor * bank = ggml_new_tensor_3d(ctx, t->type, t->ne[0], t->ne[1], g.n_slots + 1);
@@ -604,7 +611,7 @@ struct llama_moe_cache::impl {
                 !moe_cache_fits(n_tokens, n_expert_used, l.slot_map->ne[1], g.n_slots))) {
             return nullptr;
         }
-        if (!prefill && n_tokens <= 8 && n_expert_used*n_tokens <= 256 && g.streaming && devices[g.id].pipeline.device_lookup) {
+        if (!prefill && n_tokens <= 8 && n_expert_used*n_tokens <= GGML_MOE_LOOKUP_MAX_SELECTED && g.streaming && devices[g.id].pipeline.device_lookup) {
             return l.slot_map_device;
         }
         return prefill ? l.slot_map_prefill : l.slot_map;
@@ -614,7 +621,7 @@ struct llama_moe_cache::impl {
         const auto & l = layers[il];
         if (map == l.slot_map_device) {
             const auto & p = devices[groups[l.ig].id].pipeline;
-            return ggml_moe_cache_lookup(ctx, map, ids, p.lookup_job(p.context, il));
+            return ggml_moe_cache_lookup(ctx, map, ids, p.lookup_job(p.context, il), groups[l.ig].gpu_updates);
         }
         return ggml_get_rows(ctx, map, ids);
     }
@@ -658,7 +665,7 @@ struct llama_moe_cache::impl {
             if (miss) std::copy(g.policy.slot_map[il], g.policy.slot_map[il] + g.policy.n_expert, resident.begin());
             else for (int i = 0; i < count; ++i) resident[selected[i]] = 0;
             llama_moe_measure::routing(d.backend, layers[il].experts.front(), selected, count, g.policy.n_expert, 0, resident.data()));
-        std::vector<moe_cache_policy::fill> admissions;
+        auto & admissions = d.admissions;
         size_t hits = 0;
 #ifdef LLAMA_MOE_MEASURE
         const int64_t start = ggml_time_us();
@@ -669,7 +676,9 @@ struct llama_moe_cache::impl {
         if (!miss) hits = g.policy.uniq.size();
         MOE_MEASURE(llama_moe_measure::record r("hybrid_plan", d.backend, layers[il].experts.front());
             r.out << ",\"host_plan_us\":" << ggml_time_us()-start << ",\"resident_hits\":" << hits
-                  << ",\"admissions\":" << admissions.size() << ",\"temporary\":0,\"device_lookup\":true,\"device_miss\":" << (miss ? "true" : "false"));
+                  << ",\"admissions\":" << admissions.size() << ",\"temporary\":0,\"device_lookup\":true,\"device_miss\":" << (miss ? "true" : "false")
+                  << ",\"map_update_entries\":" << g.policy.changed.size()
+                  << ",\"map_update_bytes\":" << (miss ? (1 + 2*g.policy.changed.size())*sizeof(int32_t) : 0));
         size_t bytes = 0;
         for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
             const auto * w = layers[il].experts[ip];
@@ -687,10 +696,20 @@ struct llama_moe_cache::impl {
             }
         }
         if (miss) {
-            for (size_t i = 0; i < g.layers.size(); ++i) {
-                std::copy(g.policy.slot_map[g.layers[i]], g.policy.slot_map[g.layers[i]] + g.policy.n_expert, g.gpu_map_host.begin() + i*g.policy.n_expert);
+            GGML_ASSERT(g.policy.changed.size() <= 2*size_t(count));
+            g.gpu_updates_host[0] = int32_t(g.policy.changed.size());
+            for (size_t i = 0; i < g.policy.changed.size(); ++i) {
+                const int32_t key = g.policy.changed[i];
+                const int32_t layer = key/g.policy.n_expert;
+                const int32_t expert = key%g.policy.n_expert;
+                const auto * map = layers[layer].slot_map_device;
+                GGML_ASSERT(map && map->view_src == g.gpu_map);
+                const int32_t index = int32_t(map->view_offs/sizeof(int32_t)) + expert;
+                g.gpu_updates_host[1 + 2*i] = index;
+                g.gpu_updates_host[2 + 2*i] = g.policy.slot_map[layer][expert];
             }
-            d.pipeline.upload(d.pipeline.context, g.gpu_map, g.gpu_map_host.data(), 0, ggml_nbytes(g.gpu_map));
+            const size_t bytes = (1 + 2*g.policy.changed.size())*sizeof(int32_t);
+            d.pipeline.upload(d.pipeline.context, g.gpu_updates, g.gpu_updates_host.data(), 0, bytes);
         }
         {
             std::lock_guard<std::mutex> lock(stats_mutex);

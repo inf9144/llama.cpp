@@ -2508,6 +2508,8 @@ static int test_moe_cache_policy(size_t seed) {
         const bool force = step % 3 == 0;
         std::vector<int32_t> ids(1 + gen() % (force ? 8 : 128));
         for (auto & id : ids) id = gen() % experts;
+        const auto before_maps = maps;
+        const auto before_keys = cache.key_of;
         const auto before = maps[il];
         std::vector<bool> selected(experts, false), filled(experts, false), temporary(experts, false);
         for (auto id : ids) selected[id] = true;
@@ -2515,6 +2517,62 @@ static int test_moe_cache_policy(size_t seed) {
         for (int e = 0; e < experts; ++e) expected_hits += selected[e] && before[e] >= 0;
         GGML_ASSERT(cache.plan(il, ids.data(), ids.size(), fills, hits, step*37, force));
         GGML_ASSERT(hits == expected_hits);
+        // Full-sort oracle, independent of the planner's heap and stored scores.
+        const auto expected_score = [&](int32_t key) {
+            const auto & d = cache.needs[key];
+            const auto age = [](uint64_t history, uint64_t previous, uint64_t now) {
+                const uint64_t delta = now - previous;
+                history = delta >= 16 ? 0 : history << (4*delta);
+                uint32_t result = 0;
+                for (int n = 0; n < 16; ++n) result += ((history >> (4*n)) & 15)*(n < 4 ? 4 : 1);
+                return result;
+            };
+            return age(d.latency_history, d.latency_slice, 0)*(moe_cache_policy::window_max_score + 1) +
+                age(d.history, d.slice, step*37/moe_cache_policy::slice_tokens);
+        };
+        std::vector<int32_t> victims, misses, destinations;
+        for (int s = 0; s < slots; ++s) {
+            const int key = before_keys[s];
+            if (key < 0 || key/experts != il || !selected[key%experts]) victims.push_back(s);
+        }
+        std::sort(victims.begin(), victims.end(), [&](int a, int b) {
+            const int ka = before_keys[a], kb = before_keys[b];
+            if ((ka < 0) != (kb < 0)) return ka < 0;
+            if (ka < 0) return a < b;
+            if (expected_score(ka) != expected_score(kb)) return expected_score(ka) < expected_score(kb);
+            if (cache.needs[ka].stamp != cache.needs[kb].stamp) return cache.needs[ka].stamp < cache.needs[kb].stamp;
+            if (cache.needs[ka].frequency != cache.needs[kb].frequency) return cache.needs[ka].frequency < cache.needs[kb].frequency;
+            return a < b;
+        });
+        for (int e = 0; e < experts; ++e) if (selected[e] && before[e] < 0) misses.push_back(e);
+        std::sort(misses.begin(), misses.end(), [&](int a, int b) {
+            const int ka = il*experts + a, kb = il*experts + b;
+            if (expected_score(ka) != expected_score(kb)) return expected_score(ka) > expected_score(kb);
+            if (cache.needs[ka].frequency != cache.needs[kb].frequency) return cache.needs[ka].frequency > cache.needs[kb].frequency;
+            return a < b;
+        });
+        std::vector<int32_t> admitted;
+        for (int e : misses) {
+            if (destinations.size() == victims.size()) continue;
+            const int s = victims[destinations.size()], key = before_keys[s];
+            if (!force && key >= 0 && expected_score(il*experts + e) <= expected_score(key) + std::max(1u, expected_score(key)/8)) continue;
+            admitted.push_back(e);
+            destinations.push_back(s);
+        }
+        std::sort(admitted.begin(), admitted.end());
+        std::sort(destinations.begin(), destinations.end());
+        GGML_ASSERT(fills.size() == admitted.size());
+        for (size_t i = 0; i < fills.size(); ++i) {
+            GGML_ASSERT(fills[i].expert == admitted[i] && fills[i].slot == destinations[i]);
+        }
+        auto patched = before_maps;
+        std::vector<bool> changed(layers*experts, false);
+        for (int32_t key : cache.changed) {
+            GGML_ASSERT(key >= 0 && key < layers*experts && !changed[key]);
+            changed[key] = true;
+            patched[key/experts][key%experts] = maps[key/experts][key%experts];
+        }
+        GGML_ASSERT(patched == maps && cache.changed.size() <= 2*fills.size());
         for (const auto & fill : fills) {
             GGML_ASSERT(selected[fill.expert] && before[fill.expert] < 0 && !filled[fill.expert]);
             GGML_ASSERT(maps[il][fill.expert] == fill.slot);
@@ -2583,8 +2641,9 @@ static int test_moe_cache_policy(size_t seed) {
     GGML_ASSERT(delayed_map[0] < 0 && delayed_map[1] < 0);
     delayed.plan(0, initial, 2, fills, hits, 2, true, 2, false);
     GGML_ASSERT(delayed_map == after_eviction && fills.empty());
+    GGML_ASSERT(delayed.changed.empty());
     GGML_ASSERT(delayed.needs[0].latency_history > 0);
-    printf("MoE window policy: phase clocks, latency protection, remote staging, link selection and 2000 mixed plans passed\n");
+    printf("MoE window policy: phase clocks, latency protection, remote staging, link selection, exact victim oracle and sparse map updates for 2000 mixed plans passed\n");
     return 0;
 }
 

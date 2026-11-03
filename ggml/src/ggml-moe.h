@@ -11,6 +11,8 @@ extern "C" {
 
 struct ggml_backend;
 
+enum { GGML_MOE_LOOKUP_MAX_SELECTED = 256 };
+
 // Native MMQ formats used by mixed expert models; FP4 formats with separate
 // activation-scale semantics retain the ordinary path.
 #ifdef __cplusplus
@@ -75,10 +77,14 @@ typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t 
     ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);
 
 static inline struct ggml_tensor * ggml_moe_cache_lookup(struct ggml_context * ctx,
-        struct ggml_tensor * map, struct ggml_tensor * ids, void * job) {
+        struct ggml_tensor * map, struct ggml_tensor * ids, void * job, struct ggml_tensor * updates) {
     GGML_ASSERT(map->type == GGML_TYPE_I32 && job);
+    // Optional device buffer: count, followed by (group-map index, slot) pairs.
+    GGML_ASSERT(!updates || (updates->type == GGML_TYPE_I32 && ggml_is_vector(updates) &&
+        ggml_is_contiguous(updates) && ggml_nelements(updates) == 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED));
     struct ggml_tensor * res = ggml_get_rows(ctx, map, ids);
     res->op = GGML_OP_MOE_CACHE_LOOKUP;
+    res->src[2] = updates;
     memcpy(res->op_params, &job, sizeof(job));
     return res;
 }

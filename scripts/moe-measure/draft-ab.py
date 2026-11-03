@@ -32,28 +32,8 @@ VARIANTS = {
     'greedy-rocm0': ('greedy', 'ROCm0'),
     'prob-rocm0': ('probabilistic', 'ROCm0'),
 }
-SHARED_HEAD_OVERRIDE = '^output[.](weight|scale|input_scale)$=ROCm0'
-
-
-def draft_launcher(text: str, binary: Path, sampling: str, devices: str) -> str:
-    invocation = shlex.quote(str(binary))
-    start = re.search(r'(?m)^' + re.escape(invocation) + r'(?=\s|$)', text)
-    if start is None:
-        raise ValueError('Generated server invocation not found')
-    prefix, command = text[:start.end()], text[start.end():]
-    # Tensor overrides use the first match, so this must precede template overrides.
-    added = ['--override-tensor ' + shlex.quote(SHARED_HEAD_OVERRIDE)]
-    for flags, value in ((('--spec-draft-sampling',), sampling),
-                         (('--spec-draft-device', '--device-draft', '-devd'), devices)):
-        option = '(?:' + '|'.join(map(re.escape, flags)) + ')'
-        pattern = r'(?<!\S)' + option + r'''(?:=|\s+)(?:"[^"\n]*"|'[^'\n]*'|[^\s\\]+)'''
-        command, count = re.subn(pattern, lambda _: flags[0] + ' ' + shlex.quote(value), command)
-        present = len(re.findall(r'(?<!\S)' + option + r'(?=[=\s]|$)', command))
-        if count > 1 or present > 1 or (count == 0 and present):
-            raise ValueError(f'Ambiguous draft option: {flags[0]}')
-        if count == 0:
-            added.append(flags[0] + ' ' + shlex.quote(value))
-    return prefix + (' ' + ' '.join(added) if added else '') + command
+SHARED_HEAD_OVERRIDE = runner.SHARED_HEAD_OVERRIDE
+draft_launcher = runner.draft_launcher
 
 
 def draft_placement(trace: Path, devices: str) -> dict:

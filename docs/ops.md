@@ -142,6 +142,6 @@ The custom CUDA/HIP radix `TOP_K` path resolves identical cutoff keys by lower i
 
 ## Internal MoE operations in this fork
 
-`MUL_MAT_ID_STREAM` uses bounded expert-address packets on supported RDNA3 HIP configurations; CPU has a test oracle. `MOE_CACHE_LOOKUP` resolves resident slots and publishes asynchronous demand/miss notifications on RDNA3 HIP with stream-signal graph support. CPU, CUDA, Vulkan and RPC do not execute the lookup operation; model construction retains their existing paths. Both operations contain process-local state and are rejected by RPC. These are implementation capabilities, not generated hardware support CSV results.
+`MUL_MAT_ID_STREAM` uses bounded expert-address packets on supported RDNA3 HIP configurations; CPU has a test oracle. `MOE_CACHE_LOOKUP` resolves resident slots and publishes asynchronous demand/miss notifications on RDNA3 HIP with stream-signal graph support. Its optional third input holds a count followed by unique (group-map index, slot) updates; the existing completion kernel applies them after the upload wait. CPU, CUDA, Vulkan and RPC do not execute the lookup operation; model construction retains their existing paths. Both operations contain process-local state and are rejected by RPC. These are implementation capabilities, not generated hardware support CSV results.
 
 See [the MoE implementation and validation report](development/moe-cache-prefill.md).

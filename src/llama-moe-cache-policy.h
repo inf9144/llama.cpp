@@ -74,6 +74,10 @@ struct moe_cache_policy {
     std::vector<int32_t> temporary;
     std::vector<uint32_t> counts;
     std::vector<uint32_t> scores;
+    std::vector<int32_t> changed;
+    std::vector<int32_t> victims;
+    std::vector<int32_t> misses;
+    std::vector<int32_t> destinations;
 
     void init(int32_t n_layer, int32_t experts, int32_t slots) {
         GGML_ASSERT(experts > 0 && slots > 0);
@@ -101,7 +105,7 @@ struct moe_cache_policy {
         demand & d = needs[key];
         // Lexicographic priority for repeated latency-sensitive demand, then
         // total demand. This is one replacement policy, not a fixed partition.
-        return window_score(d.latency_history, d.latency_slice, latency_slice)*(window_max_score + 1) +
+        return scores[key] = window_score(d.latency_history, d.latency_slice, latency_slice)*(window_max_score + 1) +
             window_score(d.history, d.slice, slice);
     }
 
@@ -109,7 +113,7 @@ struct moe_cache_policy {
     // small batches / legacy backends. Streaming permits bypass instead of churn.
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills,
               size_t & n_hit, uint64_t clock, bool force_resident, uint64_t latency_clock = 0, bool accessible = true) {
-        fills.clear(); temporary.clear(); uniq.clear(); n_hit = 0;
+        fills.clear(); temporary.clear(); uniq.clear(); changed.clear(); n_hit = 0;
         std::fill(counts.begin(), counts.end(), 0);
         for (size_t i = 0; i < n_ids; ++i) {
             GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
@@ -144,12 +148,15 @@ struct moe_cache_policy {
             return true;
         }
         // All hits of this request stay pinned until the last matrix has read them.
-        std::vector<int32_t> victims;
+        victims.clear();
         victims.reserve(n_slots);
         for (int32_t s = 0; s < n_slots; ++s) {
             const int32_t key = key_of[s];
             if (key >= 0 && key/n_expert == il && counts[key % n_expert]) continue;
-            if (key >= 0) scores[key] = score(key, slice, latency_slice);
+            // Observed keys refresh their scores above; other keys only age at slice boundaries.
+            if (key >= 0 && (needs[key].slice != slice || needs[key].latency_slice != latency_slice)) {
+                score(key, slice, latency_slice);
+            }
             victims.push_back(s);
         }
         const auto victim_less = [&](int32_t a, int32_t b) {
@@ -163,7 +170,7 @@ struct moe_cache_policy {
         };
         const auto heap_less = [&](int32_t a, int32_t b) { return victim_less(b, a); };
         std::make_heap(victims.begin(), victims.end(), heap_less);
-        std::vector<int32_t> misses;
+        misses.clear();
         for (int32_t e : uniq) if (slot_map[il][e] < 0) misses.push_back(e);
         std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
             const int32_t ka = il*n_expert + a, kb = il*n_expert + b;
@@ -184,7 +191,10 @@ struct moe_cache_policy {
             }
             std::pop_heap(victims.begin(), victims.end(), heap_less);
             victims.pop_back();
-            if (old >= 0) slot_map[old/n_expert][old % n_expert] = -1;
+            if (old >= 0) {
+                slot_map[old/n_expert][old % n_expert] = -1;
+                changed.push_back(old);
+            }
             slot_map[il][e] = s;
             key_of[s] = candidate;
             fills.push_back({e, s});
@@ -193,7 +203,7 @@ struct moe_cache_policy {
         // then place ascending logical experts in ascending freed slots. This
         // preserves coalesced uploads on cold banks despite demand-based ranking.
         std::sort(fills.begin(), fills.end(), [](const fill & a, const fill & b) { return a.expert < b.expert; });
-        std::vector<int32_t> destinations;
+        destinations.clear();
         destinations.reserve(fills.size());
         for (const auto & f : fills) destinations.push_back(f.slot);
         std::sort(destinations.begin(), destinations.end());
@@ -201,6 +211,7 @@ struct moe_cache_policy {
             fills[i].slot = destinations[i];
             slot_map[il][fills[i].expert] = destinations[i];
             key_of[destinations[i]] = il*n_expert + fills[i].expert;
+            changed.push_back(il*n_expert + fills[i].expert);
         }
         std::sort(uniq.begin(), uniq.end());
         std::sort(temporary.begin(), temporary.end());
