@@ -1606,3 +1606,31 @@ Replacing the entire custom CLI block requires only the following settings with 
 ```
 
 The comparison script leaves the user's normal sampling settings unchanged. The restoration is checked with byte comparison against the pre-group source, `git diff --check` and EditorConfig. No local HIP SDK or physical GPU is available, so there is no new local HIP build or GPU run for this restoration. It returns to the implementation already measured as the hardware baseline; another identical full profiling run is not required. The feature branch remains separate from `codex-compat`.
+
+## 2026-11-03: DFlash2 sampling and placement benchmark
+
+`draft-ab.py` compares four configurations on the same uninstrumented feature binary. It uses the manufacturer request sampling settings above and three draft tokens, with target placement, model, cache budgets, context, prompt, seed and output limit taken from the existing templates:
+
+| Variant | Draft sampling | Draft devices |
+| --- | --- | --- |
+| greedy-split | Greedy, the current default | ROCm0,ROCm1 |
+| prob-split | Probabilistic with rejection verification | ROCm0,ROCm1 |
+| greedy-rocm0 | Greedy | ROCm0 |
+| prob-rocm0 | Probabilistic with rejection verification | ROCm0 |
+
+Two rounds run all four variants in forward and reverse order. Each server is fresh and receives one cold and one warm request: eight server starts and sixteen requests total. No profiler, host instrumentation or native kernel sweep is run. Cold means a fresh server/expert cache, not an empty OS page cache. Both source templates are copied into the handoff and remain unchanged. Draft options and their aliases are replaced only in generated launchers; explicit arguments prevent inherited draft-mode/device defaults from controlling the comparison. Child Fish processes skip startup configuration.
+
+The report contains per-variant decode medians/ranges, request-wall medians, pooled accepted/drafted counts, absolute and relative decode changes, output lengths, hashes and repeat-hash equality. Different text between sampling modes at the same seed is expected and is not a numerical-equivalence failure. This measures performance and acceptance for one prompt, not distribution correctness or answer quality. Runs must retain the same prompt-token count and reach the requested output length; an early EOS is archived as an incomplete performance comparison. Missing DFlash timings, zero acceptance, a runtime build change, wrong observed draft weight placement or OOM stops the suite and retains the partial handoff. Cache budgets are not reduced to make a configuration fit.
+
+Both requested draft devices and observed draft model buffer sizes are recorded. Placement checks isolate the draft allocation section from the target's section. These startup weight allocations are not peak-VRAM measurements. The server does not expose execution of the probabilistic branch in `/props`; the handoff records its explicit launch arguments and build identity, without claiming an independent runtime counter. Shared-library checksums, each runtime `/props`, generated launchers and the available CMake cache are archived. The selected binary's own library directory is prepended for every run.
+
+From the feature checkout, run:
+
+```fish
+git pull --ff-only
+and fish --no-config scripts/moe-measure/run_draft_ab.fish
+```
+
+The helper pins `~/opt/rocm-10.1`, configures only `build-rocm-moe-stream-reference` with the selected compiler/package paths and `LLAMA_MOE_MEASURE=OFF`, and builds only `llama-server` with `-j28`. Compiler changes use the same scoped CMake cache recovery as the previous helper. Saved baseline binaries, the measurement build and normal `build-rocm10` are untouched. The archive is `results/moe-draft-ab-...-handoff.tar.gz`. Optional benchmark arguments, such as `--rounds 1`, pass through the helper; defaults use two rounds.
+
+Local validation covers the generated Fish launchers, actual Fish build-helper execution with mock build commands, alias overrides, unchanged templates and request fields, all eight executions in balanced order, placement/build/output-length failures and partial archive retention. Existing stream-suite tests, Python type checks, EditorConfig, Fish syntax and `git diff --check` pass. These tests launch no model. There is no local HIP SDK or physical GPU, so all four performance configurations and the probabilistic DFlash2 path still require the workstation run. No inference implementation or default setting changes in this preparation, and nothing is merged to `codex-compat`.

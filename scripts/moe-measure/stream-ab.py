@@ -258,10 +258,11 @@ def require_candidate_stream(split: dict) -> None:
 
 
 def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler: bool,
-              request: bytes, env: dict, cli: argparse.Namespace, candidate: bool = False) -> dict:
+              request: bytes, env: dict, cli: argparse.Namespace, candidate: bool = False,
+              fish_no_config: bool = False) -> dict:
     out.mkdir(parents=True, exist_ok=False)
     raw = out / "gpu-raw"
-    executable = ["fish", str(launcher_script)]
+    executable = ["fish", *(["--no-config"] if fish_no_config else []), str(launcher_script)]
     if profiler:
         executable = ["rocprofv3", "--runtime-trace", "--output-format", "csv", "--output-directory", str(raw), "--", *executable]
     cmd = [sys.executable, "scripts/moe-measure/run.py", "--output", str(out / "instrumented"),

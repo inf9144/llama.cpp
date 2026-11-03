@@ -130,6 +130,24 @@ comparison = dict(tokens_equal=True, rows_with_top_id_changes=0, max_shared_logp
         self.assertIn('Expected ROCm 10.1 SDK', result.stderr)
         self.assertFalse(any(c['program'] in ('cmake', 'amdclang++') for c in self.recorded()))
 
+    def test_draft_runner_builds_only_reference_with_rocm10_and_j28(self):
+        shutil.copy2(Path(__file__).with_name('run_draft_ab.fish'), self.script.parent)
+        self.script = self.script.with_name('run_draft_ab.fish')
+        self.script.with_name('draft-ab.py').write_text(self.preamble)
+        result = self.run_script(no_config=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.recorded()
+        configurations = [c for c in calls if c['program'] == 'cmake' and '-B' in c['args']]
+        self.assertEqual(len(configurations), 1)
+        self.assertIn('--fresh', configurations[0]['args'])
+        self.assertIn(f'-DCMAKE_HIP_COMPILER={self.sdk}/bin/amdclang++', configurations[0]['args'])
+        self.assertIn(f'-DCMAKE_PREFIX_PATH={self.sdk}', configurations[0]['args'])
+        self.assertIn('-DLLAMA_MOE_MEASURE=OFF', configurations[0]['args'])
+        builds = [c['args'] for c in calls if c['program'] == 'cmake' and '--build' in c['args']]
+        self.assertEqual(builds, [['--build', 'build-rocm-moe-stream-reference', '--target', 'llama-server', '-j28']])
+        self.assertEqual(calls[-1]['program'], 'draft-ab.py')
+        self.assertFalse((self.repo / 'build-rocm-moe-before-expert-group').exists())
+
     def test_lost_hip_stops_before_build(self):
         result = self.run_script(MOE_RUNNER_DROP_HIP='1')
         self.assertNotEqual(result.returncode, 0)
