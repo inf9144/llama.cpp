@@ -28,16 +28,19 @@ def trace(devices):
 
 
 class DraftSuiteTests(unittest.TestCase):
-    def test_launcher_replaces_existing_aliases_without_changing_target(self):
+    def test_launcher_replaces_draft_aliases_and_pins_shared_head_before_overrides(self):
         binary = Path('/build with spaces/bin/server')
         text = ('set -lx LD_LIBRARY_PATH /saved/lib $LD_LIBRARY_PATH\n' + shlex.quote(str(binary)) + ' \\\n'
                 '  --device ROCm0,ROCm1 --tensor-split 60,40 --moe-cache-mib 15200,9600 \\\n'
+                "  --override-tensor '^output.*=ROCm1' \\\n"
                 '  --spec-draft-n-max 3 --device-draft="ROCm0,ROCm1" --spec-draft-sampling greedy\n')
         actual = suite.draft_launcher(text, binary, 'probabilistic', 'ROCm0')
         self.assertIn('--device ROCm0,ROCm1 --tensor-split 60,40 --moe-cache-mib 15200,9600', actual)
         self.assertIn('--spec-draft-sampling probabilistic', actual)
         self.assertIn('--spec-draft-device ROCm0', actual)
         self.assertNotIn('--device-draft', actual)
+        pin = '--override-tensor ' + shlex.quote(suite.SHARED_HEAD_OVERRIDE)
+        self.assertLess(actual.index(pin), actual.index("--override-tensor '^output.*=ROCm1'"))
         self.assertTrue(actual.startswith('set -lx LD_LIBRARY_PATH /saved/lib $LD_LIBRARY_PATH\n'))
         for bad in ('--spec-draft-device ROCm0 --device-draft ROCm1', '--spec-draft-device \\\n'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -91,6 +94,7 @@ class DraftSuiteTests(unittest.TestCase):
                 self.assertTrue(candidate and fish_no_config)
                 self.assertNotIn('LLAMA_ARG_SPEC_DRAFT_SAMPLING', env)
                 self.assertNotIn('LLAMA_ARG_SPEC_DRAFT_DEVICE', env)
+                self.assertEqual(env['LLAMA_ARG_OVERRIDE_TENSOR'], suite.SHARED_HEAD_OVERRIDE + ',^blk.*=CPU')
                 variant = target.parent.name
                 calls.append(variant)
                 generated = json.loads(payload)
@@ -101,6 +105,7 @@ class DraftSuiteTests(unittest.TestCase):
                 self.assertEqual((generated['dry_multiplier'], generated['dynatemp_range'], generated['top_n_sigma']), (0, 0, -1))
                 launcher = script.read_text()
                 self.assertIn('--spec-draft-n-max 3', launcher)
+                self.assertIn('--override-tensor ' + shlex.quote(suite.SHARED_HEAD_OVERRIDE), launcher)
                 self.assertIn('--device ROCm0,ROCm1', launcher)
                 sampling = 'probabilistic' if variant.startswith('prob-') else 'greedy'
                 devices = ['ROCm0'] if variant.endswith('rocm0') else ['ROCm0', 'ROCm1']
@@ -123,11 +128,13 @@ class DraftSuiteTests(unittest.TestCase):
             with patch.object(sys, 'argv', argv), patch.object(suite.runner, 'port_open', return_value=False), \
                     patch.object(suite.runner, 'run_phase', side_effect=run), \
                     patch.object(suite.subprocess, 'check_output', return_value='fixture-head'), \
-                    patch.dict(os.environ, {'LLAMA_ARG_SPEC_DRAFT_SAMPLING': 'unexpected', 'LLAMA_ARG_SPEC_DRAFT_DEVICE': 'ROCm2'}), \
+                    patch.dict(os.environ, {'LLAMA_ARG_SPEC_DRAFT_SAMPLING': 'unexpected', 'LLAMA_ARG_SPEC_DRAFT_DEVICE': 'ROCm2', 'LLAMA_ARG_OVERRIDE_TENSOR': '^blk.*=CPU'}), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(suite.main(), 1 if failure else 0)
             report = json.loads((root / 'suite/draft-suite.json').read_text())
             self.assertEqual(report['complete'], failure is None)
+            self.assertTrue(report['shared_head']['target_placement_changes'])
+            self.assertFalse(report['shared_head']['extra_weight_copy'])
             self.assertEqual((root / 'moe-first-request.json').read_text(), original)
             self.assertEqual((root / 'moe-server-reference.fish').read_text(), template)
             with tarfile.open(root / 'suite-handoff.tar.gz') as archive:

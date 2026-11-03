@@ -4,6 +4,7 @@
 Use one uninstrumented candidate binary for all four variants, with three draft
 tokens. Each fresh server gets cold/warm requests. Repeat in reverse order to
 reduce order bias. The existing Fish/JSON templates are copied, never edited.
+The target's shared output head is placed on ROCm0 in every variant.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ VARIANTS = {
     'greedy-rocm0': ('greedy', 'ROCm0'),
     'prob-rocm0': ('probabilistic', 'ROCm0'),
 }
+SHARED_HEAD_OVERRIDE = '^output[.](weight|scale|input_scale)$=ROCm0'
 
 
 def draft_launcher(text: str, binary: Path, sampling: str, devices: str) -> str:
@@ -39,7 +41,8 @@ def draft_launcher(text: str, binary: Path, sampling: str, devices: str) -> str:
     if start is None:
         raise ValueError('Generated server invocation not found')
     prefix, command = text[:start.end()], text[start.end():]
-    added = []
+    # Tensor overrides use the first match, so this must precede template overrides.
+    added = ['--override-tensor ' + shlex.quote(SHARED_HEAD_OVERRIDE)]
     for flags, value in ((('--spec-draft-sampling',), sampling),
                          (('--spec-draft-device', '--device-draft', '-devd'), devices)):
         option = '(?:' + '|'.join(map(re.escape, flags)) + ')'
@@ -71,7 +74,7 @@ def draft_placement(trace: Path, devices: str) -> dict:
 
 def summarize(runs: list[dict]) -> dict:
     summary = {}
-    print('\nDFLASH-VERGLEICH (Herstellersettings; gleicher Build; uninstrumentiert)\n', flush=True)
+    print('\nDFLASH-VERGLEICH (Herstellersettings; geteilter Output-Head auf ROCm0; uninstrumentiert)\n', flush=True)
     print(f"{'Variante':14} {'Cache':6} {'Decode Median [min,max]':>28} {'Akzeptiert/Draft':>23} {'Wall Median(s)':>15}", flush=True)
     for variant in VARIANTS:
         rows = [r for r in runs if r['variant'] == variant]
@@ -163,6 +166,8 @@ def main() -> int:
     output = (output if output.is_absolute() else root / output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     report: dict = dict(complete=False, rounds=args.rounds, draft_max=3, variants=VARIANTS,
+                        shared_head=dict(override=SHARED_HEAD_OVERRIDE, applies_to='all variants',
+                                         target_placement_changes=True, extra_weight_copy=False),
                         sampling_source=decode.MANUFACTURER_SOURCE, sampling=decode.MANUFACTURER_SAMPLING,
                         runs=[], errors=[],
                         limitations=['Different draft modes can produce different texts at the same seed.',
@@ -195,10 +200,14 @@ def main() -> int:
             subprocess.run(['fish', '--no-config', '-n', str(script)], check=True, capture_output=True, text=True)
             launchers[name] = script
         env = os.environ.copy()
+        # Environment overrides are parsed before CLI arguments and must also prefer this head placement.
+        inherited = env.get('LLAMA_ARG_OVERRIDE_TENSOR', '')
+        env['LLAMA_ARG_OVERRIDE_TENSOR'] = SHARED_HEAD_OVERRIDE + (',' + inherited if inherited else '')
         for key in ('LLAMA_ARG_SPEC_DRAFT_SAMPLING', 'LLAMA_ARG_SPEC_DRAFT_DEVICE'):
             env.pop(key, None)
         prompt_tokens = None
         build_id = None
+        runner.say('Gemeinsame Kontrolle: geteilter Target/Draft-Output-Head auf ROCm0; alle vier Varianten neu vergleichen.')
         for repeat in range(args.rounds):
             order = list(VARIANTS)
             if repeat % 2:
