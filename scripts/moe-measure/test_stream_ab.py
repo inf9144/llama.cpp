@@ -22,6 +22,31 @@ LINKS = ('ROCm0 host link = 16.0 GT/s x16, limiting device 0000:03:00.0 (GPU 000
 
 
 class StreamActivationTests(unittest.TestCase):
+    def test_reference_only_needs_no_measurement_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            (root / 'scripts/moe-measure').mkdir(parents=True)
+            for name in ('run.py', 'analyze.py', 'profile.py'):
+                (root / 'scripts/moe-measure' / name).touch()
+            binary = root / 'reference'
+            binary.touch()
+            (root / 'moe-server-reference.fish').write_text('./build-rocm-moe-reference/bin/llama-server --cache-ram 0\n')
+            (root / 'request.json').write_text(json.dumps(dict(cache_prompt=False, stream=False, seed=42)))
+            argv = ['stream-ab.py', '--repo', str(root), '--request', 'request.json', '--output', 'suite', '--reference-only',
+                    '--baseline-reference', str(binary), '--candidate-reference', str(binary)]
+            with patch.object(sys, 'argv', argv), patch.object(runner, 'port_open', return_value=False), \
+                    patch.object(runner.shutil, 'which', return_value='/mock/fish'), \
+                    patch.object(runner.subprocess, 'check_output', return_value='head\n'), \
+                    patch.object(runner, 'run_phase', return_value={'requests': {}}) as run, \
+                    patch.object(runner, 'print_comparison'), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(), 0)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual([c.args[2] for c in run.call_args_list], ['01-reference', '01-reference'])
+            self.assertTrue(all(not c.args[4] for c in run.call_args_list))
+            metadata = json.loads((root / 'suite/suite.json').read_text())
+            self.assertTrue(metadata['reference_only'])
+            self.assertEqual(list(metadata['binaries']['candidate']), ['reference'])
+
     def test_candidate_profile_only_needs_no_baseline_or_reference_binary(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()

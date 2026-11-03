@@ -278,6 +278,8 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
             placement = ""
             if candidate:
                 placement = require_candidate_scratch(out / "instrumented" / "trace.log")
+            with urllib.request.urlopen(f"http://{HOST}:{PORT}/props", timeout=10) as response:
+                json_write(out / "props.json", json.load(response))
             say(f"{name}: server bereit" + (f"; Candidate-Prefill: {placement}" if candidate else ""))
             for phase in ("cold", "warm"):
                 result = send_request(request, out / phase, cli.request_timeout)
@@ -340,7 +342,7 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
 
 
 def print_comparison(variants: dict) -> None:
-    print("\nA/B-VERGLEICH (uninstrumentierte 01-reference; Host-Bytes aus 02-measure)\n")
+    print("\nA/B-VERGLEICH (uninstrumentierte 01-reference; Host-Bytes aus 02-measure, falls erfasst)\n")
     print(f"{'Variante':12} {'Cache':6} {'Wall(s)':>9} {'Prefill t/s':>12} {'Decode t/s':>11} {'H2D GiB':>9} {'D2D GiB':>9} {'Prompt':>8} {'Comp':>6} {'Hash':>8}")
     for variant in ("baseline", "candidate"):
         if "01-reference" not in variants.get(variant, {}):
@@ -427,6 +429,7 @@ def main() -> int:
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--profile", action="store_true", help="Auch ROCprofv3 auf beiden Varianten (Gesamt-Session) ausführen")
     p.add_argument("--candidate-profile-only", action="store_true", help="Nur das Kandidaten-Profil mit Cold/Warm erfassen; keine Referenz- oder A/B-Durchläufe")
+    p.add_argument("--reference-only", action="store_true", help="Nur uninstrumentiertes Cold/Warm-A/B; keine Host-Messung oder GPU-Profile")
     p.add_argument("--draft-max", type=int, choices=range(1, 8), help="Bestehenden Draft-Parameter für beide Varianten gleich überschreiben")
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--startup-timeout", type=int, default=900)
@@ -436,9 +439,11 @@ def main() -> int:
         p.add_argument(f"--{key}-reference", type=Path, default=Path(paths[0]))
         p.add_argument(f"--{key}-measure", type=Path, default=Path(paths[1]))
     a = p.parse_args()
+    if a.reference_only and (a.profile or a.candidate_profile_only):
+        p.error("--reference-only ist nicht mit Profiling kombinierbar")
     a.profile = a.profile or a.candidate_profile_only
     variants = ("candidate",) if a.candidate_profile_only else ("baseline", "candidate")
-    phases = PHASES[2:] if a.candidate_profile_only else PHASES if a.profile else PHASES[:2]
+    phases = PHASES[:1] if a.reference_only else PHASES[2:] if a.candidate_profile_only else PHASES if a.profile else PHASES[:2]
     kinds = tuple(dict.fromkeys(kind for _, kind, _ in phases))
     global PORT
     PORT = a.port
@@ -496,6 +501,7 @@ def main() -> int:
         "request_sha256": hashlib.sha256(payload).hexdigest(),
         "cache_prompt": False, "profile_enabled": a.profile, "candidate_activation_required": True, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
         "candidate_profile_only": a.candidate_profile_only,
+        "reference_only": a.reference_only,
         "draft_max_override": a.draft_max,
         "configuration": "Existing fish templates, SSD/RAM prompt cache off, same settings across variants."
     })

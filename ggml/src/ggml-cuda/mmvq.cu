@@ -3,6 +3,10 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#if defined(GGML_USE_HIP)
+#include "mmvq-moe.cuh"
+#endif
+
 #include <cstdint>
 #include <type_traits>
 
@@ -1607,6 +1611,36 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#if defined(GGML_USE_HIP)
+    const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    const bool grouped_type = src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_XXS ||
+                              src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ4_NL ||
+                              src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q2_0;
+    if (ids && grouped_type && GGML_CUDA_CC_IS_RDNA3_0(device.cc) && device.warp_size == WARP_SIZE &&
+            ncols_dst == 4 && nchannels_dst > 0 && nchannels_dst <= 16 && ne00 >= 256 && ne01 >= 128 &&
+            (nchannels_y == 1 || nchannels_y == nchannels_dst) &&
+            ne00 <= INT32_MAX/4 && ne01 <= INT32_MAX/(4*nchannels_dst) && ids_stride <= INT32_MAX/4 && stride_col_y <= INT32_MAX/4 &&
+            ne03 == 1 && ne13 == 1 && ne3 == 1 && ne02 > 0 && s02 <= INT32_MAX/ne02 &&
+            !fusion_local.x_bias && !fusion_local.gate_bias && !fusion_local.x_scale && !fusion_local.gate_scale) {
+        ggml_cuda_pool_alloc<mmvq_moe_group> groups(ctx.pool(), 4*nchannels_dst + 1);
+        mmvq_moe_group_ids<<<1, 64, 0, stream>>>(ids_d, nchannels_dst, ids_stride, groups.get());
+        const auto launch = [&](auto quant) {
+            mul_mat_vec_q_moe_grouped_launch<decltype(quant)::value>(src0->data, (const block_q8_1 *) src1_q8_1.get(), groups.get(), fusion_local,
+                    dst_d, ne00, ne01, nchannels_dst, nchannels_y, s01, s02, stride_col_y, stride_channel_y, stride_col_dst, stride_channel_dst, device.warp_size, stream);
+        };
+        switch (src0->type) {
+            case GGML_TYPE_IQ2_S:   launch(std::integral_constant<ggml_type, GGML_TYPE_IQ2_S>{});   break;
+            case GGML_TYPE_IQ3_XXS: launch(std::integral_constant<ggml_type, GGML_TYPE_IQ3_XXS>{}); break;
+            case GGML_TYPE_IQ3_S:   launch(std::integral_constant<ggml_type, GGML_TYPE_IQ3_S>{});   break;
+            case GGML_TYPE_IQ4_NL:  launch(std::integral_constant<ggml_type, GGML_TYPE_IQ4_NL>{});  break;
+            case GGML_TYPE_IQ4_XS:  launch(std::integral_constant<ggml_type, GGML_TYPE_IQ4_XS>{});  break;
+            case GGML_TYPE_Q2_0:    launch(std::integral_constant<ggml_type, GGML_TYPE_Q2_0>{});    break;
+            default: GGML_ABORT("unsupported grouped MoE quantization");
+        }
+        return;
+    }
+#endif
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
