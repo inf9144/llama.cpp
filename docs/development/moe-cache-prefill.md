@@ -1471,3 +1471,53 @@ begin
         --baseline-measure $before/measure/llama-server
 end
 ```
+
+## 2026-11-03: HC hardware validation
+
+Handoffs `moe-completion-diagnose-20261103-120223-407672`, `moe-completion-diagnose-20261103-120438-160202` and `moe-decode-ab-20261103-120626-194831` compare the saved `fa5789c` libraries against `3aaaa98`. Both numerical launchers now prefix the correct library directory; `/props` reports `b12054-fa5789c93` and `b12057-3aaaa9899`. Repository HEAD is `c26128a`, whose additional change fixes only the test scheduler. The identical server-executable SHA is expected for a change in shared libraries. The raw GPU trace independently identifies the new split-K kernel and reduction only in the candidate.
+
+### Numerical results
+
+Both draft-0 and draft-3 controls are complete. Within each setting, both repetitions and both builds have identical 128-token sequences and complete recorded top-32 probability arrays. Prefix replays at 0 and 32 also have identical recorded arrays. The greedy draft-3 requests actually speculate: all four generate 118 drafts and accept 87. All twelve performance requests have the same completion hash and generate 156 drafts with 74 accepted. This is a real cross-build comparison after correcting the launcher.
+
+These results cover the reported top-32 values, not full-vocabulary raw logits. Draft 0 versus draft 3 is not itself numerically identical: 127 rows differ, with maximum shared-top logprob delta 1.4221649169921875. Those cross-mode differences are identical in baseline and candidate; the HC change introduces no recorded difference in either mode. Standalone `test-hip-mmf-thin --bench` output is not part of these handoffs, so no isolated timings for widths 5-8 are inferred from them.
+
+### End-to-end results
+
+The request, 15200/9600-MiB cache budgets, prompt length 5121 and completion length 128 are unchanged. Use the uninstrumented `01-reference` pair for throughput:
+
+| Metric | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Cold prefill tokens/s | 527.71 | 515.12 | -2.39% |
+| Warm prefill tokens/s | 591.20 | 596.26 | +0.86% |
+| Cold decode tokens/s | 23.35 | 24.31 | +4.14% |
+| Warm decode tokens/s | 36.74 | 37.36 | +1.69% |
+| Cold request seconds | 15.1757 | 15.1971 | +0.14% |
+| Warm request seconds | 12.1476 | 12.0196 | -1.05% |
+
+The warm decode difference is 57.56 ms across this completion. The larger cold decode difference is not attributable to HC alone. Prefill is outside the split-K dispatch and varies in both directions across the controls; one pair does not establish a prefill regression or a repeatable 4% decode gain. Instrumented phases are not additional uninstrumented repetitions.
+
+### Production HC subgraph timings
+
+In the warm trace there are 52 target verify forwards of four queries and one target forward of one query. All 5044 eligible HC down chains use split K in the candidate. Sections are matched in per-stream dispatch order, comparing old matmul/scale/SiLU against new partials/reduction. Spans include the gaps between their kernels:
+
+| GPU | Sections | Baseline median | Candidate median | Span change |
+| --- | ---: | ---: | ---: | ---: |
+| RX 7900 XTX | 3120 | 36.48 us | 30.08 us | -17.54% |
+| RX 7800 XT | 1924 | 40.761 us | 33.96 us | -16.69% |
+
+The sum of these section spans falls from 202.874 to 166.720 ms, saving 36.154 ms across 128 output tokens. This workload spent about 5% of its profiled decode window in the old chain, so a small total improvement is consistent with the local result. Warm dispatches fall from 214602 to 209558, exactly one fewer per eligible chain. Whole-session dispatches fall from 537853 to 527575.
+
+The pure matrix kernel improves on the XTX but is almost unchanged on the XT; the complete chain, including the fused epilogue and fewer launches, is the positive result on both cards. The selection is therefore kept for the tested production shape, without extending it from these data to more shapes or backends.
+
+### Memory and remaining work
+
+Traced process GPU allocation peaks are 21678.774 to 21678.759 MiB on the XTX and 14482.198 to 14484.689 MiB on the XT. The XT target compute high-water increases from 646.23 to 648.73 MiB; the XTX remains 676.03 MiB. Draft compute remains 18.10/110.00 MiB without late growth. The earlier approximately 1.05-GiB draft-reservation saving is largely preserved. Traced host allocation peak increases by 29.50 MiB. These process measurements include allocation rounding and driver-managed storage; they are not OS-wide memory figures. Allocation tables have no coverage warnings or unknown frees.
+
+Warm expert H2D/D2D bytes remain zero, with no small-batch expert misses. Filtered to the 53 cold decode target graphs, expert H2D is 12.427 GiB on either build. The cache/transfer behavior is unchanged. Warm `hipStreamSynchronize` time falls from 2558.69 to 2514.00 ms; these intervals include GPU execution and cannot be treated as removable CPU overhead.
+
+The greedy diagnostic reaches 60.08 to 62.60 tokens/s warm, with 87/118 drafts accepted (73.7%). The normal performance fixture accepts 74/156 (47.4%). Different sampling and token trajectories change verification work and routing, so those rates are not interchangeable hardware benchmarks. Improving the work per accepted token remains a larger question than another small HC epilogue.
+
+One concrete next kernel candidate is expert grouping within a four-token verify. Its 2496 layer batches contain 99840 token/expert assignments but 69205 distinct layer-batch experts: median 40 assignments versus 28 experts, with 30.68% repeated assignments. Routed MMVQ consumes 353.27 ms in the warm trace, mostly IQ2_S, IQ4_NL and IQ3_XXS. In `mul_mat_vec_q_moe`, `threadIdx.y` selects a token and each warp computes its expert independently. Grouping matching experts across token/rank positions could reuse resident weight decoding while preserving each output's accumulation order. The count is not a measured DRAM-byte or tokens/s saving: hardware caches already service some repeated loads, and grouping has a cost. This is a candidate for a separate focused change; no grouped-kernel implementation or cache-policy change is included here.
+
+Keep the current HC candidate for review. No further identical profiling run or dispatch change is required to document this result, and no merge to `codex-compat` is made.
