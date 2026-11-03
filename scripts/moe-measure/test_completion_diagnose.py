@@ -147,7 +147,7 @@ class CompletionDiagnoseTests(unittest.TestCase):
         cached = diagnose.launch_text(source, path)
         other = diagnose.launch_text(source, Path('/tmp/other/server'))
         self.assertIn("'/tmp/my repo/server'", cached)
-        self.assertEqual(cached.replace("'/tmp/my repo/server'", '/tmp/other/server'), other)
+        self.assertEqual(cached.replace("'/tmp/my repo/server'", '/tmp/other/server').replace("'/tmp/my repo'", '/tmp/other'), other)
         self.assertIn('--moe-cache-mib 15200,9600', cached)
         self.assertIn('--spec-draft-n-max 3', cached)
         self.assertIn('--ctx-size 262144 --temp 0.7', cached)
@@ -160,6 +160,16 @@ class CompletionDiagnoseTests(unittest.TestCase):
                     source.replace('--spec-draft-n-max 5', '')):
             with self.assertRaises(ValueError):
                 diagnose.launch_text(bad, path)
+
+    def test_launcher_uses_saved_libraries_before_inherited_current_build_paths(self):
+        source = ('set -lx LD_LIBRARY_PATH /tmp/current/bin $LD_LIBRARY_PATH\n'
+                  './build-rocm-moe-reference/bin/llama-server --cache-ram 0 '
+                  '--spec-draft-n-max 3 --moe-cache-mib 15200,9600 --port 8080\n')
+        path = Path('/tmp/saved reference/bin/llama-server')
+        text = diagnose.launch_text(source, path)
+        prefix = "set -lx LD_LIBRARY_PATH '/tmp/saved reference/bin' $LD_LIBRARY_PATH\n'/tmp/saved reference/bin/llama-server'"
+        self.assertIn(prefix, text)
+        self.assertLess(text.index('/tmp/current/bin'), text.index(prefix))
 
     def test_greedy_controls_and_prompt_replay(self):
         request = diagnose.greedy_request([1, 2, 3], 1, 42)

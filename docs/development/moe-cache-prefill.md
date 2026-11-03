@@ -1239,7 +1239,7 @@ Eligible dense kernels should change to `mul_mat_vec_q<..., true, ...>` at width
 
 ## 2026-11-02: physical results, Q8 rollback and partial F1 reserve
 
-The `233917-924358` and `234140-876004` completion handoffs compare `b8b49e07` with `a5cf563b` at draft maxima 0 and 3. All tokens and complete recorded top-32 probability arrays match within and across builds, including prefix replays at 0 and 32. This is not a full-vocabulary logit comparison. The `moe-decode-ab-20261102-234333-737798` performance requests have identical hashes, 5121 prompt tokens, 128 completions and 74/156 accepted drafts.
+The `233917-924358` and `234140-876004` completion handoffs record matching tokens and complete top-32 probability arrays, including prefix replays at 0 and 32. The later launcher audit below shows that both sides actually loaded `a5cf563b`; these controls establish candidate repeatability, not a `b8b49e07`/`a5cf563b` probability comparison. The independently launched `moe-decode-ab-20261102-234333-737798` performance requests have identical hashes, 5121 prompt tokens, 128 completions and 74/156 accepted drafts.
 
 Uninstrumented decode is 23.45 -> 23.60 tokens/s cold and 36.37 -> 37.39 warm. The instrumented warm controls are effectively unchanged (37.25 -> 37.30 and 31.72 -> 31.75); these are diagnostic controls, not independent production speed measurements. The 10.1% warm prefill gain in the uninstrumented pair is not repeated in the instrumented pair. A stable larger end-to-end speedup is not established.
 
@@ -1334,3 +1334,53 @@ The synthetic 1024-row fixture reports the following aggregate compute reservati
 | Q8_0 | 17010688 bytes (16.22 MiB) | 31432704 bytes (29.98 MiB) |
 
 Both compact figures increase by exactly 1 MiB versus the previous hardware trial, matching one 256-wide F32 feature buffer at 1024 rows. The 16-row failure was the corresponding 16-KiB difference. A subsequent production A/B run is still needed to measure process peaks and throughput with this correction; no speedup is claimed for changing reservation alone. Keep the saved `b8b49e07` baseline, draft maximum 3 and unchanged cache budgets for that comparison.
+
+## 2026-11-03: production validation and numerical-launcher correction
+
+Handoff `moe-decode-ab-20261103-011409-070969` uses the saved pre-reservation baseline and `fa5789c`, with unchanged 15200/9600-MiB cache budgets and the same 5121-token prompt/128-token completion. All twelve performance requests have the same completion hash and accept 74/156 drafts. The launchers prefix each selected binary's own directory in `LD_LIBRARY_PATH`. The raw traces independently confirm different implementations: baseline Q6_K is unfused with the old draft reservations, whereas the candidate uses fused Q6_K, unfused Q8_0 and compact draft reservations.
+
+| Uninstrumented metric | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Cold prefill tokens/s | 510.57 | 506.17 | -0.86% |
+| Warm prefill tokens/s | 582.98 | 587.90 | +0.84% |
+| Cold decode tokens/s | 23.40 | 23.61 | +0.87% |
+| Warm decode tokens/s | 37.38 | 37.24 | -0.37% |
+| Cold request seconds | 15.4859 | 15.5262 | +0.26% |
+| Warm request seconds | 12.2102 | 12.1500 | -0.49% |
+
+This pair establishes no stable throughput gain or material regression. Instrumented controls have different overhead and must not be averaged with the uninstrumented pair as additional production repetitions.
+
+| GPU | Baseline draft compute | Candidate draft compute | Reduction in process GPU allocation peak |
+| --- | ---: | ---: | ---: |
+| RX 7900 XTX | 161.37 MiB | 18.10 MiB | 143.28 MiB |
+| RX 7800 XT | 1041.38 MiB | 110.00 MiB | 931.37 MiB |
+
+The sum of per-device peak reductions is 1074.65 MiB (1.05 GiB). Allocation tables have no coverage warnings, unknown frees or unsupported events. Draft compute is constant through both requests; the previous late increase is gone. Target compute high-water remains 676.03/646.23 MiB. The draft retains about 50 MiB more host-compute reserve; traced host allocation peak is 41.60 MiB higher. These are process allocation measurements, not OS-wide VRAM readings. Graph-plan reallocation messages still occur; they do not imply compute-buffer byte growth.
+
+### Remaining decode cost
+
+The warm host trace has 2639 small target MoE layer batches, all cache hits with zero expert H2D/D2D bytes, for both builds. Cache admission cannot remove uploads from this captured warm workload. Cold small batches upload 7330.27 MiB on ROCm0 and 6582.28 MiB on ROCm1, so cache coverage and prefill-to-decode preparation remain relevant for cold and changing workloads.
+
+Complete warm Q6_K gate/up/GLU section spans fall from 9.013 to 6.630 ms over 312 sections. Q8_0 draft FFN spans return to baseline (26.320 versus 26.292 ms). The Q6_K saving is about 2.38 ms across 128 generated tokens, too small to explain a large end-to-end gain. Whole-session kernel dispatches fall from 539779 to 537853.
+
+The approximate warm decode window is 3996.51 ms. The candidate executes 187528 target kernels and 20020 draft-generation kernels; 20713 target launches quantize Q8_1 activations. The target MoE kernels include IQ2_S, IQ4_NL and IQ3_XXS: the model's package label must not be treated as one uniform kernel quantization. The next kernel investigation should inspect common-input projection/quantization and complete HC/projection subgraphs, rather than expect another isolated shared-FFN fusion to change throughput substantially. This is an investigation direction, not a demonstrated speedup or a new implementation.
+
+There are 3952 `hipStreamSynchronize` calls in that warm window, with a 2528.94-ms time union. Recorded GPU kernel/copy activity has a 1693.70-ms union across both cards. These intervals overlap, and the API waits include GPU execution and profiler overhead; neither the synchronization duration nor the remaining trace gaps are a removable-overhead estimate. The trace has no call stacks. Earlier input-order changes already moved much of the target wait from submission to output retrieval. Removing more calls without tracing the actual dependency would not establish more parallelism.
+
+### Completion diagnostic library path
+
+The separate `moe-completion-diagnose-20261103-011156-705915` handoff has identical tokens and recorded top-32 arrays, but both `/props` responses identify `b12054-fa5789c93`, and both traces reserve 18.10/110.00 MiB for the draft. Its baseline launcher selected the saved executable without prefixing the saved library directory. The executable's original library search path therefore selected the current build's libraries. Disk checksums of the files beside the saved executable did not establish which libraries were loaded.
+
+This handoff validates repeatability of the candidate, not cross-build probability equivalence. The same issue is confirmed in the `233917` and `234140` controls, where both sides report `a5cf563b`. Cross-build probability conclusions from other archived-executable controls remain provisional until their library origin is checked. The performance A/B launchers already set the correct prefix and are unaffected; their matching generation hashes and DFlash counts remain valid evidence.
+
+`completion_diagnose.py` now prefixes the selected binary's own directory immediately before invocation, using the same quoting and inherited-path handling as the performance launcher. A regression test with a saved path containing spaces and an inherited current-build path fails before this correction. All 14 completion-diagnostic unit tests, `ty 0.0.88` checks and EditorConfig checks pass afterward. This changes measurement tooling only; the server requires no rebuild.
+
+One corrected draft-3 completion control is needed, using the existing binaries. Another performance A/B or GPU kernel sweep is not needed for the launcher fix:
+
+```fish
+git pull --ff-only
+and python3 scripts/moe-measure/completion_diagnose.py --draft-max 3 \
+    --baseline-reference build-rocm-moe-before-verify-reserve/reference/llama-server
+```
+
+The expected reference build is `b8b49e07`, with its old 161.37/1041.38-MiB draft reservation. The corrected cross-build top-32 result remains open. No production-branch merge is made.

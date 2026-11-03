@@ -109,7 +109,8 @@ def launch_text(source: str, binary: Path, draft_max: int = 3) -> str:
     ports = re.findall(r'--port\s+(\d+)', source)
     if len(ports) != 1 or int(ports[0]) != runner.PORT:
         raise ValueError('Expected port 8080 in the existing template')
-    text, n = re.subn(r'(?m)^\s*\./build-rocm-moe-reference/bin/llama-server(?=\s|$)', lambda _: shlex.quote(str(binary)), source)
+    replacement = f"set -lx LD_LIBRARY_PATH {shlex.quote(str(binary.parent))} $LD_LIBRARY_PATH\n{shlex.quote(str(binary))}"
+    text, n = re.subn(r'(?m)^\s*\./build-rocm-moe-reference/bin/llama-server(?=\s|$)', lambda _: replacement, source)
     if n != 1:
         raise ValueError('Reference server path is not unique in moe-server-reference.fish')
     text, n = re.subn(r'(--spec-draft-n-max\s+)\d+', lambda m: m[1] + str(draft_max), text)
