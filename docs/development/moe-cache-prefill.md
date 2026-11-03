@@ -1322,4 +1322,15 @@ The original device F1 measure graph allocates its synthetic source tensors insi
 
 The original owned-source measure remains in the per-backend maximum, preserving its conservative source-storage budget for fit. F2 recovery still measures only bounded noise; global packed KQ-mask reservation, runtime attention arithmetic and cache policy are unchanged. There are no new user controls or caches.
 
-The focused fixture additionally verifies that no-allocation fit estimates cover separate owned/external F1 measurements for every backend buffer type. CPU Release and Debug ASan/UBSan pass for F16/Q8_0, single and multiple sequences, full/partial F1 ingestion, logits, selector lattice and serialized rollback (LeakSanitizer disabled because of the container's ptrace restriction). Its compute sizes are unchanged. Native validation of the new source-lifetime measure remains open: the existing GPU no-growth check must now pass with the higher peak covered at initialization. A subsequent production A/B run is still needed; no speedup is claimed for this reservation correction.
+The focused fixture additionally verifies that no-allocation fit estimates cover separate owned/external F1 measurements for every backend buffer type. CPU Release and Debug ASan/UBSan pass for F16/Q8_0, single and multiple sequences, full/partial F1 ingestion, logits, selector lattice and serialized rollback (LeakSanitizer disabled because of the container's ptrace restriction). Its CPU compute sizes are unchanged.
+
+The native follow-up at `fa5789c` passes on both gfx1100 and gfx1101 with F16 and Q8_0 KV. There are no reserve-growth or reserve-failure reports through the 16/15-row F1 chunks, subsequent 1/4-row inputs, F2 noise and rollback. K/V and selector comparisons pass, as do the full/partial F1 logits and fit checks.
+
+The synthetic 1024-row fixture reports the following aggregate compute reservations (all backend buffer types summed, not production VRAM):
+
+| KV | Compact F1/F2 reserve | Full-noise reference |
+| --- | ---: | ---: |
+| F16 | 16846848 bytes (16.07 MiB) | 30613504 bytes (29.20 MiB) |
+| Q8_0 | 17010688 bytes (16.22 MiB) | 31432704 bytes (29.98 MiB) |
+
+Both compact figures increase by exactly 1 MiB versus the previous hardware trial, matching one 256-wide F32 feature buffer at 1024 rows. The 16-row failure was the corresponding 16-KiB difference. A subsequent production A/B run is still needed to measure process peaks and throughput with this correction; no speedup is claimed for changing reservation alone. Keep the saved `b8b49e07` baseline, draft maximum 3 and unchanged cache budgets for that comparison.
