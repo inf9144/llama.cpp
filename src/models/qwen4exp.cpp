@@ -650,6 +650,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
+    // Keep sibling projections adjacent before convolution rollback copies expand the graph.
+    auto * dev = model.dev_layer(il);
+    if (dev && model.layers[il].wqkv->type == GGML_TYPE_Q6_K && model.layers[il].wqkv_gate->type == GGML_TYPE_Q6_K &&
+            std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+    }
+
     return { qkv_mixed, z };
 }
 

@@ -1715,3 +1715,42 @@ and fish --no-config scripts/moe-measure/run_miss_handoff.fish
 The runner first copies the current binaries and libraries to `build-rocm-moe-before-miss-handoff`, retaining that snapshot on repeat runs. It pins `$HOME/opt/rocm-10.1`, sets both compiler and prefix paths, checks the resulting cache and builds with `-j28`. GPU checks use only `test-moe-stream --lookup-only`: full-map and sparse-map fixtures at widths 1/4/8, cross-layer eviction, a nonzero group-map offset, 512 patches, mixed hits/misses, the last map cell and poisoned stale updates on a hit. The previous quantization/GEMM sweep is not run.
 
 Greedy numerical diagnoses at draft maxima 0 and 3 gate the existing cold/warm A/B and profile run. The A/B uses manufacturer sampling, probabilistic drafting on both GPUs, a shared ROCm0 head and draft maximum 3 for both binaries. These controls affect only generated test files and are archived; original launchers, request content and cache budgets are preserved. Compare uninstrumented timings and matching output/acceptance first, then inspect the profiled waits and metadata sizes. An identical replay of the interactive live session is not required.
+
+
+## 2026-11-04: Miss-handoff hardware results and verify projection pairs
+
+Handoff `moe-decode-ab-20261104-195349-054826` tests `96aa0367b` on gfx1100 and gfx1101. The full-map and sparse-update native fixtures pass at widths 1, 4 and 8, including 512 changes, nonzero group-map offsets, cross-layer eviction and poisoned stale updates on a hit. The supplied draft-0 and draft-3 completion diagnoses report identical 128-token sequences and recorded top-probability rows, including fixed-prefix replays; all reported deltas are zero. All twelve performance requests have the same content hash (`6b6f99fc`) and accept 85 of 125 drafts (68.0%).
+
+| Uninstrumented metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Cold decode (tokens/s) | 35.49 | 38.73 |
+| Warm decode (tokens/s) | 79.45 | 79.24 |
+| Cold prefill (tokens/s) | 516.94 | 511.12 |
+| Warm prefill (tokens/s) | 580.80 | 583.21 |
+| Cold request (s) | 13.4936 | 13.3072 |
+| Warm request (s) | 10.4246 | 10.3909 |
+
+This is one uninstrumented pair, not a repeatability estimate. Expert weight bytes are unchanged. The warm small-query batches are entirely resident on both GPUs: there is no miss upload or map patch to accelerate. Cold four-query CPU plan medians decrease from 54 to 35 us on ROCm0 and from 27 to 16 us on ROCm1, with matching hit/admission counts. A later interactive report of 45 tokens/s at 211K context is useful real-workload feedback, not an isolated A/B measurement.
+
+The archive also exposes a baseline provenance problem: the saved reference runtime is `50dd19c05`, but its measurement/profile runtime is the older `8bafd739a`. Candidate phases all use `96aa0367b`. The uninstrumented comparison remains usable; differences between the two GPU profiles cannot be attributed only to the miss-handoff patch. `build_pair.py` now checks each executable with its own library directory before copying or reusing a baseline. The new runner also rejects comparing a saved baseline with the same runtime build as the candidate. Snapshots are published only after both copies retain the same checked runtime ID. The A/B controller independently checks `/props` before requests and rejects a phase whose runtime ID differs from its variant's reference. Runtime IDs do not prove a clean source tree or identical compiler options.
+
+### Next candidate: two independent Q6_K projections
+
+The candidate warm profile contains about 775 ms of summed matrix-kernel duration across the two GPUs, versus about 4.7 ms in MoE signal-wait nodes. These sums overlap other work and are not a whole-request speedup budget. Repeated Q8_1 quantizations and short matrix launches provide a bounded next experiment.
+
+The new HIP fusion accepts two independent, contiguous Q6_K weight matrices with the same contiguous F32 matrix input and 2-4 query columns. It is restricted to RDNA3_0, K divisible by 256 in [256, 32768], at most 16384 output rows per projection, default precision and no matmul hints. Weight buffers must be weight buffers on the executing device; host, peer and meta buffers fall back. Up to three intervening VIEW/RESHAPE metadata nodes are allowed; no arithmetic is moved or skipped. Existing gate/up/GLU fusion takes precedence. Concurrent multi-stream graphs, overlapping memory, larger batches, other weight types and other backends retain their existing paths.
+
+The two projections share one temporary Q8_1 quantization and one matrix launch. Each output row still uses the existing Q6_K VDR=2 dot function, one wave and the same reduction order. Both original outputs are written. For Q6_K QKV/Z weights, the Qwen4Exp HIP graph expands both projections before the convolution rollback copies. This keeps the sibling matmuls adjacent without changing the state-copy order or values. The ordering condition is independent of batch size. No GGML operation or reservation rule is added, but Z lives longer across the state copies, which can affect allocator reuse and must be checked in GPU compute-buffer/peak-VRAM measurements. There is no new persistent cache, weight copy, runtime option or reserved index tensor. This targets sibling projections such as the GDN QKV/Z inputs, rather than changing expert routing, attention, the shared output head or DFlash sampling. The intended savings are command/quantization overhead, not fewer weight bytes. No throughput gain is claimed before GPU measurement.
+
+`test-hip-mmvq-pair` compares separate backend matmuls, automatic paired dispatch, an original one-wave reference and the new kernel bit for bit. Cases cover 2/3/4 queries, K padding, unequal/odd output dimensions, weight views with nonzero offsets, intervening metadata nodes, zero inputs, several exact activation scales, repeated execution and output guards. The isolated alternating-order GPU graph benchmark measures matrix execution only; it excludes quantization. The existing production A/B measures the complete requests, including quantization and graph management. Its candidate GPU profile must contain paired projections on both devices, so an inactive optimization is not reported as a gain.
+
+Run from the feature checkout before rebuilding its existing binaries:
+
+```fish
+git pull --ff-only
+and fish --no-config scripts/moe-measure/run_verify_pair.fish
+```
+
+The helper saves `build-rocm-moe-before-verify-pair`, pins `$HOME/opt/rocm-10.1` with explicit compiler/prefix paths, and builds reference and measurement servers with `-j28`. Only the new native pair fixture runs on both GPUs, followed by the greedy draft-3 numerical diagnosis and the manufacturer/probabilistic draft-3 A/B/profile suite. Original templates, cache budgets, sampling defaults and `build-rocm10` are untouched. Results are below `results/moe-verify-pair-check-...`; the completion and decode runs each retain their existing handoff archive. No identical interactive-session replay is required.
+
+Local CPU build, cache-policy validation (2000 plans), prefill/logit/checkpoint validation (NMSE=0), all 68 Python tests including actual Fish runner fixtures, Fish syntax, Python type checks, EditorConfig and `git diff --check` pass. The CPU fixture explicitly skips GPU cache execution. The coding environment has no ROCm SDK or GPU: HIP compilation, native pair bitwise checks, production dispatch, DFlash acceptance, timing, VRAM high-water behavior and Vulkan execution remain open. Do not merge or assume the candidate is faster until the workstation results are available.

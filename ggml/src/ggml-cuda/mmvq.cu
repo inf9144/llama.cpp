@@ -2,6 +2,9 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#if defined(GGML_USE_HIP)
+#include "mmvq-pair.cuh"
+#endif
 
 #include <cstdint>
 #include <type_traits>
@@ -1614,6 +1617,71 @@ void ggml_cuda_mul_mat_vec_q(
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
+
+#if defined(GGML_USE_HIP)
+bool ggml_cuda_mul_mat_vec_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second) {
+    if (!GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[ctx.device].cc) ||
+            first->op != GGML_OP_MUL_MAT || second->op != GGML_OP_MUL_MAT || first->src[1] != second->src[1]) {
+        return false;
+    }
+    const ggml_tensor * input = first->src[1];
+    if (!ggml_is_matrix(input) || !ggml_is_contiguous(input) || input->type != GGML_TYPE_F32 ||
+            input->ne[0] < QK_K || input->ne[0] > 32768 || input->ne[0] % QK_K != 0 ||
+            input->ne[1] < 2 || input->ne[1] > 4) {
+        return false;
+    }
+    for (const ggml_tensor * node : {first, second}) {
+        const ggml_tensor * weight = node->src[0];
+        if (weight->type != GGML_TYPE_Q6_K || !ggml_is_matrix(weight) || !ggml_is_contiguous(weight) ||
+                weight->ne[0] != input->ne[0] || weight->ne[1] < 1 || weight->ne[1] > 16384 || !weight->buffer ||
+                ggml_backend_buffer_get_usage(weight->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_is_matrix(node) || !ggml_is_contiguous(node) || node->type != GGML_TYPE_F32 ||
+                node->ne[0] != weight->ne[1] || node->ne[1] != input->ne[1] ||
+                ggml_get_op_params_i32(node, 0) != GGML_PREC_DEFAULT || ggml_get_op_params_i32(node, 1) != GGML_HINT_NONE) {
+            return false;
+        }
+    }
+    const ggml_tensor * tensors[] = {input, first->src[0], second->src[0], first, second};
+    for (const ggml_tensor * tensor : tensors) {
+        if (!tensor->buffer || !tensor->data ||
+                ggml_backend_buffer_get_type(tensor->buffer) != ggml_backend_cuda_buffer_type(ctx.device)) {
+            return false;
+        }
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t pa = (uintptr_t) a->data, pb = (uintptr_t) b->data;
+        return pa <= pb ? pb - pa < ggml_nbytes(a) : pa - pb < ggml_nbytes(b);
+    };
+    if (overlaps(first, second)) {
+        return false;
+    }
+    const ggml_tensor * sources[] = {input, first->src[0], second->src[0]};
+    for (const ggml_tensor * dst : {first, second}) {
+        for (const ggml_tensor * src : sources) {
+            if (overlaps(dst, src)) {
+                return false;
+            }
+        }
+    }
+    const int k = input->ne[0], cols = input->ne[1];
+    const int padded = GGML_PAD(k, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<block_q8_1> quantized(ctx.pool(), size_t(cols)*padded/QK8_1);
+    quantize_row_q8_1_cuda((const float *) input->data, nullptr, quantized.get(), GGML_TYPE_Q6_K,
+            k, k, k*cols, k*cols, padded, cols, 1, 1, ctx.stream());
+    const auto launch = [&](auto columns) {
+        constexpr int ncols = decltype(columns)::value;
+        const auto params = ggml_cuda_kernel_launch_params(dim3(first->ne[0] + second->ne[0]), dim3(32), 0, ctx.stream());
+        ggml_cuda_kernel_launch(mul_mat_vec_q6_k_pair<ncols>, params, first->src[0]->data, second->src[0]->data,
+                quantized.get(), (float *) first->data, (float *) second->data, k, int(first->ne[0]), int(second->ne[0]), padded/QK8_1);
+    };
+    switch (cols) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+    }
+    return true;
+}
+#endif
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,

@@ -170,6 +170,82 @@ comparison = dict(tokens_equal=True, rows_with_top_id_changes=0, max_shared_logp
         self.assertEqual(calls[-1]['program'], 'draft-ab.py')
         self.assertFalse((self.repo / 'build-rocm-moe-before-expert-group').exists())
 
+    def prepare_pair_runner(self):
+        for name in ('run_verify_pair.fish', 'build_pair.py'):
+            shutil.copy2(Path(__file__).with_name(name), self.script.parent)
+        self.script = self.script.with_name('run_verify_pair.fish')
+        for phase in ('reference', 'measure'):
+            self.executable(self.repo / f'build-rocm-moe-stream-{phase}/bin/llama-server',
+                            '#!/bin/sh\necho "version: 0.7.0-dev (build 12067, commit 96aa0367b)"\n')
+        self.executable(self.tools / 'cmake', self.preamble + '''
+a = sys.argv[1:]
+if '--build' in a:
+    build = pathlib.Path(a[a.index('--build') + 1])
+    for name in a[a.index('--target') + 1:]:
+        if name.startswith('-'): break
+        out = build / 'bin' / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        message = 'version: 0.7.0-dev (build 12068, commit 123456789)' if name == 'llama-server' else 'automatic dispatch and guards passed'
+        out.write_text('#!/bin/sh\\necho "' + message + '"\\n')
+        out.chmod(0o755)
+else:
+    build = pathlib.Path(a[a.index('-B') + 1])
+    compiler = next(x.split('=', 1)[1] for x in a if x.startswith('-DCMAKE_HIP_COMPILER='))
+    mode = next(x.split('=', 1)[1] for x in a if x.startswith('-DLLAMA_MOE_MEASURE='))
+    build.mkdir(parents=True, exist_ok=True)
+    (build / 'CMakeCache.txt').write_text('CMAKE_HIP_COMPILER:FILEPATH=' + compiler + '\\nGGML_HIP:BOOL=ON\\nLLAMA_MOE_MEASURE:BOOL=' + mode + '\\n')
+''')
+        self.script.with_name('decode-ab.py').write_text(self.preamble + '''
+out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1]) / 'draft-3/candidate/03-profile'
+out.mkdir(parents=True)
+agents = ['one'] if os.environ.get('MOE_RUNNER_MISSING_PAIR') else ['one', 'two']
+(out / 'gpu.json').write_text(json.dumps({'kernels': [{'name': 'void mul_mat_vec_q6_k_pair<4>', 'agent': agent, 'calls': 20} for agent in agents]}))
+''')
+
+    def test_pair_runner_saves_aligned_baseline_then_checks_only_new_kernels(self):
+        self.prepare_pair_runner()
+        result = self.run_script(no_config=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        saved = self.repo / 'build-rocm-moe-before-verify-pair'
+        self.assertEqual(json.loads((saved / 'build-pair.json').read_text())['reference'], 'b12067-96aa0367b')
+        self.assertIn('96aa0367b', (saved / 'reference/llama-server').read_text())
+        calls = self.recorded()
+        builds = [c['args'] for c in calls if c['program'] == 'cmake' and '--build' in c['args']]
+        self.assertEqual(builds[0][-4:], ['--target', 'llama-server', 'test-hip-mmvq-pair', '-j28'])
+        self.assertEqual(builds[1][-3:], ['--target', 'llama-server', '-j28'])
+        diagnoses = [c['args'] for c in calls if c['program'] == 'completion_diagnose.py']
+        self.assertEqual(len(diagnoses), 1)
+        self.assertIn('--production-controls', diagnoses[0])
+        self.assertEqual(diagnoses[0][diagnoses[0].index('--draft-max') + 1], '3')
+        self.assertIn('--production-controls', calls[-1]['args'])
+        self.assertIn('--profile', calls[-1]['args'])
+        self.assertIn('Production projection pairs:', result.stdout)
+
+    def test_pair_runner_rejects_stale_measurement_before_build(self):
+        self.prepare_pair_runner()
+        binary = self.repo / 'build-rocm-moe-stream-measure/bin/llama-server'
+        binary.write_text(binary.read_text().replace('96aa0367b', '8bafd739a'))
+        result = self.run_script(no_config=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Different runtime builds', result.stderr)
+        self.assertFalse(any(c['program'] == 'cmake' for c in self.recorded()))
+        self.assertFalse((self.repo / 'build-rocm-moe-before-verify-pair').exists())
+
+    def test_pair_runner_rejects_inactive_production_path(self):
+        self.prepare_pair_runner()
+        result = self.run_script(no_config=True, MOE_RUNNER_MISSING_PAIR='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Projection pairs not observed on both GPUs', result.stderr)
+
+    def test_pair_runner_rejects_comparing_a_build_with_itself(self):
+        self.prepare_pair_runner()
+        cmake = self.tools / 'cmake'
+        cmake.write_text(cmake.read_text().replace('build 12068, commit 123456789', 'build 12067, commit 96aa0367b'))
+        result = self.run_script(no_config=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Baseline and candidate are the same runtime build', result.stderr)
+        self.assertFalse(any(c['program'] == 'decode-ab.py' for c in self.recorded()))
+
     def test_lost_hip_stops_before_build(self):
         result = self.run_script(MOE_RUNNER_DROP_HIP='1')
         self.assertNotEqual(result.returncode, 0)

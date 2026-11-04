@@ -22,6 +22,14 @@ LINKS = ('ROCm0 host link = 16.0 GT/s x16, limiting device 0000:03:00.0 (GPU 000
 
 
 class StreamActivationTests(unittest.TestCase):
+    def test_runtime_build_guard_rejects_old_measurement_before_requests(self):
+        self.assertEqual(runner.require_runtime_build({'build_info': 'b12067-96aa0367b'}, None), 'b12067-96aa0367b')
+        self.assertEqual(runner.require_runtime_build({'build_info': 'b12067-96aa0367b'}, 'b12067-96aa0367b'), 'b12067-96aa0367b')
+        with self.assertRaisesRegex(RuntimeError, 'Runtime build mismatch before requests'):
+            runner.require_runtime_build({'build_info': 'b12062-8bafd739a'}, 'b12064-50dd19c05')
+        with self.assertRaisesRegex(RuntimeError, 'Missing runtime build_info'):
+            runner.require_runtime_build({}, None)
+
     def test_production_controls_apply_to_both_variants_and_keep_sources(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()

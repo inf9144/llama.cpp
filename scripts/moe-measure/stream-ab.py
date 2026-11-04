@@ -290,9 +290,19 @@ def require_candidate_stream(split: dict) -> None:
         raise RuntimeError("Candidate/cold: keine stage_h2d-Transfers; Miss-Staging wurde nicht nachgewiesen.")
 
 
+def require_runtime_build(props: dict, expected: str | None) -> str:
+    current = props.get('build_info')
+    if not isinstance(current, str) or not current:
+        raise RuntimeError('Missing runtime build_info in /props')
+    if expected is not None and current != expected:
+        raise RuntimeError(f'Runtime build mismatch before requests: {current} != {expected}. '
+                           'Reference and measurement/profile binaries must use the same source revision.')
+    return current
+
+
 def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler: bool,
               request: bytes, env: dict, cli: argparse.Namespace, candidate: bool = False,
-              fish_no_config: bool = False) -> dict:
+              fish_no_config: bool = False, expected_build: str | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=False)
     raw = out / "gpu-raw"
     executable = ["fish", *(["--no-config"] if fish_no_config else []), str(launcher_script)]
@@ -313,7 +323,9 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
             if candidate:
                 placement = require_candidate_scratch(out / "instrumented" / "trace.log")
             with urllib.request.urlopen(f"http://{HOST}:{PORT}/props", timeout=10) as response:
-                json_write(out / "props.json", json.load(response))
+                props = json.load(response)
+                json_write(out / "props.json", props)
+            runtime_build = require_runtime_build(props, expected_build)
             say(f"{name}: server bereit" + (f"; Candidate-Prefill: {placement}" if candidate else ""))
             for phase in ("cold", "warm"):
                 result = send_request(request, out / phase, cli.request_timeout)
@@ -334,7 +346,7 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
                 if not (profiler and rc == 143 and proc.returncode in (0, 143)):
                     raise RuntimeError(f"Unerwarteter Stop: run.py={rc}, launcher={proc.returncode}")
             if name == "01-reference":
-                return {"requests": results}
+                return {"requests": results, "runtime_build": runtime_build}
             trace = out / "instrumented" / "trace.log"
             intervals = {key: (value["monotonic_start_us"], value["monotonic_end_us"]) for key, value in results.items()}
             split = split_host_trace(trace, out, intervals)
@@ -358,10 +370,10 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
                 gpu = json.loads((out / "gpu.json").read_text())
                 if not gpu.get("kernels"):
                     raise RuntimeError("Profiler enthielt keine GPU-Kernel")
-                return {"requests": results, "host": analysis, "trace_split": split,
+                return {"requests": results, "host": analysis, "trace_split": split, "runtime_build": runtime_build,
                         "gpu_profile_whole_session": {"kernel_groups": len(gpu["kernels"]),
                                                       "warnings": gpu.get("coverage_warnings", [])}}
-            return {"requests": results, "host": analysis, "trace_split": split}
+            return {"requests": results, "host": analysis, "trace_split": split, "runtime_build": runtime_build}
         finally:
             if not stopped and proc.poll() is None:
                 try:
@@ -538,7 +550,7 @@ def main() -> int:
         "repo_HEAD_during_run": repo_head,
         "baseline_source_expected_not_verified": "unknown",
         "candidate_source_expected_not_verified": repo_head,
-        "binary_provenance_note": "Binary SHA256s recorded. Source revisions are not verified; inspect the selected baseline build ID and configuration. The original and numerically corrected references use separate build directories.",
+        "binary_provenance_note": "Binary SHA256s recorded. Each runtime /props build ID is recorded and must match the reference within a variant before further requests. This does not verify a clean source tree or equal build options.",
         "binaries": {variant: {key: {k: v for k, v in entry.items() if k != "script"} for key, entry in xs.items()} for variant, xs in launchers.items()},
         "request_sha256": hashlib.sha256(payload).hexdigest(),
         "cache_prompt": False, "profile_enabled": a.profile, "candidate_activation_required": True, "started": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -559,7 +571,9 @@ def main() -> int:
                 target = suite / variant / name
                 target.parent.mkdir(exist_ok=True)
                 try:
-                    result = run_phase(root, target, name, launchers[variant][kind]["script"], profiler, payload, env, a, candidate=variant == "candidate")
+                    expected = next((r['runtime_build'] for r in report[variant].values() if r.get('runtime_build')), None)
+                    result = run_phase(root, target, name, launchers[variant][kind]["script"], profiler, payload, env, a,
+                                       candidate=variant == "candidate", expected_build=expected)
                     report[variant][name] = result
                     json_write(suite / "comparison.json", report)
                     say(f"{variant}/{name}: OK")

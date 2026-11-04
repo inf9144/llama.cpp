@@ -4120,6 +4120,31 @@ static bool ggml_cuda_mmf_thin_fusion_matches(const ggml_cgraph * graph, int i) 
         ggml_cuda_mmf_thin_shape(mat->src[0], mat->src[1], silu) &&
         ggml_can_fuse_subgraph(graph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY }, { i + 2 });
 }
+
+static int ggml_cuda_mmvq_pair_end(const ggml_cgraph * graph, int i) {
+    const auto * first = graph->nodes[i];
+    if (first->op != GGML_OP_MUL_MAT || first->src[0]->type != GGML_TYPE_Q6_K) {
+        return i;
+    }
+    for (int j = i + 1; j < graph->n_nodes && j <= i + 4; ++j) {
+        const auto * second = graph->nodes[j];
+        if (second->op == GGML_OP_VIEW || second->op == GGML_OP_RESHAPE) {
+            continue;
+        }
+        if (second->op != GGML_OP_MUL_MAT || second->src[1] != first->src[1]) {
+            return i;
+        }
+        // Preserve the existing gate/up/GLU fusion.
+        if (j + 1 < graph->n_nodes && graph->nodes[j + 1]->op == GGML_OP_GLU) {
+            const auto * glu = graph->nodes[j + 1];
+            if (glu->src[0] == first || glu->src[1] == first || glu->src[0] == second || glu->src[1] == second) {
+                return i;
+            }
+        }
+        return j;
+    }
+    return i;
+}
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4132,6 +4157,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
 #if defined(GGML_USE_HIP)
+    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int end = ggml_cuda_mmvq_pair_end(cgraph, i);
+        if (end > i) {
+            const int outputs[] = {i, end};
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, end - i + 1, outputs, 2) &&
+                    ggml_cuda_mul_mat_vec_q_pair(*cuda_ctx, node, cgraph->nodes[end])) {
+                return end - i;
+            }
+        }
+    }
     if (GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
             ggml_cuda_mmf_thin_fusion_matches(cgraph, i)) {
         const int output = i + 2;
