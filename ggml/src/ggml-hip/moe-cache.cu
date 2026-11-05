@@ -275,6 +275,10 @@ bool ggml_hip_moe_pipeline_init(ggml_backend_t backend, int32_t layers,
             GGML_ASSERT(e.device_lookup && il >= 0 && size_t(il) < e.jobs.size());
             return e.jobs[il].get();
         },
+        [](void * p, const ggml_moe_upload * uploads, size_t count) {
+            auto & e = *(service *) p;
+            ggml_cuda_set_tensor_batch_async_stream(e.ctx, uploads, count, e.upload);
+        },
     };
     engine.release();
     return true;

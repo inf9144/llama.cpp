@@ -62,6 +62,12 @@ struct ggml_moe_packet {
 // Internal HIP service. Slot maps stay on device; only admission needs a host
 // decision. Notifications also observe hits without blocking device execution.
 typedef void (*ggml_moe_resolve_t)(void * userdata, int32_t layer, const int32_t * ids, int32_t count, bool miss);
+struct ggml_moe_upload {
+    struct ggml_tensor * dst;
+    const void * src;
+    size_t offset;
+    size_t bytes;
+};
 struct ggml_moe_pipeline {
     void * context;
     bool device_lookup;
@@ -72,6 +78,8 @@ struct ggml_moe_pipeline {
     void (*packet_begin)(void * context, int32_t lane);
     void (*packet_end)(void * context, int32_t lane, struct ggml_moe_packet * packet);
     void * (*lookup_job)(void * context, int32_t layer);
+    // Same source lifetime and stream order as upload. Pool-backed copies own their host sources.
+    void (*upload_batch)(void * context, const struct ggml_moe_upload * uploads, size_t count);
 };
 typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t layers,
     ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);

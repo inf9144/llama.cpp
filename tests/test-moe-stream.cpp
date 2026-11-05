@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -224,8 +225,13 @@ struct lookup_fixture {
             const int index = (1 - il)*experts + e;
             f.cross_layer_evictions += before[index] >= 0 && f.maps[index] < 0;
         }
+        std::vector<ggml_moe_upload> uploads;
+        auto upload = [&](ggml_tensor * dst, const void * src, size_t offset, size_t bytes) {
+            if (f.sparse_updates) uploads.push_back({dst, src, offset, bytes});
+            else f.pipeline.upload(f.pipeline.context, dst, src, offset, bytes);
+        };
         for (auto fill : fills) {
-            f.pipeline.upload(f.pipeline.context, f.bank,
+            upload(f.bank,
                 f.weights.data() + (il*experts + fill.expert)*f.bank->nb[2], fill.slot*f.bank->nb[2], f.bank->nb[2]);
         }
         if (f.sparse_updates) {
@@ -236,10 +242,11 @@ struct lookup_fixture {
                 f.update_data[1 + 2*i] = index;
                 f.update_data[2 + 2*i] = f.maps[index];
             }
-            f.pipeline.upload(f.pipeline.context, f.updates, f.update_data.data(), 0, f.update_data.size()*sizeof(int32_t));
+            upload(f.updates, f.update_data.data(), 0, f.update_data.size()*sizeof(int32_t));
         } else {
-            f.pipeline.upload(f.pipeline.context, f.map, f.maps.data(), 0, ggml_nbytes(f.map));
+            upload(f.map, f.maps.data(), 0, ggml_nbytes(f.map));
         }
+        if (f.sparse_updates) f.pipeline.upload_batch(f.pipeline.context, uploads.data(), uploads.size());
     }
 
     void run(ggml_moe_pipeline_init_t init) {
@@ -385,6 +392,79 @@ static void test_lookup_updates(ggml_backend_t backend, ggml_moe_pipeline_init_t
     s.pipeline.destroy(s.pipeline.context);
 }
 
+static void test_upload_batch(ggml_backend_t backend, ggml_moe_pipeline_init_t init, bool bench) {
+    ggml_moe_pipeline pipeline = {};
+    GGML_ASSERT(init(backend, 1, [](void *, int32_t, const int32_t *, int32_t, bool) {}, nullptr, &pipeline));
+    GGML_ASSERT(pipeline.upload_batch);
+    ggml_context_ptr ctx(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
+    constexpr size_t bank_bytes = 10*1024*1024;
+    ggml_tensor * banks[3];
+    for (int i = 0; i < 3; ++i) banks[i] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, bank_bytes);
+    auto * view = ggml_view_1d(ctx.get(), banks[1], bank_bytes - 19, 19);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    GGML_ASSERT(buffer);
+    std::vector<uint8_t> source(3*bank_bytes), actual(bank_bytes);
+    std::vector<std::vector<uint8_t>> expected(3, std::vector<uint8_t>(bank_bytes));
+    const char * filter = getenv("GGML_ROCM_MALLOC_STAGE_POOL_TENSOR"), * enabled = getenv("GGML_ROCM_MALLOC_STAGE_POOL");
+    const bool owned = (!filter || !filter[0]) && (!enabled || !strcmp(enabled, "1"));
+    pipeline.upload_batch(pipeline.context, nullptr, 0);
+    for (int step = 0; step < 8; ++step) {
+        for (size_t i = 0; i < source.size(); ++i) source[i] = uint8_t((i*13 + step*31) % 251);
+        std::vector<ggml_moe_upload> uploads;
+        for (int bank = 0; bank < 3; ++bank) {
+            std::fill(expected[bank].begin(), expected[bank].end(), 0xa5);
+            ggml_backend_tensor_set(banks[bank], expected[bank].data(), 0, bank_bytes);
+            size_t offset = 37;
+            for (size_t bytes : {size_t(0), size_t(17), size_t(65535), size_t(65536), size_t(65537), size_t(2*1024*1024 + 3)}) {
+                uploads.push_back({bank == 1 ? view : banks[bank], source.data() + bank*bank_bytes + offset, offset, bytes});
+                std::memcpy(expected[bank].data() + offset + (bank == 1 ? 19 : 0), uploads.back().src, bytes);
+                offset += bytes + 29;
+            }
+        }
+        // Overlapping writes retain list order; the view also tests byte offsets.
+        uploads.push_back({banks[0], source.data() + 500, 40, 31});
+        std::memcpy(expected[0].data() + 40, source.data() + 500, 31);
+        if (step%2) pipeline.upload_batch(pipeline.context, uploads.data(), uploads.size());
+        else for (const auto & u : uploads) if (u.bytes) pipeline.upload(pipeline.context, u.dst, u.src, u.offset, u.bytes);
+        if (owned) std::fill(source.begin(), source.end(), 0xff);
+        pipeline.flush(pipeline.context);
+        for (int bank = 0; bank < 3; ++bank) {
+            ggml_backend_tensor_get(banks[bank], actual.data(), 0, bank_bytes);
+            GGML_ASSERT(actual == expected[bank]);
+        }
+    }
+    printf("%s upload batch: byte equality, guards, views, overlapping writes, source lifetime and pool reuse passed\n", ggml_backend_name(backend));
+    if (bench) for (int experts : {1, 4, 16}) {
+        std::vector<ggml_moe_upload> uploads;
+        for (int bank = 0; bank < 3; ++bank) for (int e = 0; e < experts; ++e) {
+            const size_t bytes = (bank == 1 ? 256 : 128)*1024;
+            uploads.push_back({banks[bank], source.data() + bank*bank_bytes + e*bytes, size_t(e)*bytes, bytes});
+        }
+        std::vector<double> host[2], wall[2];
+        for (int round = 0; round < 9; ++round) for (int order = 0; order < 2; ++order) {
+            const int batch = (round + order)%2;
+            pipeline.flush(pipeline.context);
+            int64_t enqueue = 0;
+            const int64_t start = ggml_time_us();
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                const int64_t before = ggml_time_us();
+                if (batch) pipeline.upload_batch(pipeline.context, uploads.data(), uploads.size());
+                else for (const auto & u : uploads) pipeline.upload(pipeline.context, u.dst, u.src, u.offset, u.bytes);
+                enqueue += ggml_time_us() - before;
+                pipeline.flush(pipeline.context);
+            }
+            if (round > 0) {
+                host[batch].push_back(enqueue/8.0);
+                wall[batch].push_back((ggml_time_us() - start)/8.0);
+            }
+        }
+        for (int i = 0; i < 2; ++i) { std::sort(host[i].begin(), host[i].end()); std::sort(wall[i].begin(), wall[i].end()); }
+        printf("%s upload batch experts=%d copies=%zu host_us=%.3f -> %.3f complete_us=%.3f -> %.3f (separate -> batch; alternating medians, includes staging and completion)\n",
+            ggml_backend_name(backend), experts, uploads.size(), host[0][4], host[1][4], wall[0][4], wall[1][4]);
+    }
+    pipeline.destroy(pipeline.context);
+}
+
 // Reproduce the poisoned-tail failure without requiring a GPU: a tiled read
 // dequantizes the next block, then multiplies it by zero activation padding.
 static void test_quantized_padding() {
@@ -414,10 +494,13 @@ static void test_quantized_padding() {
 int main(int argc, char ** argv) {
     const char * filter = nullptr;
     bool lookup_only = false;
+    bool upload_only = false, upload_bench = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) filter = argv[++i];
         else if (strcmp(argv[i], "--lookup-only") == 0) lookup_only = true;
-        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only]");
+        else if (strcmp(argv[i], "--upload-only") == 0) upload_only = true;
+        else if (strcmp(argv[i], "--upload-bench") == 0) upload_only = upload_bench = true;
+        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only | --upload-only | --upload-bench]");
     }
     ggml_backend_load_all();
     test_quantized_padding();
@@ -433,6 +516,11 @@ int main(int argc, char ** argv) {
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr)); GGML_ASSERT(backend);
         if (ggml_backend_is_cpu(backend.get())) ggml_backend_cpu_set_n_threads(backend.get(), 2);
         auto init = reg ? (ggml_moe_pipeline_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_pipeline_init") : nullptr;
+        if (upload_only) {
+            if (hip && init) test_upload_batch(backend.get(), init, upload_bench);
+            ++tested; gpu += hip;
+            continue;
+        }
         if (lookup_only) {
             if (hip && init) {
                 for (int width : {1, 4, 8}) for (bool sparse : {false, true}) {

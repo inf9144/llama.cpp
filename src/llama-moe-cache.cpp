@@ -115,6 +115,7 @@ struct llama_moe_cache::impl {
         ggml_tensor * active = nullptr;
         ggml_moe_pipeline pipeline = {};
         std::vector<moe_cache_policy::fill> admissions;
+        std::vector<ggml_moe_upload> uploads;
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -680,6 +681,8 @@ struct llama_moe_cache::impl {
                   << ",\"map_update_entries\":" << g.policy.changed.size()
                   << ",\"map_update_bytes\":" << (miss ? (1 + 2*g.policy.changed.size())*sizeof(int32_t) : 0));
         size_t bytes = 0;
+        const bool batch_upload = miss && d.pipeline.upload_batch;
+        if (batch_upload) d.uploads.clear();
         for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
             const auto * w = layers[il].experts[ip];
             MOE_MEASURE(llama_moe_measure::record r("bank", d.backend, w); r.out << ",\"expert_bytes\":" << w->nb[2]);
@@ -689,8 +692,10 @@ struct llama_moe_cache::impl {
 #ifdef LLAMA_MOE_MEASURE
                 const int64_t upload_start = ggml_time_us();
 #endif
-                d.pipeline.upload(d.pipeline.context, g.banks[ip], (const char *) w->data + size_t(admissions[i].expert)*w->nb[2], size_t(admissions[i].slot)*w->nb[2], n*w->nb[2]);
-                MOE_MEASURE(llama_moe_measure::transfer("admission_h2d", d.backend, w, admissions[i].expert, n, n*w->nb[2], ggml_time_us()-upload_start));
+                ggml_moe_upload upload = {g.banks[ip], (const char *) w->data + size_t(admissions[i].expert)*w->nb[2], size_t(admissions[i].slot)*w->nb[2], n*w->nb[2]};
+                if (batch_upload) d.uploads.push_back(upload);
+                else d.pipeline.upload(d.pipeline.context, upload.dst, upload.src, upload.offset, upload.bytes);
+                MOE_MEASURE(llama_moe_measure::transfer("admission_h2d", d.backend, w, admissions[i].expert, n, n*w->nb[2], batch_upload ? 0 : ggml_time_us()-upload_start));
                 bytes += n*w->nb[2];
                 i += n;
             }
@@ -709,7 +714,16 @@ struct llama_moe_cache::impl {
                 g.gpu_updates_host[2 + 2*i] = g.policy.slot_map[layer][expert];
             }
             const size_t bytes = (1 + 2*g.policy.changed.size())*sizeof(int32_t);
-            d.pipeline.upload(d.pipeline.context, g.gpu_updates, g.gpu_updates_host.data(), 0, bytes);
+            if (batch_upload) d.uploads.push_back({g.gpu_updates, g.gpu_updates_host.data(), 0, bytes});
+            else d.pipeline.upload(d.pipeline.context, g.gpu_updates, g.gpu_updates_host.data(), 0, bytes);
+        }
+        if (batch_upload) {
+#ifdef LLAMA_MOE_MEASURE
+            const int64_t upload_start = ggml_time_us();
+#endif
+            d.pipeline.upload_batch(d.pipeline.context, d.uploads.data(), d.uploads.size());
+            MOE_MEASURE(llama_moe_measure::record r("admission_batch", d.backend, layers[il].experts.front());
+                r.out << ",\"enqueue_us\":" << ggml_time_us()-upload_start << ",\"copies\":" << d.uploads.size());
         }
         {
             std::lock_guard<std::mutex> lock(stats_mutex);

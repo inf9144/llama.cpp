@@ -772,6 +772,26 @@ struct ggml_rocm_malloc_stage_slot {
     bool pinned = false;
 };
 
+struct ggml_rocm_malloc_stage_config {
+    bool enabled;
+    size_t limit;
+    const char * filter;
+
+    bool matches(const ggml_moe_upload & upload) const {
+        return enabled && upload.bytes > 0 &&
+            (!filter || !filter[0] || std::strstr(upload.dst->name, filter));
+    }
+};
+
+static const ggml_rocm_malloc_stage_config & ggml_rocm_stage_config() {
+    static const ggml_rocm_malloc_stage_config config = {
+        ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL", 1) != 0,
+        size_t(std::max(1, std::min(4096, ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL_MIB", 512))))*1024*1024,
+        getenv("GGML_ROCM_MALLOC_STAGE_POOL_TENSOR"),
+    };
+    return config;
+}
+
 struct ggml_rocm_malloc_stage_pool {
     std::vector<ggml_rocm_malloc_stage_slot> slots;
     size_t reserved_bytes = 0;
@@ -907,6 +927,52 @@ struct ggml_rocm_malloc_stage_pool {
             slot.in_flight = true;
             slot.submitted = ++submissions;
             offset += n;
+        }
+    }
+
+    void copy_batch(cudaStream_t stream, const ggml_moe_upload * uploads, size_t count,
+            const ggml_rocm_malloc_stage_config & config) {
+        constexpr size_t granularity = 64*1024;
+        const size_t chunk_limit = std::min(config.limit, size_t(64)*1024*1024);
+        for (size_t first = 0; first < count;) {
+            const auto & u = uploads[first];
+            if (!u.bytes) {
+                ++first;
+                continue;
+            }
+            if (!config.matches(u)) {
+                CUDA_CHECK(cudaMemcpyAsync((char *) u.dst->data + u.offset, u.src, u.bytes, cudaMemcpyHostToDevice, stream));
+                ++first;
+                continue;
+            }
+            if (u.bytes > chunk_limit) {
+                copy(stream, (char *) u.dst->data + u.offset, u.src, u.bytes, config.limit);
+                ++first;
+                continue;
+            }
+            size_t last = first, bytes = 0;
+            while (last < count && (!uploads[last].bytes || config.matches(uploads[last])) &&
+                    uploads[last].bytes <= chunk_limit - bytes) {
+                bytes += uploads[last++].bytes;
+            }
+            const size_t capacity = (bytes + granularity - 1) & ~(granularity - 1);
+            const size_t selected = acquire(capacity, config.limit);
+            auto & slot = slots[selected];
+            size_t offset = 0;
+            for (size_t i = first; i < last; ++i) {
+                const auto & upload = uploads[i];
+                if (!upload.bytes) continue;
+                void * staged = (char *) slot.data + offset;
+                std::memcpy(staged, upload.src, upload.bytes);
+                CUDA_CHECK(cudaMemcpyAsync((char *) upload.dst->data + upload.offset, staged,
+                    upload.bytes, cudaMemcpyHostToDevice, stream));
+                offset += upload.bytes;
+            }
+            // One event protects every disjoint source range in this slot.
+            CUDA_CHECK(cudaEventRecord(slot.done, stream));
+            slot.in_flight = true;
+            slot.submitted = ++submissions;
+            first = last;
         }
     }
 };
@@ -2882,13 +2948,8 @@ static void ggml_cuda_set_tensor_async_impl(ggml_backend_cuda_context * cuda_ctx
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
 #if defined(GGML_USE_HIP)
-    static const bool malloc_pool_enabled = ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL", 1) != 0;
-    static const int malloc_pool_mib = std::max(1, std::min(4096,
-        ggml_cuda_env_int("GGML_ROCM_MALLOC_STAGE_POOL_MIB", 512)));
-    static const char * malloc_pool_filter = getenv("GGML_ROCM_MALLOC_STAGE_POOL_TENSOR");
-    if (malloc_pool_enabled && size > 0 &&
-        (malloc_pool_filter == nullptr || malloc_pool_filter[0] == 0 ||
-         std::strstr(tensor->name, malloc_pool_filter) != nullptr)) {
+    const auto & config = ggml_rocm_stage_config();
+    if (config.matches({tensor, data, offset, size})) {
         ggml_cuda_set_device(cuda_ctx->device);
         std::lock_guard<std::mutex> lock(cuda_ctx->rocm_malloc_stage_pool_mutex);
         if (cuda_ctx->rocm_malloc_stage_pool == nullptr) {
@@ -2896,7 +2957,7 @@ static void ggml_cuda_set_tensor_async_impl(ggml_backend_cuda_context * cuda_ctx
         }
         cuda_ctx->rocm_malloc_stage_pool->copy(stream,
             (char *) tensor->data + offset, data, size,
-            (size_t) malloc_pool_mib * 1024 * 1024);
+            config.limit);
         return;
     }
 #endif
@@ -2914,6 +2975,32 @@ void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_ten
         const void * data, size_t offset, size_t size, cudaStream_t stream) {
     GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
     ggml_cuda_set_tensor_async_impl(&ctx, tensor, data, offset, size, stream);
+}
+
+void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,
+        const ggml_moe_upload * uploads, size_t count, cudaStream_t stream) {
+    const auto & config = ggml_rocm_stage_config();
+    bool staged = false;
+    for (size_t i = 0; i < count; ++i) {
+        const auto & u = uploads[i];
+        GGML_ASSERT(u.dst && u.offset <= ggml_nbytes(u.dst) && u.bytes <= ggml_nbytes(u.dst) - u.offset);
+        auto * buffer = u.dst->view_src ? u.dst->view_src->buffer : u.dst->buffer;
+        GGML_ASSERT(buffer && buffer->buft == ggml_backend_cuda_buffer_type(ctx.device));
+        GGML_ASSERT(!u.bytes || u.src);
+        staged |= config.matches(u);
+    }
+    if (!count) return;
+    ggml_cuda_set_device(ctx.device);
+    if (!staged) {
+        for (size_t i = 0; i < count; ++i) {
+            const auto & u = uploads[i];
+            if (u.bytes) CUDA_CHECK(cudaMemcpyAsync((char *) u.dst->data + u.offset, u.src, u.bytes, cudaMemcpyHostToDevice, stream));
+        }
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx.rocm_malloc_stage_pool_mutex);
+    if (!ctx.rocm_malloc_stage_pool) ctx.rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
+    ctx.rocm_malloc_stage_pool->copy_batch(stream, uploads, count, config);
 }
 #endif
 

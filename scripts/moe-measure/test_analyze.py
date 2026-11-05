@@ -38,6 +38,19 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual((layer['h2d_bytes'], layer['d2d_bytes'], layer['upload_enqueue_us']), (200, 0, 5))
         self.assertEqual((layer['unique_experts'], layer['miss_experts']), (3, 2))
 
+    def test_batched_admissions_count_weights_and_time_once(self):
+        base = dict(schema=1, context=1, graph=2, backend='ROCm0', tokens=4, graph_type=0, us=0,
+                    tensor='blk.3.ffn_up_exps.weight')
+        events = [dict(kind='routing', counts=[2, 1], resident=[1, 0], wait_us=0),
+                  dict(kind='bank', expert_bytes=100),
+                  dict(kind='admission_h2d', bytes=100, enqueue_us=0),
+                  dict(kind='admission_h2d', bytes=200, enqueue_us=0),
+                  dict(kind='admission_batch', copies=3, enqueue_us=19)]
+        layer = analyzer.analyze(['MOE_MEASURE\t'+json.dumps(base | e) for e in events], 'verify')['layers'][0]
+        self.assertEqual((layer['h2d_bytes'], layer['upload_enqueue_us']), (300, 19))
+        self.assertEqual((layer['upload_batches'], layer['upload_copies']), (1, 3))
+        self.assertEqual((layer['unique_experts'], layer['miss_experts']), (2, 1))
+
     def test_missing_trace(self):
         with self.assertRaises(ValueError):
             analyzer.analyze(['ordinary log'], 'decode')

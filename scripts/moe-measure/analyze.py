@@ -33,6 +33,7 @@ def analyze(lines, phase):
                                            tokens=event['tokens'], graph_type=event['graph_type'], banks={},
                                            h2d_bytes=0, d2d_bytes=0, routing_wait_us=0, upload_enqueue_us=0,
                                            host_plan_us=0, device_lookup=False, device_miss=False,
+                                           upload_batches=0, upload_copies=0,
                                            counts=None, hits=set()))
         kind = event['kind']
         if kind == 'routing':
@@ -52,6 +53,10 @@ def analyze(lines, phase):
         if kind in ('h2d', 'admission_h2d', 'stage_h2d'):
             group['h2d_bytes'] += event['bytes']
             group['upload_enqueue_us'] += event['enqueue_us']
+        elif kind == 'admission_batch':
+            group['upload_enqueue_us'] += event['enqueue_us']
+            group['upload_batches'] += 1
+            group['upload_copies'] += event['copies']
         elif kind == 'd2d':
             group['d2d_bytes'] += event['bytes']
             group['hits'].update(range(event['first'], event['first'] + event['count']))

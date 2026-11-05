@@ -1754,3 +1754,45 @@ and fish --no-config scripts/moe-measure/run_verify_pair.fish
 The helper saves `build-rocm-moe-before-verify-pair`, pins `$HOME/opt/rocm-10.1` with explicit compiler/prefix paths, and builds reference and measurement servers with `-j28`. Only the new native pair fixture runs on both GPUs, followed by the greedy draft-3 numerical diagnosis and the manufacturer/probabilistic draft-3 A/B/profile suite. Original templates, cache budgets, sampling defaults and `build-rocm10` are untouched. Results are below `results/moe-verify-pair-check-...`; the completion and decode runs each retain their existing handoff archive. No identical interactive-session replay is required.
 
 Local CPU build, cache-policy validation (2000 plans), prefill/logit/checkpoint validation (NMSE=0), all 68 Python tests including actual Fish runner fixtures, Fish syntax, Python type checks, EditorConfig and `git diff --check` pass. The CPU fixture explicitly skips GPU cache execution. The coding environment has no ROCm SDK or GPU: HIP compilation, native pair bitwise checks, production dispatch, DFlash acceptance, timing, VRAM high-water behavior and Vulkan execution remain open. Do not merge or assume the candidate is faster until the workstation results are available.
+
+### Live miss-upload trace and batched host staging (2026-11-05)
+
+`live-decode-20261105-192833.tar.gz` contains a complete 120.03-second collection. The kernel CSV has 3,494,724 lines including its header (1,158,064,728 bytes, SHA256 `249c12e1eb3d8a183957287fd206501b54369086592e8066e5c547ba52d82d72`). A first local extraction was incomplete; the figures here use the verified full file and all 3,494,723 valid dispatch records. The archive has no server/request logs or build identity. It does not establish accepted output tokens/s, exact expert transfer bytes, full process VRAM peak or the boundary of SSD restore.
+
+The analysis isolates 853 complete target passes with four queries: 48 routers and 96 MoE matmuls per pass, with 30 layers on gfx1100 and 18 on gfx1101. Prefill and draft execution outside those passes are excluded from this table. These are sums divided by pass count, under the profiler, not uninstrumented latency predictions. Copy spans overlap wait spans and must not be added to them.
+
+| Average per four-query target pass | gfx1100 | gfx1101 |
+| --- | ---: | ---: |
+| MoE signal-wait kernels | 27.526 ms | 10.178 ms |
+| Recorded H2D copies in the target interval | 6.793 ms | 5.729 ms |
+| MoE matrix kernels | 3.067 ms | 2.999 ms |
+| Sparse attention plus combine | 0.421 ms | 0.513 ms |
+| Lightning Indexer | 0.421 ms | 0.413 ms |
+| QSA selection | 0.091 ms | 0.073 ms |
+
+Within lookup windows, 20,327/25,590 on gfx1100 and 7,156/15,354 on gfx1101 contain recorded H2D transfers. These are proportions of layer requests with transfers, not expert miss rates. Transfer-free lookup windows have medians of 8.36/13.36 us. Windows with transfers have medians of 768.73/792.93 us. On gfx1100, gaps between the first and last copies, excluding the recorded DMA spans themselves, sum to about 16.90 ms per target pass. The source of these gaps is not uniquely identified: host memcpy, pool management, CPU scheduling, runtime and profiler effects can contribute.
+
+Copy/API correlation identifies the existing per-device worker threads. Their full-window counts include 235,174 and 47,909 `hipEventRecord` calls, and 971,267 and 126,391 `hipEventQuery` calls respectively. Much of the time between their upload calls is outside the recorded HIP APIs. Batching removes repeated bookkeeping; it does not remove host weight reads or establish that all observed gaps are removable.
+
+The candidate collects a small miss's existing weight ranges and its existing map patch into one ordered upload request. An optional callback in the process-local `ggml_moe_pipeline` contract submits it on the same HIP upload stream. The existing pool packs ranges into disjoint portions of a host segment, copies each portion directly to its original cache destination, then records one completion event for that segment. The event protects every portion until its DMA completes. The CPU still copies each source before enqueueing that range, allowing earlier DMA to run while later sources are staged. No GPU weight-scatter copy or extra device allocation is introduced.
+
+Batch segments are at most 64 MiB and use the existing per-context pool budget (default 512 MiB). Individual oversized ranges use the existing chunk/copy behavior. Pool disable and tensor filters retain their existing meaning, including a mixture of staged and direct ranges. Bounds and destination device are checked before submission. The shared pool mutex protects allocation, submission and final event recording. The worker queues the original ready signal only after weights and map updates, as before. Cache-hit execution, admission policy, weight bytes, cache slots, attention arithmetic, graph layout and the large-batch prefill path are unchanged. Larger host slots can alter pin-allocation/reuse costs; cold and concurrent-input behavior still need GPU measurement.
+
+Measurement builds retain per-range weight byte accounting with zero per-range enqueue time for a collected batch. The `admission_batch` record supplies the actual submission time once, including the map patch, plus request/range counts. `analyze.py` accounts for that time once without counting map metadata as expert weight bytes. There is no new runtime option or normal-build logging.
+
+Local validation:
+
+- CPU Release build of `test-moe-stream` and `test-llama-archs` passed. The instrumented `llama-moe-cache.cpp` also passed a separate C++17 syntax check.
+- The production pool implementation passes a deferred-copy host harness under AddressSanitizer and UBSan: borrowed-source mutation, event-protected reuse and destruction, two streams, byte guards, overlapping writes, zero and oversized ranges, mixed filters, pin-allocation fallback and budget enforcement. Twelve small staged ranges require one event. This uses a simulated HIP runtime and is not a HIP build or GPU validation. LeakSanitizer is disabled because the tool sandbox blocks its `/proc` task inspection.
+- Cache-policy tests passed, including the 2,000-plan victim oracle. The CPU prefill fixture passed with logit NMSE 0, checkpoints and warm-cache reset; GPU cache execution was skipped. Six analyzer and thirteen A/B-controller unit tests passed. Embedded Python in the runner parses; Fish execution itself is not available in this environment.
+
+Hardware validation is pending. Run the prepared helper before rebuilding the existing reference/measurement binaries manually:
+
+```fish
+git pull --ff-only
+and fish scripts/moe-measure/run_upload_batch.fish
+```
+
+The helper verifies and saves both existing runtimes to `build-rocm-moe-before-upload-batch`, pins `$HOME/opt/rocm-10.1` and builds with `-j28`. It runs focused native upload checks with a 1-MiB pool, an alternating-order upload benchmark with the 512-MiB pool, and the short lookup/signal checks on both GPUs. The byte fixture includes views, overlaps, guards, source mutation and reuse. Sparse-map lookup fixtures now exercise batching under real GPU graph waits for widths 1/4/8; full-map fixtures retain separate uploads as a reference. Greedy diagnoses at draft maxima 0 and 3 must match before the existing manufacturer/probabilistic draft-3 A/B/profile run. The helper checks that profiled device-miss backends actually submitted batches. Tests and benchmarks use only the existing pool settings, scoped to the helper process. Original launchers and `build-rocm10` are untouched.
+
+The isolated upload benchmark includes host staging and stream completion but uses resident host test data. The existing short warm request has no expert misses and cannot prove a live decode gain. Use the native checks and uninstrumented cold/warm controls first; no exact reproduction of the interactive session is required. HIP compilation, real asynchronous dependencies, decode/verify numerical equivalence, end-to-end speed and allocation behavior remain open until the hardware results arrive. This candidate stays on `feature/moe-cache-prefill`; it is not merged into `codex-compat`.
