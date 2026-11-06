@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "../ggml/src/ggml-moe.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -17,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2257,7 +2259,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * shared) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2280,7 +2283,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        shared
     );
 }
 
@@ -2310,7 +2314,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * shared) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2456,7 +2461,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, shared, cur);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2689,7 +2694,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * shared,
+         ggml_tensor * shared_input) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
@@ -2716,6 +2723,38 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     auto backend = moe_cache->backend(il, selected_experts->ne[1]);
     if (!ggml_backend_supports_op(backend, slots)) {
         return nullptr;
+    }
+    if (shared && shared_input && slots->op == GGML_OP_MOE_CACHE_LOOKUP) {
+        std::vector<ggml_tensor *> work = { shared };
+        bool supported = true;
+        for (size_t i = 0; i < work.size() && supported; ++i) {
+            auto * node = work[i];
+            if (node->op == GGML_OP_NONE) {
+                supported = node->buffer && ggml_backend_buffer_get_type(node->buffer) == ggml_backend_get_default_buffer_type(backend);
+                continue;
+            }
+            supported = ggml_backend_supports_op(backend, node);
+            for (auto * src : node->src) {
+                if (src && src != shared_input && std::find(work.begin(), work.end(), src) == work.end()) work.push_back(src);
+            }
+        }
+        if (supported) {
+            auto * finish = ggml_moe_cache_finish(ctx0, slots, shared);
+            ggml_moe_set_lookup_stage(slots, GGML_MOE_LOOKUP_PUBLISH);
+            if (ggml_backend_supports_op(backend, slots) && ggml_backend_supports_op(backend, finish)) {
+                cb(slots, "ffn_moe_request", il);
+                ggml_backend_sched_set_tensor_backend(sched, slots, backend);
+                ggml_build_forward_expand(gf, slots);
+                for (auto * node : work) {
+                    if (node->op != GGML_OP_NONE) ggml_backend_sched_set_tensor_backend(sched, node, backend);
+                }
+                // Both branches share this stream; defer its weight wait until the independent work is complete.
+                ggml_build_forward_expand(gf, shared);
+                slots = finish;
+            } else {
+                ggml_moe_set_lookup_stage(slots, GGML_MOE_LOOKUP_FULL);
+            }
+        }
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, backend);
     cb(slots, "ffn_moe_slots", il);

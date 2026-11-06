@@ -18,6 +18,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-moe-cache.h"
 #include "../src/llama-moe-cache-policy.h"
+#include "../ggml/src/ggml-moe.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -2851,6 +2852,7 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         int redirected = 0;
         int fallback = 0;
         int device_lookups = 0;
+        int device_requests = 0;
         int last_layer_device_lookups = 0;
         int cropped_lookups = 0;
     };
@@ -2871,6 +2873,10 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
             if (ask) { return (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT_ID_STREAM || t->op == GGML_OP_MOE_CACHE_LOOKUP); }
             auto & cap = *static_cast<capture *>(userdata);
             if (t->op == GGML_OP_MOE_CACHE_LOOKUP) {
+                if (ggml_moe_get_lookup_stage(t) == GGML_MOE_LOOKUP_PUBLISH) {
+                    ++cap.device_requests;
+                    return true;
+                }
                 ++cap.device_lookups;
                 int il = -1;
                 GGML_ASSERT(sscanf(t->name, "ffn_moe_slots-%d", &il) == 1);
@@ -2973,9 +2979,10 @@ static int test_moe_cache_prefill(size_t seed, float stdev, const char * target_
         }
         const bool any_budget = std::any_of(budgets.begin(), budgets.end(), [](size_t b) { return b != 0; });
         GGML_ASSERT(!any_budget || config != 0 || cap.cached > 0);
+        GGML_ASSERT(cap.device_requests <= cap.device_lookups);
         GGML_ASSERT(cap.last_layer_device_lookups == 0 || cap.cropped_lookups > 0);
-        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, redirected=%d, fallback=%d, device lookups=%d, cropped=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
-            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.redirected, cap.fallback, cap.device_lookups, cap.cropped_lookups, worst_nmse);
+        printf("MoE prefill %s model: devices=%zu, budgets=%d, cached=%d, redirected=%d, fallback=%d, device lookups=%d, split requests=%d, cropped=%d, worst logit NMSE=%g, checkpoint and warm-cache reset passed\n",
+            cpu_fixture ? "CPU fixture" : "GPU", devices.size(), config, cap.cached, cap.redirected, cap.fallback, cap.device_lookups, cap.device_requests, cap.cropped_lookups, worst_nmse);
     }
     return 0;
 }

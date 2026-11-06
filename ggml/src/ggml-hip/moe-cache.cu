@@ -206,6 +206,7 @@ static __global__ void publish_lookup(const int32_t * map, const int32_t * ids, 
     }
 }
 
+template<bool separate>
 static __global__ void finish_lookup(const int32_t * map, const int32_t * ids, int32_t * out,
         int32_t count, const notification * request, const int32_t * updates, int32_t * group_map, int64_t map_size) {
     const int i = threadIdx.x;
@@ -220,7 +221,7 @@ static __global__ void finish_lookup(const int32_t * map, const int32_t * ids, i
         }
         __syncthreads();
     }
-    if (i < count && request->miss) out[i] = map[ids[i]];
+    if (i < count && (separate || request->miss)) out[i] = map[ids[i]];
 }
 
 } // namespace
@@ -295,7 +296,13 @@ void ggml_hip_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int count = ggml_nelements(dst);
     GGML_ASSERT(count > 0 && count <= max_selected);
     const auto stream = ctx.stream();
-    publish_lookup<<<1, max_selected, 0, stream>>>(map, ids, slots, count, dst->src[0]->ne[1], job.device, job.ready);
+    const int32_t stage = ggml_moe_get_lookup_stage(dst);
+    GGML_ASSERT(stage >= GGML_MOE_LOOKUP_FULL && stage <= GGML_MOE_LOOKUP_FINISH);
+    if (stage != GGML_MOE_LOOKUP_FINISH) {
+        publish_lookup<<<1, max_selected, 0, stream>>>(map, ids, slots, count, dst->src[0]->ne[1], job.device, job.ready);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (stage == GGML_MOE_LOOKUP_PUBLISH) return;
 #if HIP_VERSION >= 60400000
     hipStreamCaptureStatus status;
     hipGraph_t graph;
@@ -314,7 +321,12 @@ void ggml_hip_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const auto * map_tensor = dst->src[0];
     while (map_tensor->view_src) map_tensor = map_tensor->view_src;
     const auto * updates = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
-    finish_lookup<<<1, max_selected, 0, stream>>>(map, ids, slots, count, job.device, updates,
-        (int32_t *) map_tensor->data, ggml_nelements(map_tensor));
+    if (stage == GGML_MOE_LOOKUP_FINISH) {
+        finish_lookup<true><<<1, max_selected, 0, stream>>>(map, ids, slots, count, job.device, updates,
+            (int32_t *) map_tensor->data, ggml_nelements(map_tensor));
+    } else {
+        finish_lookup<false><<<1, max_selected, 0, stream>>>(map, ids, slots, count, job.device, updates,
+            (int32_t *) map_tensor->data, ggml_nelements(map_tensor));
+    }
     CUDA_CHECK(cudaGetLastError());
 }

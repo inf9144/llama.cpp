@@ -84,6 +84,22 @@ struct ggml_moe_pipeline {
 typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t layers,
     ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);
 
+enum ggml_moe_lookup_stage {
+    GGML_MOE_LOOKUP_FULL = 0,
+    GGML_MOE_LOOKUP_PUBLISH = 1,
+    GGML_MOE_LOOKUP_FINISH = 2,
+};
+
+static inline int32_t ggml_moe_get_lookup_stage(const struct ggml_tensor * t) {
+    int32_t stage;
+    memcpy(&stage, (const char *) t->op_params + sizeof(void *), sizeof(stage));
+    return stage;
+}
+
+static inline void ggml_moe_set_lookup_stage(struct ggml_tensor * t, int32_t stage) {
+    memcpy((char *) t->op_params + sizeof(void *), &stage, sizeof(stage));
+}
+
 static inline struct ggml_tensor * ggml_moe_cache_lookup(struct ggml_context * ctx,
         struct ggml_tensor * map, struct ggml_tensor * ids, void * job, struct ggml_tensor * updates) {
     GGML_ASSERT(map->type == GGML_TYPE_I32 && job);
@@ -94,6 +110,7 @@ static inline struct ggml_tensor * ggml_moe_cache_lookup(struct ggml_context * c
     res->op = GGML_OP_MOE_CACHE_LOOKUP;
     res->src[2] = updates;
     memcpy(res->op_params, &job, sizeof(job));
+    ggml_moe_set_lookup_stage(res, GGML_MOE_LOOKUP_FULL);
     return res;
 }
 
@@ -101,6 +118,19 @@ static inline void * ggml_moe_get_lookup_job(const struct ggml_tensor * t) {
     void * job;
     memcpy(&job, t->op_params, sizeof(job));
     return job;
+}
+
+static inline struct ggml_tensor * ggml_moe_cache_finish(struct ggml_context * ctx,
+        struct ggml_tensor * published, struct ggml_tensor * work) {
+    GGML_ASSERT(published->op == GGML_OP_MOE_CACHE_LOOKUP && work);
+    struct ggml_tensor * res = ggml_dup_tensor(ctx, published);
+    res->op = GGML_OP_MOE_CACHE_LOOKUP;
+    for (int i = 0; i < 3; ++i) res->src[i] = published->src[i];
+    res->src[3] = published;
+    res->src[4] = work;
+    memcpy(res->op_params, published->op_params, sizeof(res->op_params));
+    ggml_moe_set_lookup_stage(res, GGML_MOE_LOOKUP_FINISH);
+    return res;
 }
 typedef bool (*ggml_moe_prepare_t)(void * userdata, int32_t packet, struct ggml_moe_packet * out);
 struct ggml_moe_stream {

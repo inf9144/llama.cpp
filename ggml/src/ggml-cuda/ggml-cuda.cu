@@ -6222,7 +6222,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MOE_CACHE_LOOKUP: {
 #if defined(GGML_USE_HIP)
             const auto & info = ggml_cuda_info().devices[dev_ctx->device];
+            const int32_t stage = ggml_moe_get_lookup_stage(op);
+            const auto * published = op->src[3];
             return GGML_CUDA_CC_IS_RDNA3_0(info.cc) && info.warp_size == 32 &&
+                stage >= GGML_MOE_LOOKUP_FULL && stage <= GGML_MOE_LOOKUP_FINISH &&
+                (stage != GGML_MOE_LOOKUP_FINISH || (published && op->src[4] &&
+                    published->op == GGML_OP_MOE_CACHE_LOOKUP && ggml_are_same_shape(op, published) &&
+                    published->src[0] == op->src[0] && published->src[1] == op->src[1] && published->src[2] == op->src[2] &&
+                    ggml_moe_get_lookup_stage(published) == GGML_MOE_LOOKUP_PUBLISH &&
+                    ggml_moe_get_lookup_job(published) == ggml_moe_get_lookup_job(op))) &&
                 ggml_moe_get_lookup_job(op) && op->type == GGML_TYPE_I32 &&
                 op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[0] == 1 &&
                 op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&

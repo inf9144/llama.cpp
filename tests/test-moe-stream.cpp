@@ -211,11 +211,12 @@ struct lookup_fixture {
     uint64_t clock = 0;
     int hits = 0, misses = 0, cross_layer_evictions = 0;
     bool sparse_updates = false;
+    bool split_lookup = false;
     std::vector<int32_t> update_data;
 
     void progress(const char * phase, int step = -1) const {
-        printf("%s lookup progress: tokens=%d sparse_updates=%d step=%d phase=%s\n",
-            ggml_backend_name(backend), tokens, sparse_updates, step, phase);
+        printf("%s lookup progress: tokens=%d sparse_updates=%d split=%d step=%d phase=%s\n",
+            ggml_backend_name(backend), tokens, sparse_updates, split_lookup, step, phase);
     }
 
     static void resolve(void * userdata, int32_t il, const int32_t * ids, int32_t count, bool miss) {
@@ -274,7 +275,15 @@ struct lookup_fixture {
             ids[il] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, used*tokens);
             auto * view = ggml_view_2d(ctx.get(), map, 1, experts, sizeof(int32_t), il*experts*sizeof(int32_t));
             auto * selected = ggml_moe_cache_lookup(ctx.get(), view, ids[il], pipeline.lookup_job(pipeline.context, il), sparse_updates ? updates : nullptr);
-            out[il] = ggml_mul_mat_id(ctx.get(), bank, x, ggml_reshape_2d(ctx.get(), selected, used, tokens));
+            auto * input = x;
+            if (split_lookup) {
+                ggml_moe_set_lookup_stage(selected, GGML_MOE_LOOKUP_PUBLISH);
+                ggml_build_forward_expand(graph, selected);
+                input = ggml_scale(ctx.get(), x, 0.5f);
+                ggml_build_forward_expand(graph, input);
+                selected = ggml_moe_cache_finish(ctx.get(), selected, input);
+            }
+            out[il] = ggml_mul_mat_id(ctx.get(), bank, input, ggml_reshape_2d(ctx.get(), selected, used, tokens));
             ggml_set_output(out[il]);
             ggml_build_forward_expand(graph, out[il]);
         }
@@ -319,6 +328,7 @@ struct lookup_fixture {
                     double expected = 0;
                     const int e = il*experts + routing[il][t*used + u];
                     for (int col = 0; col < k; ++col) expected += double(source[(e*m + row)*k + col])*input[(t*used + u)*k + col];
+                    if (split_lookup) expected *= 0.5;
                     const double value = actual[(t*used + u)*m + row];
                     GGML_ASSERT(std::isfinite(value));
                     error += (value - expected)*(value - expected); energy += expected*expected;
@@ -326,9 +336,9 @@ struct lookup_fixture {
                 worst = std::max(worst, error/std::max(energy, 1e-30));
             }
         }
-        GGML_ASSERT(hits > 0 && misses > 0 && (tokens == 1 || cross_layer_evictions > 0) && worst < 1e-10);
-        printf("%s device lookup: tokens=%d sparse_updates=%d hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
-            ggml_backend_name(backend), tokens, sparse_updates, hits, misses, cross_layer_evictions, worst);
+        GGML_ASSERT(hits > 0 && misses > 0 && hits + misses == 24 && (tokens == 1 || cross_layer_evictions > 0) && worst < 1e-10);
+        printf("%s device lookup: tokens=%d sparse_updates=%d split=%d hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
+            ggml_backend_name(backend), tokens, sparse_updates, split_lookup, hits, misses, cross_layer_evictions, worst);
         progress("pipeline-destroy");
         pipeline.destroy(pipeline.context);
     }
@@ -507,13 +517,15 @@ int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char * filter = nullptr;
     bool lookup_only = false;
+    bool overlap_only = false;
     bool upload_only = false, upload_bench = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) filter = argv[++i];
         else if (strcmp(argv[i], "--lookup-only") == 0) lookup_only = true;
+        else if (strcmp(argv[i], "--overlap-only") == 0) overlap_only = true;
         else if (strcmp(argv[i], "--upload-only") == 0) upload_only = true;
         else if (strcmp(argv[i], "--upload-bench") == 0) upload_only = upload_bench = true;
-        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only | --upload-only | --upload-bench]");
+        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only | --overlap-only | --upload-only | --upload-bench]");
     }
     ggml_backend_load_all();
     test_quantized_padding();
@@ -534,12 +546,13 @@ int main(int argc, char ** argv) {
             ++tested; gpu += hip;
             continue;
         }
-        if (lookup_only) {
+        if (lookup_only || overlap_only) {
             if (hip && init) {
                 for (int width : {1, 4, 8}) for (bool sparse : {false, true}) {
-                    lookup_fixture lookup; lookup.backend = backend.get(); lookup.tokens = width; lookup.sparse_updates = sparse; lookup.run(init);
+                    lookup_fixture lookup; lookup.backend = backend.get(); lookup.tokens = width; lookup.sparse_updates = sparse;
+                    lookup.split_lookup = overlap_only; lookup.run(init);
                 }
-                test_lookup_updates(backend.get(), init);
+                if (!overlap_only) test_lookup_updates(backend.get(), init);
             }
             ++tested; gpu += hip;
             continue;
