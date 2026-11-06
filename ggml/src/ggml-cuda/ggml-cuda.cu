@@ -833,24 +833,25 @@ struct ggml_rocm_malloc_stage_pool {
     }
 
     size_t acquire(size_t capacity, size_t limit_bytes) {
-        const size_t slot_capacity = std::min(limit_bytes, chunk_max);
-        GGML_ASSERT(capacity <= slot_capacity);
+        GGML_ASSERT(capacity > 0 && capacity <= limit_bytes);
+        size_t selected = slots.size();
         for (size_t i = 0; i < slots.size(); ++i) {
-            GGML_ASSERT(slots[i].capacity == slot_capacity);
-            if (!slots[i].in_flight) return i;
+            if (!slots[i].in_flight && slots[i].capacity >= capacity &&
+                    (selected == slots.size() || slots[i].capacity < slots[selected].capacity)) {
+                selected = i;
+            }
         }
+        if (selected != slots.size()) return selected;
 
         for (size_t i = 0; i < slots.size(); ++i) {
-            if (completed(slots[i])) return i;
+            if (slots[i].capacity >= capacity && completed(slots[i])) return i;
         }
 
-        // hipHostFree synchronizes the device, which may be waiting for this upload.
-        // Fixed-size slots never need to be freed or resized until teardown.
-        if (reserved_bytes <= limit_bytes - slot_capacity) {
+        if (reserved_bytes <= limit_bytes - capacity) {
             ggml_rocm_malloc_stage_slot slot;
-            slot.capacity = slot_capacity;
+            slot.capacity = capacity;
             if (try_pinned) {
-                const hipError_t status = hipHostMalloc(&slot.data, slot_capacity, hipHostMallocDefault);
+                const hipError_t status = hipHostMalloc(&slot.data, capacity, hipHostMallocDefault);
                 if (status == hipSuccess) {
                     slot.pinned = true;
                 } else {
@@ -863,20 +864,29 @@ struct ggml_rocm_malloc_stage_pool {
                 }
             }
             if (!slot.pinned) {
-                slot.data = std::malloc(slot_capacity);
+                slot.data = std::malloc(capacity);
                 GGML_ASSERT(slot.data != nullptr);
             }
             CUDA_CHECK(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming));
             slots.push_back(slot);
-            reserved_bytes += slot_capacity;
+            reserved_bytes += capacity;
             return slots.size() - 1;
         }
 
-        GGML_ASSERT(!slots.empty());
-        size_t oldest = 0;
-        for (size_t i = 1; i < slots.size(); ++i) {
-            if (slots[i].submitted < slots[oldest].submitted) oldest = i;
+        // hipHostFree may wait for the graph waiting for this upload. Reuse a
+        // smaller slot at budget pressure; the caller splits the transfer.
+        selected = slots.size();
+        size_t oldest = slots.size();
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].capacity < capacity) completed(slots[i]);
+            if (!slots[i].in_flight) {
+                if (selected == slots.size() || slots[i].capacity > slots[selected].capacity) selected = i;
+            } else if (oldest == slots.size() || slots[i].submitted < slots[oldest].submitted) {
+                oldest = i;
+            }
         }
+        if (selected != slots.size()) return selected;
+        GGML_ASSERT(oldest != slots.size());
         CUDA_CHECK(cudaEventSynchronize(slots[oldest].done));
         slots[oldest].in_flight = false;
         return oldest;
@@ -891,10 +901,11 @@ struct ggml_rocm_malloc_stage_pool {
         GGML_ASSERT(limit_bytes <= SIZE_MAX - (granularity - 1));
         const size_t chunk_limit = std::min(limit_bytes, chunk_max);
         for (size_t offset = 0; offset < size;) {
-            const size_t n = std::min(size - offset, chunk_limit);
-            const size_t capacity = (n + granularity - 1) & ~(granularity - 1);
+            const size_t wanted = std::min(size - offset, chunk_limit);
+            const size_t capacity = (wanted + granularity - 1) & ~(granularity - 1);
             const size_t selected = acquire(capacity, limit_bytes);
             auto & slot = slots[selected];
+            const size_t n = std::min(wanted, slot.capacity);
             GGML_ASSERT(!slot.in_flight && slot.capacity >= n);
             std::memcpy(slot.data, (const char *) src + offset, n);
             CUDA_CHECK(cudaMemcpyAsync((char *) dst + offset, slot.data, n, cudaMemcpyHostToDevice, stream));
@@ -909,6 +920,7 @@ struct ggml_rocm_malloc_stage_pool {
             const ggml_rocm_malloc_stage_config & config) {
         constexpr size_t granularity = 64*1024;
         const size_t chunk_limit = std::min(config.limit, chunk_max);
+        size_t consumed = 0;
         for (size_t first = 0; first < count;) {
             const auto & u = uploads[first];
             if (!u.bytes) {
@@ -920,34 +932,39 @@ struct ggml_rocm_malloc_stage_pool {
                 ++first;
                 continue;
             }
-            if (u.bytes > chunk_limit) {
-                copy(stream, (char *) u.dst->data + u.offset, u.src, u.bytes, config.limit);
-                ++first;
-                continue;
-            }
             size_t last = first, bytes = 0;
-            while (last < count && (!uploads[last].bytes || config.matches(uploads[last])) &&
-                    uploads[last].bytes <= chunk_limit - bytes) {
-                bytes += uploads[last++].bytes;
+            while (last < count && bytes < chunk_limit && (!uploads[last].bytes || config.matches(uploads[last]))) {
+                const size_t remaining = uploads[last].bytes - (last == first ? consumed : 0);
+                bytes += std::min(remaining, chunk_limit - bytes);
+                ++last;
             }
             const size_t capacity = (bytes + granularity - 1) & ~(granularity - 1);
             const size_t selected = acquire(capacity, config.limit);
             auto & slot = slots[selected];
+            const size_t staged_bytes = std::min(bytes, slot.capacity);
             size_t offset = 0;
-            for (size_t i = first; i < last; ++i) {
-                const auto & upload = uploads[i];
-                if (!upload.bytes) continue;
+            while (first < count && offset < staged_bytes) {
+                const auto & upload = uploads[first];
+                if (!upload.bytes) {
+                    ++first;
+                    continue;
+                }
+                const size_t n = std::min(upload.bytes - consumed, staged_bytes - offset);
                 void * staged = (char *) slot.data + offset;
-                std::memcpy(staged, upload.src, upload.bytes);
-                CUDA_CHECK(cudaMemcpyAsync((char *) upload.dst->data + upload.offset, staged,
-                    upload.bytes, cudaMemcpyHostToDevice, stream));
-                offset += upload.bytes;
+                std::memcpy(staged, (const char *) upload.src + consumed, n);
+                CUDA_CHECK(cudaMemcpyAsync((char *) upload.dst->data + upload.offset + consumed, staged,
+                    n, cudaMemcpyHostToDevice, stream));
+                offset += n;
+                consumed += n;
+                if (consumed == upload.bytes) {
+                    ++first;
+                    consumed = 0;
+                }
             }
             // One event protects every disjoint source range in this slot.
             CUDA_CHECK(cudaEventRecord(slot.done, stream));
             slot.in_flight = true;
             slot.submitted = ++submissions;
-            first = last;
         }
     }
 };

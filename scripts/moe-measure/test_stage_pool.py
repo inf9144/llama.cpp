@@ -62,6 +62,8 @@ int main() {
         std::vector<unsigned char> input(limit, 7), output(limit, 0xa5);
         ggml_tensor tensor = {}; tensor.data = output.data();
         for (int i = 0; i < 4; ++i) pool.copy(0, output.data() + 17*i, input.data(), 17, limit);
+        assert(pool.slots.size() == 4);
+        for (const auto & slot : pool.slots) assert(slot.capacity == 65536);
         run(0, queues[0].size());
         const size_t pinned_before = pin_attempts, freed_before = frees;
         const size_t reserved_before = pool.reserved_bytes;
@@ -80,6 +82,21 @@ int main() {
         graph_waiting = false;
     }
     {
+        // Small pending transfers must not consume eight 64-MiB slots and stall.
+        ggml_rocm_malloc_stage_pool pool;
+        constexpr size_t budget = 512*1024*1024;
+        unsigned char input[17];
+        std::fill(std::begin(input), std::end(input), 23);
+        std::vector<unsigned char> output(16*sizeof(input), 0);
+        const size_t waited_before = synchronizes;
+        for (int i = 0; i < 16; ++i) pool.copy(0, output.data() + i*sizeof(input), input, sizeof(input), budget);
+        assert(pool.reserved_bytes == 16*65536);
+        assert(synchronizes == waited_before);
+        std::fill(std::begin(input), std::end(input), 0xff);
+        run(0, queues[0].size());
+        assert(std::all_of(output.begin(), output.end(), [](unsigned char x) { return x == 23; }));
+    }
+    {
         // A large single range must obey the same chunk bound as a batch.
         constexpr size_t chunk = 64*1024*1024, bytes = chunk + 17;
         ggml_rocm_malloc_stage_pool pool;
@@ -88,7 +105,7 @@ int main() {
         ggml_tensor tensor = {}; tensor.data = output.data();
         const ggml_moe_upload upload{&tensor, input.data(), 19, bytes};
         pool.copy_batch(0, &upload, 1, cfg);
-        assert(pool.slots.size() == 1 && pool.slots[0].capacity == chunk);
+        assert(pool.slots.size() == 2 && pool.slots[0].capacity == chunk && pool.slots[1].capacity == 65536);
         assert(pool.reserved_bytes <= cfg.limit);
         std::fill(input.begin(), input.end(), 0xff);
         run(0, queues[0].size());
