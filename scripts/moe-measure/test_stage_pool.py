@@ -34,11 +34,11 @@ using hipError_t = int;
 constexpr int hipSuccess=0, hipErrorNotReady=1, hipHostMallocDefault=0;
 constexpr int cudaEventDisableTiming=0, cudaMemcpyHostToDevice=0;
 std::vector<std::function<void()>> queues[2];
-size_t completed[2] = {}, records = 0, queries = 0, synchronizes = 0, pin_attempts = 0;
-bool fail_pin = false;
+size_t completed[2] = {}, records = 0, queries = 0, synchronizes = 0, pin_attempts = 0, frees = 0;
+bool fail_pin = false, graph_waiting = false;
 void run(int stream, size_t through) { while (completed[stream] < through) queues[stream][completed[stream]++](); }
 int hipHostMalloc(void ** p, size_t n, int) { ++pin_attempts; if (fail_pin) return 2; *p = std::malloc(n); assert(*p); return 0; }
-int cudaFreeHost(void * p) { std::free(p); return 0; }
+int cudaFreeHost(void * p) { assert(!graph_waiting && "hipHostFree would wait for the blocked graph"); ++frees; std::free(p); return 0; }
 int cudaEventCreateWithFlags(event ** p, int) { *p = new event; return 0; }
 int cudaEventDestroy(event * p) { assert(completed[p->stream] >= p->through); delete p; return 0; }
 int hipEventQuery(event * p) { ++queries; return completed[p->stream] >= p->through ? 0 : 1; }
@@ -54,6 +54,46 @@ int ggml_cuda_env_int(const char *, int value) { return value; }
         cases = r'''
 int main() {
     constexpr size_t limit = 256*1024;
+    {
+        // Fill the old pool with small slots, then request a larger miss batch.
+        // Freeing any pinned slot here would wait for the graph waiting for us.
+        ggml_rocm_malloc_stage_pool pool;
+        ggml_rocm_malloc_stage_config cfg{true, limit, ""};
+        std::vector<unsigned char> input(limit, 7), output(limit, 0xa5);
+        ggml_tensor tensor = {}; tensor.data = output.data();
+        for (int i = 0; i < 4; ++i) pool.copy(0, output.data() + 17*i, input.data(), 17, limit);
+        run(0, queues[0].size());
+        const size_t pinned_before = pin_attempts, freed_before = frees;
+        const size_t reserved_before = pool.reserved_bytes;
+        const ggml_moe_upload batch[] = {
+            {&tensor, input.data(), 0, 65536},
+            {&tensor, input.data(), 65536, 65536},
+            {&tensor, input.data(), 131072, 65536},
+        };
+        graph_waiting = true;
+        pool.copy_batch(1, batch, 3, cfg);
+        std::fill(input.begin(), input.end(), 0xff);
+        run(1, queues[1].size());
+        assert(pin_attempts == pinned_before && frees == freed_before);
+        assert(pool.reserved_bytes == reserved_before && pool.reserved_bytes <= limit);
+        for (size_t i = 0; i < output.size(); ++i) assert(output[i] == (i < 196608 ? 7 : 0xa5));
+        graph_waiting = false;
+    }
+    {
+        // A large single range must obey the same chunk bound as a batch.
+        constexpr size_t chunk = 64*1024*1024, bytes = chunk + 17;
+        ggml_rocm_malloc_stage_pool pool;
+        ggml_rocm_malloc_stage_config cfg{true, chunk + 65536, ""};
+        std::vector<unsigned char> input(bytes, 13), output(bytes + 38, 0xa5);
+        ggml_tensor tensor = {}; tensor.data = output.data();
+        const ggml_moe_upload upload{&tensor, input.data(), 19, bytes};
+        pool.copy_batch(0, &upload, 1, cfg);
+        assert(pool.slots.size() == 1 && pool.slots[0].capacity == chunk);
+        assert(pool.reserved_bytes <= cfg.limit);
+        std::fill(input.begin(), input.end(), 0xff);
+        run(0, queues[0].size());
+        for (size_t i = 0; i < output.size(); ++i) assert(output[i] == (i >= 19 && i < bytes + 19 ? 13 : 0xa5));
+    }
     for (bool pin_failure : {false, true}) for (const char * filter : {"", "ffn_", "excluded"}) {
         fail_pin = pin_failure;
         ggml_rocm_malloc_stage_config cfg{true, limit, filter};
@@ -121,7 +161,7 @@ int main() {
         pool.copy_batch(1, nullptr, 0, cfg);
         assert(records == before + 1);
     }
-    puts("Production stage pool: deferred copies, bounded reuse, mixed filters, pin fallback, oversized ranges, two streams, guards and event batching passed");
+    puts("Production stage pool: no frees under graph waits, deferred copies, bounded reuse, mixed filters, pin fallback, oversized ranges, two streams, guards and event batching passed");
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
