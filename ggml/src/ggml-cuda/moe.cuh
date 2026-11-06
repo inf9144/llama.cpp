@@ -23,6 +23,7 @@ static inline void ggml_cuda_moe_consume_packet(const ggml_moe_packet & packet, 
 }
 
 #if defined(GGML_USE_HIP)
+void ggml_cuda_moe_prepare_stage_pool(ggml_backend_cuda_context & ctx);
 void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_tensor * tensor,
     const void * data, size_t offset, size_t size, cudaStream_t stream);
 void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,

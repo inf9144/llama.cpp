@@ -832,6 +832,15 @@ struct ggml_rocm_malloc_stage_pool {
         return !slot.in_flight;
     }
 
+    void prepare(size_t limit_bytes) {
+        const size_t capacity = std::min(limit_bytes, chunk_max);
+        for (const auto & slot : slots) {
+            if (slot.capacity >= capacity) return;
+        }
+        // Prepare before graph execution, without evicting or waiting for slots.
+        if (reserved_bytes <= limit_bytes - capacity) (void) acquire(capacity, limit_bytes);
+    }
+
     size_t acquire(size_t capacity, size_t limit_bytes) {
         GGML_ASSERT(capacity > 0 && capacity <= limit_bytes);
         size_t selected = slots.size();
@@ -2963,6 +2972,15 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 }
 
 #if defined(GGML_USE_HIP)
+void ggml_cuda_moe_prepare_stage_pool(ggml_backend_cuda_context & ctx) {
+    const auto & config = ggml_rocm_stage_config();
+    if (!config.enabled || (config.filter && config.filter[0])) return;
+    ggml_cuda_set_device(ctx.device);
+    std::lock_guard<std::mutex> lock(ctx.rocm_malloc_stage_pool_mutex);
+    if (!ctx.rocm_malloc_stage_pool) ctx.rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
+    ctx.rocm_malloc_stage_pool->prepare(config.limit);
+}
+
 void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size, cudaStream_t stream) {
     GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);

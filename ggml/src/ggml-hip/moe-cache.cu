@@ -240,6 +240,8 @@ bool ggml_hip_moe_pipeline_init(ggml_backend_t backend, int32_t layers,
     if (!engine->init_lookup(layers)) {
         (void) hipGetLastError();
         GGML_LOG_WARN("%s: %s device routing unavailable; retain host routing, enable transfer pipeline\n", __func__, ctx.name.c_str());
+    } else {
+        ggml_cuda_moe_prepare_stage_pool(ctx);
     }
     *out = {
         engine.get(), engine->device_lookup,

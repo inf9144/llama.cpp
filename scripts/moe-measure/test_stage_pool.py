@@ -37,7 +37,7 @@ std::vector<std::function<void()>> queues[2];
 size_t completed[2] = {}, records = 0, queries = 0, synchronizes = 0, pin_attempts = 0, frees = 0;
 bool fail_pin = false, graph_waiting = false;
 void run(int stream, size_t through) { while (completed[stream] < through) queues[stream][completed[stream]++](); }
-int hipHostMalloc(void ** p, size_t n, int) { ++pin_attempts; if (fail_pin) return 2; *p = std::malloc(n); assert(*p); return 0; }
+int hipHostMalloc(void ** p, size_t n, int) { assert(!graph_waiting); ++pin_attempts; if (fail_pin) return 2; *p = std::malloc(n); assert(*p); return 0; }
 int cudaFreeHost(void * p) { assert(!graph_waiting && "hipHostFree would wait for the blocked graph"); ++frees; std::free(p); return 0; }
 int cudaEventCreateWithFlags(event ** p, int) { *p = new event; return 0; }
 int cudaEventDestroy(event * p) { assert(completed[p->stream] >= p->through); delete p; return 0; }
@@ -54,6 +54,31 @@ int ggml_cuda_env_int(const char *, int value) { return value; }
         cases = r'''
 int main() {
     constexpr size_t limit = 256*1024;
+    for (bool pin_failure : {false, true}) {
+        fail_pin = pin_failure;
+        ggml_rocm_malloc_stage_pool pool;
+        pool.prepare(limit);
+        const size_t pinned_before = pin_attempts, freed_before = frees;
+        pool.prepare(limit);
+        assert(pin_attempts == pinned_before && pool.reserved_bytes == limit);
+        std::vector<unsigned char> input(limit), output(limit + 38);
+        ggml_tensor tensor = {}; tensor.data = output.data();
+        ggml_rocm_malloc_stage_config cfg{true, limit, ""};
+        graph_waiting = true;
+        for (size_t bytes : {size_t(65536), size_t(131072), size_t(196608), limit}) {
+            std::fill(input.begin(), input.end(), 7);
+            std::fill(output.begin(), output.end(), 0xa5);
+            const ggml_moe_upload batch[] = {{&tensor, input.data(), 19, bytes/2},
+                {&tensor, input.data() + bytes/2, 19 + bytes/2, bytes - bytes/2}};
+            pool.copy_batch(1, batch, 2, cfg);
+            std::fill(input.begin(), input.end(), 0xff);
+            run(1, queues[1].size());
+            for (size_t i = 0; i < output.size(); ++i) assert(output[i] == (i >= 19 && i < bytes + 19 ? 7 : 0xa5));
+            assert(pin_attempts == pinned_before && frees == freed_before && pool.reserved_bytes == limit);
+        }
+        graph_waiting = false;
+    }
+    fail_pin = false;
     {
         // Fill the old pool with small slots, then request a larger miss batch.
         // Freeing any pinned slot here would wait for the graph waiting for us.
@@ -64,6 +89,9 @@ int main() {
         for (int i = 0; i < 4; ++i) pool.copy(0, output.data() + 17*i, input.data(), 17, limit);
         assert(pool.slots.size() == 4);
         for (const auto & slot : pool.slots) assert(slot.capacity == 65536);
+        const size_t prepared_pins = pin_attempts, prepared_waits = synchronizes;
+        pool.prepare(limit);
+        assert(pin_attempts == prepared_pins && synchronizes == prepared_waits && pool.reserved_bytes == limit);
         run(0, queues[0].size());
         const size_t pinned_before = pin_attempts, freed_before = frees;
         const size_t reserved_before = pool.reserved_bytes;
