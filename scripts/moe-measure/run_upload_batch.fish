@@ -64,13 +64,22 @@ set -lx GGML_ROCM_MALLOC_STAGE_POOL_TENSOR ''
 for backend in ROCm0 ROCm1
     set -l log $checks/upload-$backend.log
     echo "Testing uploads and cache lookup on $backend (log: $log)"
-    begin
-        env GGML_ROCM_MALLOC_STAGE_POOL_MIB=1 ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend $backend --upload-only
-        and ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend $backend --upload-bench
-        and ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend $backend --lookup-only
-    end > $log 2>&1; or begin
-        tail -n 80 $log
-        exit 1
+    echo "Native upload checks: backend=$backend" > $log
+    for check in upload-only upload-bench lookup-only
+        set -l pool_mib 512
+        if test $check = upload-only
+            set pool_mib 1
+        end
+        echo "Running $backend --$check (pool=$pool_mib MiB)"
+        echo "BEGIN backend=$backend test=$check pool_mib=$pool_mib" >> $log
+        env GGML_ROCM_MALLOC_STAGE_POOL_MIB=$pool_mib ./build-rocm-moe-stream-reference/bin/test-moe-stream --backend $backend --$check >> $log 2>&1
+        set -l check_status $status
+        echo "END backend=$backend test=$check exit=$check_status" >> $log
+        if test $check_status -ne 0
+            echo "Native test failed: backend=$backend test=$check exit=$check_status (log: $log)" >&2
+            tail -n 80 $log
+            exit $check_status
+        end
     end
     if not string match -rq 'upload batch: byte equality.*passed' < $log
         echo "Upload checks were skipped on $backend; inspect $log" >&2

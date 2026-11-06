@@ -213,6 +213,11 @@ struct lookup_fixture {
     bool sparse_updates = false;
     std::vector<int32_t> update_data;
 
+    void progress(const char * phase, int step = -1) const {
+        printf("%s lookup progress: tokens=%d sparse_updates=%d step=%d phase=%s\n",
+            ggml_backend_name(backend), tokens, sparse_updates, step, phase);
+    }
+
     static void resolve(void * userdata, int32_t il, const int32_t * ids, int32_t count, bool miss) {
         auto & f = *(lookup_fixture *) userdata;
         std::vector<moe_cache_policy::fill> fills;
@@ -250,12 +255,14 @@ struct lookup_fixture {
     }
 
     void run(ggml_moe_pipeline_init_t init) {
+        progress("pipeline-init");
         if (!init(backend, 2, &resolve, this, &pipeline)) return;
         if (!pipeline.device_lookup) {
             printf("%s device lookup tests SKIPPED: stream-signal graph support unavailable\n", ggml_backend_name(backend));
             pipeline.destroy(pipeline.context);
             return;
         }
+        progress("fixture-setup");
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
         map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 2*experts);
         updates = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1 + 4*GGML_MOE_LOOKUP_MAX_SELECTED);
@@ -296,8 +303,11 @@ struct lookup_fixture {
                 ggml_backend_tensor_set(ids[il], routing[il].data(), 0, ggml_nbytes(ids[il]));
             }
             pipeline.begin(pipeline.context);
+            progress("graph-compute", step);
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            progress("pipeline-flush", step);
             pipeline.flush(pipeline.context);
+            progress("readback", step);
             std::vector<int32_t> actual_map(maps.size());
             ggml_backend_tensor_get(map, actual_map.data(), 0, ggml_nbytes(map));
             GGML_ASSERT(actual_map == maps);
@@ -319,6 +329,7 @@ struct lookup_fixture {
         GGML_ASSERT(hits > 0 && misses > 0 && (tokens == 1 || cross_layer_evictions > 0) && worst < 1e-10);
         printf("%s device lookup: tokens=%d sparse_updates=%d hits=%d misses=%d cross-layer-evictions=%d, cold/admission and 12 graph calls with capture/replay, NMSE=%g\n",
             ggml_backend_name(backend), tokens, sparse_updates, hits, misses, cross_layer_evictions, worst);
+        progress("pipeline-destroy");
         pipeline.destroy(pipeline.context);
     }
 };
@@ -492,6 +503,8 @@ static void test_quantized_padding() {
 }
 
 int main(int argc, char ** argv) {
+    // Keep the last completed test phase when a redirected process dies by signal.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     const char * filter = nullptr;
     bool lookup_only = false;
     bool upload_only = false, upload_bench = false;

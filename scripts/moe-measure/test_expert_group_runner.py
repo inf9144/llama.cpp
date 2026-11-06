@@ -231,6 +231,27 @@ agents = ['one'] if os.environ.get('MOE_RUNNER_MISSING_PAIR') else ['one', 'two'
         self.assertFalse(any(c['program'] == 'cmake' for c in self.recorded()))
         self.assertFalse((self.repo / 'build-rocm-moe-before-verify-pair').exists())
 
+    def test_upload_runner_reports_and_preserves_native_failure(self):
+        self.prepare_pair_runner()
+        shutil.copy2(Path(__file__).with_name('run_upload_batch.fish'), self.script.parent)
+        self.script = self.script.with_name('run_upload_batch.fish')
+        cmake = self.tools / 'cmake'
+        stub = "#!/bin/sh\necho 'upload batch: byte equality and guards passed'\necho 'sparse map updates: 512 changes passed'\ncase \"$*\" in *--lookup-only*) exit 139;; esac\n"
+        cmake.write_text(cmake.read_text().replace(
+            '    out.chmod(0o755)',
+            '    if name == "test-moe-stream": out.write_text(' + repr(stub) + ')\n    out.chmod(0o755)'))
+        result = self.run_script(no_config=True)
+        self.assertEqual(result.returncode, 139, result.stdout + result.stderr)
+        self.assertIn('backend=ROCm0 test=lookup-only exit=139', result.stderr)
+        logs = list((self.repo / 'results').glob('moe-upload-batch-check-*/upload-ROCm0.log'))
+        self.assertEqual(len(logs), 1)
+        trace = logs[0].read_text()
+        self.assertIn('test=upload-only exit=0', trace)
+        self.assertIn('test=upload-bench exit=0', trace)
+        self.assertIn('test=lookup-only exit=139', trace)
+        calls = self.recorded()
+        self.assertFalse(any(c['program'] in ('completion_diagnose.py', 'decode-ab.py') for c in calls))
+
     def test_pair_runner_rejects_inactive_production_path(self):
         self.prepare_pair_runner()
         result = self.run_script(no_config=True, MOE_RUNNER_MISSING_PAIR='1')
