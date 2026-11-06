@@ -627,7 +627,7 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, const ggml_tensor * output) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -650,8 +650,26 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    ggml_tensor * unary       = ggml_get_rows(ctx0, logits_rows, candidates);
+    if (output && output->buffer && g.sched) {
+        const auto buft = ggml_backend_buffer_get_type(output->buffer);
+        const auto dev = ggml_backend_buft_get_device(buft);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(g.sched); ++i) {
+                auto * backend = ggml_backend_sched_get_backend(g.sched, i);
+                if (ggml_backend_get_device(backend) == dev && buft == ggml_backend_get_default_buffer_type(backend) &&
+                        ggml_backend_supports_op(backend, candidates) &&
+                        ggml_backend_supports_op(backend, unary)) {
+                    // Gather before crossing devices; the selector only needs top_k scores per row.
+                    ggml_backend_sched_set_tensor_backend(g.sched, candidates, backend);
+                    ggml_backend_sched_set_tensor_backend(g.sched, unary, backend);
+                    break;
+                }
+            }
+        }
+    }
+    unary = ggml_reshape_2d(ctx0, unary, top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -1172,7 +1190,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, output);
     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
     }

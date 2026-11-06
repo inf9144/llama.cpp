@@ -157,6 +157,7 @@ static void usage(char ** argv) {
     LOG("  --test-moe-cache-policy  Test shared SLRU prefill admission and capacity bounds\n");
     LOG("  --test-layer-inputs      Test Qwen4Exp layer extraction and MoE cache parameters\n");
     LOG("  --test-dflash-device-inputs  Compare device-gather and host DFlash2 injection\n");
+    LOG("  --test-dflash-selector   Check compact DFlash2 scores across two devices\n");
     LOG("  --test-dflash-vision     Test DFlash2 drafting across M-RoPE image positions\n");
     LOG("  --test-kq-derived       Compare compact mask inputs with the packed mask fill\n");
     LOG("  --test-dflash-tail       Test DFlash2 prompt tails, cache reuse and SWA guards\n");
@@ -1880,6 +1881,150 @@ static int test_dflash_device_inputs(size_t seed, float stdev, const char * back
     return reserve_ok ? 0 : 1;
 }
 
+static int test_dflash_selector(size_t seed, float stdev, const char * backend_name) {
+    auto * head = backend_name ? ggml_backend_dev_by_name(backend_name) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(head);
+    const bool gpu = ggml_backend_dev_type(head) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    auto * peer = head;
+    if (gpu) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            if (dev != head && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(head)) {
+                peer = dev;
+                break;
+            }
+        }
+        if (peer == head) {
+            fprintf(stderr, "DFlash2 selector: two GPU devices are required\n");
+            return 1;
+        }
+    }
+    constexpr int vocab = 4096;
+    auto target_meta = get_gguf_ctx(LLM_ARCH_LLAMA, false, vocab);
+    auto draft_meta = get_gguf_ctx(LLM_ARCH_DFLASH, false, vocab);
+    const int32_t layers[] = { 0, 1 };
+    gguf_set_arr_data(draft_meta.get(), "dflash.target_layers", GGUF_TYPE_INT32, layers, 2);
+    gguf_set_val_u32(draft_meta.get(), "dflash.block_size", 4);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_kernel_size", 2);
+    gguf_set_val_u32(draft_meta.get(), "dflash.conv_group_size", 8);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_rank", 32);
+    gguf_set_val_u32(draft_meta.get(), "dflash.selector_top_k", 2);
+    const bool swa[] = { true, true };
+    gguf_set_arr_data(draft_meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, swa, 2);
+    ggml_backend_dev_t devices[] = { gpu ? head : nullptr, gpu ? peer : nullptr, nullptr };
+    const llama_model_tensor_buft_override head_weights[] = { { ".*", ggml_backend_dev_buffer_type(head) }, { nullptr, nullptr } };
+    const llama_model_tensor_buft_override peer_weights[] = { { ".*", ggml_backend_dev_buffer_type(peer) }, { nullptr, nullptr } };
+    auto mp = llama_model_default_params();
+    mp.devices = devices;
+    mp.n_gpu_layers = gpu ? 99 : 0;
+    mp.tensor_buft_overrides = head_weights;
+    tensor_data_params data = { seed, stdev };
+    llama_model_ptr target(llama_model_init_from_user(target_meta.get(), set_tensor_data, &data, mp));
+    mp.tensor_buft_overrides = peer_weights;
+    llama_model_ptr draft(llama_model_init_from_user(draft_meta.get(), set_tensor_data, &data, mp));
+    GGML_ASSERT(target && draft);
+    // Virtual models do not discover optional selector tensors through the file index.
+    ggml_context_ptr selector_ctx(ggml_init({3*ggml_tensor_overhead(), nullptr, true}));
+    draft->dflash_selector_hidden = ggml_new_tensor_2d(selector_ctx.get(), GGML_TYPE_Q8_0, 256, 32);
+    draft->dflash_selector_prev = ggml_new_tensor_2d(selector_ctx.get(), GGML_TYPE_Q8_0, 32, vocab);
+    draft->dflash_selector_next = ggml_new_tensor_2d(selector_ctx.get(), GGML_TYPE_Q8_0, 32, vocab);
+    ggml_set_name(draft->dflash_selector_hidden, "selector_hidden.weight");
+    ggml_set_name(draft->dflash_selector_prev, "selector_predecessor.weight");
+    ggml_set_name(draft->dflash_selector_next, "selector_successor.weight");
+    ggml_backend_buffer_ptr selector_buffer(ggml_backend_alloc_ctx_tensors_from_buft(selector_ctx.get(), ggml_backend_dev_buffer_type(peer)));
+    GGML_ASSERT(selector_buffer);
+    ggml_backend_buffer_set_usage(selector_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (auto * t = ggml_get_first_tensor(selector_ctx.get()); t; t = ggml_get_next_tensor(selector_ctx.get(), t)) {
+        std::vector<float> values(ggml_nelements(t));
+        std::vector<uint8_t> packed(ggml_nbytes(t));
+        fill_normal(values, t->name, data);
+        ggml_quantize_chunk(t->type, values.data(), packed.data(), 0, t->ne[1], t->ne[0], nullptr);
+        ggml_backend_tensor_set(t, packed.data(), 0, packed.size());
+    }
+    draft->hparams.dflash_selector_rank = 32;
+    draft->output = nullptr;
+    draft->tok_embd = nullptr;
+    if (gpu) {
+        GGML_ASSERT(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(target->output->buffer)) == head);
+        GGML_ASSERT(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(draft->dflash_selector_hidden->buffer)) == peer);
+    }
+
+    struct capture {
+        llama_context * ctx = nullptr;
+        ggml_backend_dev_t head = nullptr;
+        bool placement = false;
+        int calls = 0;
+        int64_t values = 0;
+    } cap;
+    cap.head = head;
+    cap.placement = gpu && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(head)), "ROCm") == 0;
+    for (const auto kv : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        auto cp = llama_context_default_params();
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = 16;
+        cp.n_threads = cp.n_threads_batch = 2;
+        cp.type_k = cp.type_v = kv;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context_ptr tgt(llama_init_from_model(target.get(), cp));
+        GGML_ASSERT(tgt);
+        cp.ctx_other = tgt.get();
+        cp.cb_eval_user_data = &cap;
+        cp.cb_eval = [](ggml_tensor * t, bool ask, void * userdata) {
+            const bool unary = t->op == GGML_OP_GET_ROWS && t->src[0]->type == GGML_TYPE_F32 &&
+                t->src[0]->ne[0] == 1 && t->src[0]->ne[1] == vocab;
+            if (ask || !unary) return unary;
+            auto & cap = *(capture *) userdata;
+            const auto backend = ggml_backend_sched_get_tensor_backend(cap.ctx->get_sched(), t);
+            GGML_ASSERT(backend);
+            if (cap.placement) GGML_ASSERT(ggml_backend_get_device(backend) == cap.head);
+            std::vector<float> logits(ggml_nelements(t->src[0])), values(ggml_nelements(t));
+            std::vector<int32_t> indices(ggml_nelements(t->src[1]));
+            ggml_backend_tensor_get(t->src[0], logits.data(), 0, ggml_nbytes(t->src[0]));
+            ggml_backend_tensor_get(t->src[1], indices.data(), 0, ggml_nbytes(t->src[1]));
+            ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
+            const int64_t top_k = t->src[1]->ne[0];
+            GGML_ASSERT(indices.size() == values.size());
+            for (size_t i = 0; i < values.size(); ++i) {
+                GGML_ASSERT(indices[i] >= 0 && indices[i] < vocab);
+                const float expected = logits[(i / top_k)*vocab + indices[i]];
+                GGML_ASSERT(std::isfinite(values[i]) && values[i] == expected);
+            }
+            ++cap.calls;
+            cap.values += values.size();
+            return true;
+        };
+        llama_context_ptr ctx(llama_init_from_model(draft.get(), cp));
+        GGML_ASSERT(ctx);
+        cap.ctx = ctx.get();
+        llama_set_causal_attn(ctx.get(), false);
+        llama_set_embeddings_nextn(ctx.get(), true, false);
+        std::vector<float> features(16*2*256);
+        for (size_t i = 0; i < features.size(); ++i) features[i] = stdev * (int(i % 29) - 14) / 14;
+        common_batch prefix(ctx.get());
+        for (int i = 0; i < 16; ++i) {
+            const llama_pos pos[] = { i, i, i, 0 };
+            prefix.add_embd({ features.data() + i*512, 1, 512 }, pos, 0, false);
+        }
+        GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, prefix.get()) == 0);
+        const int before = cap.calls;
+        for (int count : { 1, 2, 4 }) {
+            common_batch noise(ctx.get());
+            for (int i = 0; i < count; ++i) noise.add(i ? 127 : 1, 16 + i, 0, false);
+            const int calls = cap.calls;
+            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, noise.get()) == 0);
+            GGML_ASSERT(llama_get_embeddings_nextn(ctx.get()));
+            GGML_ASSERT(cap.calls == calls + (count > 1));
+            GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 16, -1));
+        }
+        GGML_ASSERT(cap.calls == before + 2);
+        printf("DFlash2 selector KV=%s head=%s selector=%s: widths 1/2/4, exact score gathers and rollback passed\n",
+                ggml_type_name(kv), ggml_backend_dev_name(head), ggml_backend_dev_name(peer));
+    }
+    GGML_ASSERT(cap.calls == 4 && cap.values == 24);
+    return 0;
+}
+
 static int test_dflash_vision(size_t seed, float stdev, int tail_mode = -1) {
     recovery_log log;
     auto target_meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
@@ -3037,6 +3182,7 @@ int main(int argc, char ** argv) {
     bool graph_recovery = false;
     bool layer_inputs = false;
     bool dflash_device_inputs = false;
+    bool dflash_selector = false;
     bool dflash_vision = false;
     bool dflash_tail = false;
     bool kq_derived = false;
@@ -3116,6 +3262,8 @@ int main(int argc, char ** argv) {
             layer_inputs = true;
         } else if (strcmp(argv[i], "--test-dflash-device-inputs") == 0) {
             dflash_device_inputs = true;
+        } else if (strcmp(argv[i], "--test-dflash-selector") == 0) {
+            dflash_selector = true;
         } else if (strcmp(argv[i], "--test-dflash-vision") == 0) {
             dflash_vision = true;
         } else if (strcmp(argv[i], "--test-moe-cache-prefill") == 0) {
@@ -3168,6 +3316,9 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             return test_dflash_device_inputs(seed, stdev, target_backend, 2);
+        }
+        if (dflash_selector) {
+            return test_dflash_selector(seed, stdev, target_backend);
         }
         if (dflash_vision) {
             return test_dflash_vision(seed, stdev);
