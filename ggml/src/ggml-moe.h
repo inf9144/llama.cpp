@@ -68,6 +68,22 @@ struct ggml_moe_upload {
     size_t offset;
     size_t bytes;
 };
+// Optional LLAMA_MOE_MEASURE observer. Called on the service thread after a
+// miss's ready signal has been enqueued. Install it before the first begin().
+struct ggml_moe_handoff_sample {
+    int32_t layer;
+    uint32_t version;
+    int64_t observed_us;
+    int64_t ready_begin_us;
+    int64_t ready_end_us;
+    int64_t pool_acquire_us;
+    int64_t pool_wait_us;
+    int64_t staging_us;
+    size_t staged_bytes;
+    size_t pinned_bytes;
+    size_t staged_copies;
+};
+typedef void (*ggml_moe_handoff_observer_t)(void * userdata, const struct ggml_moe_handoff_sample * sample);
 struct ggml_moe_pipeline {
     void * context;
     bool device_lookup;
@@ -80,6 +96,7 @@ struct ggml_moe_pipeline {
     void * (*lookup_job)(void * context, int32_t layer);
     // Same source lifetime and stream order as upload. Pool-backed copies own their host sources.
     void (*upload_batch)(void * context, const struct ggml_moe_upload * uploads, size_t count);
+    void (*set_handoff_observer)(void * context, ggml_moe_handoff_observer_t observer);
 };
 typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t layers,
     ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);

@@ -11,6 +11,10 @@ namespace {
 
 constexpr int max_selected = GGML_MOE_LOOKUP_MAX_SELECTED;
 
+#ifdef LLAMA_MOE_MEASURE
+thread_local ggml_moe_handoff_sample * handoff_sample = nullptr;
+#endif
+
 // One notification per cached layer and forward pass. The context drains it
 // before another pass can reuse it. No cache weights live in this allocation.
 struct alignas(64) notification {
@@ -50,6 +54,9 @@ struct service {
     std::atomic<bool> active{false};
     bool idle = true;
     bool stopping = false;
+#ifdef LLAMA_MOE_MEASURE
+    ggml_moe_handoff_observer_t handoff_observer = nullptr;
+#endif
 
     service(ggml_backend_cuda_context & ctx, ggml_moe_resolve_t resolve, void * userdata) :
         ctx(ctx), resolve(resolve), userdata(userdata) {}
@@ -110,11 +117,30 @@ struct service {
                     GGML_ASSERT(uint32_t(version - job->serviced) == 1);
                     const auto & request = *job->host;
                     GGML_ASSERT(request.count > 0 && request.count <= max_selected);
+#ifdef LLAMA_MOE_MEASURE
+                    ggml_moe_handoff_sample sample = {};
+                    if (request.miss && handoff_observer) {
+                        sample.layer = job->layer;
+                        sample.version = version;
+                        sample.observed_us = ggml_time_us();
+                        handoff_sample = &sample;
+                    }
+#endif
                     resolve(userdata, job->layer, request.ids, request.count, request.miss != 0);
                     if (request.miss) {
                         // A later request cannot arrive until this stream has
                         // uploaded the maps and released the current device wait.
+#ifdef LLAMA_MOE_MEASURE
+                        handoff_sample = nullptr;
+                        if (handoff_observer) sample.ready_begin_us = ggml_time_us();
+#endif
                         CUDA_CHECK(hipStreamWriteValue64(upload, job->ready, 1, 0));
+#ifdef LLAMA_MOE_MEASURE
+                        if (handoff_observer) {
+                            sample.ready_end_us = ggml_time_us();
+                            handoff_observer(userdata, &sample);
+                        }
+#endif
                         poll_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
                     }
                     job->serviced = version;
@@ -280,8 +306,22 @@ bool ggml_hip_moe_pipeline_init(ggml_backend_t backend, int32_t layers,
         },
         [](void * p, const ggml_moe_upload * uploads, size_t count) {
             auto & e = *(service *) p;
+#ifdef LLAMA_MOE_MEASURE
+            ggml_cuda_set_tensor_batch_async_stream(e.ctx, uploads, count, e.upload, handoff_sample);
+#else
             ggml_cuda_set_tensor_batch_async_stream(e.ctx, uploads, count, e.upload);
+#endif
         },
+#ifdef LLAMA_MOE_MEASURE
+        [](void * p, ggml_moe_handoff_observer_t observer) {
+            auto & e = *(service *) p;
+            std::lock_guard<std::mutex> lock(e.mutex);
+            GGML_ASSERT(e.idle);
+            e.handoff_observer = observer;
+        },
+#else
+        nullptr,
+#endif
     };
     engine.release();
     return true;

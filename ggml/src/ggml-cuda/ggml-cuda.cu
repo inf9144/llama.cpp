@@ -841,7 +841,10 @@ struct ggml_rocm_malloc_stage_pool {
         if (reserved_bytes <= limit_bytes - capacity) (void) acquire(capacity, limit_bytes);
     }
 
-    size_t acquire(size_t capacity, size_t limit_bytes) {
+    size_t acquire(size_t capacity, size_t limit_bytes, ggml_moe_handoff_sample * sample = nullptr) {
+#ifndef LLAMA_MOE_MEASURE
+        GGML_UNUSED(sample);
+#endif
         GGML_ASSERT(capacity > 0 && capacity <= limit_bytes);
         size_t selected = slots.size();
         for (size_t i = 0; i < slots.size(); ++i) {
@@ -896,7 +899,13 @@ struct ggml_rocm_malloc_stage_pool {
         }
         if (selected != slots.size()) return selected;
         GGML_ASSERT(oldest != slots.size());
+#ifdef LLAMA_MOE_MEASURE
+        const int64_t wait_begin = sample ? ggml_time_us() : 0;
+#endif
         CUDA_CHECK(cudaEventSynchronize(slots[oldest].done));
+#ifdef LLAMA_MOE_MEASURE
+        if (sample) sample->pool_wait_us += ggml_time_us() - wait_begin;
+#endif
         slots[oldest].in_flight = false;
         return oldest;
     }
@@ -926,7 +935,7 @@ struct ggml_rocm_malloc_stage_pool {
     }
 
     void copy_batch(cudaStream_t stream, const ggml_moe_upload * uploads, size_t count,
-            const ggml_rocm_malloc_stage_config & config) {
+            const ggml_rocm_malloc_stage_config & config, ggml_moe_handoff_sample * sample = nullptr) {
         constexpr size_t granularity = 64*1024;
         const size_t chunk_limit = std::min(config.limit, chunk_max);
         size_t consumed = 0;
@@ -948,7 +957,13 @@ struct ggml_rocm_malloc_stage_pool {
                 ++last;
             }
             const size_t capacity = (bytes + granularity - 1) & ~(granularity - 1);
-            const size_t selected = acquire(capacity, config.limit);
+#ifdef LLAMA_MOE_MEASURE
+            const int64_t acquire_begin = sample ? ggml_time_us() : 0;
+#endif
+            const size_t selected = acquire(capacity, config.limit, sample);
+#ifdef LLAMA_MOE_MEASURE
+            if (sample) sample->pool_acquire_us += ggml_time_us() - acquire_begin;
+#endif
             auto & slot = slots[selected];
             const size_t staged_bytes = std::min(bytes, slot.capacity);
             size_t offset = 0;
@@ -960,7 +975,18 @@ struct ggml_rocm_malloc_stage_pool {
                 }
                 const size_t n = std::min(upload.bytes - consumed, staged_bytes - offset);
                 void * staged = (char *) slot.data + offset;
+#ifdef LLAMA_MOE_MEASURE
+                const int64_t staging_begin = sample ? ggml_time_us() : 0;
+#endif
                 std::memcpy(staged, (const char *) upload.src + consumed, n);
+#ifdef LLAMA_MOE_MEASURE
+                if (sample) {
+                    sample->staging_us += ggml_time_us() - staging_begin;
+                    sample->staged_bytes += n;
+                    if (slot.pinned) sample->pinned_bytes += n;
+                    ++sample->staged_copies;
+                }
+#endif
                 CUDA_CHECK(cudaMemcpyAsync((char *) upload.dst->data + upload.offset + consumed, staged,
                     n, cudaMemcpyHostToDevice, stream));
                 offset += n;
@@ -2988,7 +3014,7 @@ void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_ten
 }
 
 void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,
-        const ggml_moe_upload * uploads, size_t count, cudaStream_t stream) {
+        const ggml_moe_upload * uploads, size_t count, cudaStream_t stream, ggml_moe_handoff_sample * sample) {
     const auto & config = ggml_rocm_stage_config();
     bool staged = false;
     for (size_t i = 0; i < count; ++i) {
@@ -3010,7 +3036,7 @@ void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,
     }
     std::lock_guard<std::mutex> lock(ctx.rocm_malloc_stage_pool_mutex);
     if (!ctx.rocm_malloc_stage_pool) ctx.rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
-    ctx.rocm_malloc_stage_pool->copy_batch(stream, uploads, count, config);
+    ctx.rocm_malloc_stage_pool->copy_batch(stream, uploads, count, config, sample);
 }
 #endif
 

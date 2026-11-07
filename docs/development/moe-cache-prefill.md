@@ -1867,3 +1867,22 @@ and fish --no-config scripts/moe-measure/run_selector_overlap.fish
 ```
 
 The snapshot is `build-rocm-moe-before-selector-overlap`; older experiment snapshots are retained. Native test output is captured in per-test logs and included in the decode handoff. The runner rejects numerical differences and verifies that profiled split completions actually occur on two agents. Profiled timing is not substituted for uninstrumented A/B speed. No HIP SDK or GPU is available in the coding environment; neither a native build pass nor an end-to-end speedup is claimed here.
+
+### Synthetic MoE handoff trace
+
+```fish
+git pull --ff-only
+and python3 scripts/moe-measure/handoff_trace.py
+```
+
+The runner builds `test-moe-stream` in `build-rocm-moe-stream-measure` with `-j28` and the SDK in `~/opt/rocm-10.1`. `--build-dir` selects a separate build if the existing CMake cache uses another compiler. The runner needs `rocprofv3` from that SDK and both RDNA3 devices.
+
+The fixture runs one four-token Verify-shaped layer with the production HIP service, admission policy, split lookup and pinned stage pool. Two alternating sets of 28 selected experts produce exactly 1, 3 or 8 misses, with 64 measured rounds per case and per GPU. The IQ3_S gate/up and IQ4_NL down banks use 2560/640 dimensions and scattered weight ranges. A separate Q8_0 shared FFN provides independent GPU work before the wait. The fixture uses synthetic routing and resident host payloads. It loads no model and opens no server socket.
+
+`report.json` contains medians, p95 and per-round data for host observation, policy, range construction, pool acquisition and slot wait, RAM staging, HIP API calls, H2D transfers and the GPU gap after shared work. The ready API brackets the clock offset. A negative publication-end-to-observation estimate is possible when the CPU sees the notification before the publishing kernel exits. The GPU gap includes scheduling time. When visible, the stream-wait kernel is reported separately. Copy time within the gap uses the union of trace intervals, so overlapping copy and wait times should not be added. Weight transfers must correlate with every expected upload. The tiny map patch's API call is required and its device copy is marked when visible.
+
+The runner prints the Handoff archive path after both profiles. It records missing trace data as an incomplete result and bounds each profiled process to 120 seconds. The fixture isolates the handoff, so its timings do not establish production throughput or the cost of searching a full multi-layer cache.
+
+### GDN convolution history for Verify width four
+
+On RDNA3 the matching F32 graph packs the convolution input and writes all four rollback snapshots in a single kernel. The fusion checks the input strides, distinct cache ranges and uses of each intermediate snapshot. Other shapes retain the original operations. The `SSM_CONV_ROLLBACK` backend test compares the packed input and the whole cache against the CPU, including a live-intermediate and a single-token case. Run it on both GPUs after the HIP build to check numerical equivalence. The CPU graph cases and host-side matcher/kernel checks passed. Native activation and timing remain to be measured.

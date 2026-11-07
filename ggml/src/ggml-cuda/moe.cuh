@@ -27,7 +27,7 @@ void ggml_cuda_moe_prepare_stage_pool(ggml_backend_cuda_context & ctx);
 void ggml_cuda_set_tensor_async_stream(ggml_backend_cuda_context & ctx, ggml_tensor * tensor,
     const void * data, size_t offset, size_t size, cudaStream_t stream);
 void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,
-    const ggml_moe_upload * uploads, size_t count, cudaStream_t stream);
+    const ggml_moe_upload * uploads, size_t count, cudaStream_t stream, ggml_moe_handoff_sample * sample = nullptr);
 bool ggml_hip_moe_pipeline_init(ggml_backend_t backend, int32_t layers,
     ggml_moe_resolve_t resolve, void * userdata, ggml_moe_pipeline * out);
 void ggml_hip_moe_cache_lookup(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
