@@ -2,6 +2,47 @@
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
+#if defined(GGML_USE_HIP)
+static __global__ void ssm_conv_rollback_f32(const float * history, const float * tokens, float * input,
+        float * state, int channels, size_t slot_stride) {
+    const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+
+    float values[7];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        values[i] = history[3*channel + i];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[3 + i] = tokens[i*channels + channel];
+    }
+#pragma unroll
+    for (int i = 0; i < 7; ++i) {
+        input[7*channel + i] = values[i];
+    }
+
+#pragma unroll
+    for (int slot = 0; slot < 4; ++slot) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            state[slot*slot_stride + 3*channel + i] = values[4 - slot + i];
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_rollback(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+        const ggml_tensor * state_dst, size_t slot_stride) {
+    constexpr int threads = 128;
+    const int channels = int(input->ne[1]);
+    ssm_conv_rollback_f32<<<(channels + threads - 1) / threads, threads, 0, ctx.stream()>>>(
+            (const float *) input->src[0]->data, (const float *) input->src[1]->data, (float *) input->data,
+            (float *) state_dst->data, channels, slot_stride / sizeof(float));
+}
+#endif
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
                                     const float * bias_ptr,

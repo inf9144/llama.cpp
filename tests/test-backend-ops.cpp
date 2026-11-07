@@ -4810,6 +4810,54 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+struct test_ssm_conv_rollback : public test_case {
+    const int64_t n_tokens;
+    const bool keep_tail;
+    ggml_tensor * packed = nullptr;
+    ggml_tensor * cache_out = nullptr;
+    ggml_tensor * first_tail = nullptr;
+
+    test_ssm_conv_rollback(int64_t n_tokens, bool keep_tail = false) : n_tokens(n_tokens), keep_tail(keep_tail) {}
+
+    std::string vars() override { return VARS_TO_STR2(n_tokens, keep_tail); }
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_ROLLBACK"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return keep_tail ? std::vector<ggml_tensor *>{ packed, cache_out, first_tail }
+                         : std::vector<ggml_tensor *>{ packed, cache_out };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t channels = 10240;
+        constexpr int64_t history_cols = 3;
+        constexpr int64_t mem_size = 3;
+        constexpr int64_t head = 1;
+        auto * history = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_cols, channels);
+        auto * tokens = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, n_tokens);
+        auto * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, history_cols*channels, 4*mem_size);
+        packed = ggml_concat(ctx, history, ggml_transpose(ctx, tokens), 0);
+
+        cache_out = ggml_dup(ctx, cache);
+        // Include the cache writes before comparing the entire cache, including the untouched rows.
+        for (int slot = 0; slot < 4; ++slot) {
+            const size_t offset = std::max<int64_t>(0, n_tokens - slot)*sizeof(float);
+            auto * tail = ggml_view_3d(ctx, packed, history_cols, channels, 1, packed->nb[1], packed->nb[2], offset);
+            auto * cont = ggml_cont(ctx, tail);
+            auto * dst = ggml_view_2d(ctx, cache, cache->ne[0], 1, cache->nb[1], (slot*mem_size + head)*cache->nb[1]);
+            cache_out->src[1 + slot] = ggml_cpy(ctx, cont, dst);
+            if (slot == 0) {
+                first_tail = cont;
+            }
+        }
+        if (keep_tail) {
+            ggml_set_output(first_tail);
+        }
+        return cache_out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -11324,6 +11372,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_ssm_conv_rollback(4));
+    test_cases.emplace_back(new test_ssm_conv_rollback(4, true));
+    test_cases.emplace_back(new test_ssm_conv_rollback(1));
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)

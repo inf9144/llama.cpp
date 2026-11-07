@@ -4204,6 +4204,106 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 #if defined(GGML_USE_HIP)
+// Match concat plus the four convolution snapshots, from newest to oldest.
+static int ggml_cuda_try_ssm_conv_rollback_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int i) {
+    constexpr int n_slots = 4;
+    constexpr int history_cols = 3;
+    constexpr int input_cols = history_cols + n_slots;
+    const auto * input = graph->nodes[i];
+    const auto * history = input->src[0];
+    const auto * tokens = input->src[1];
+    const int64_t channels = input->ne[1];
+
+    if (!history || !tokens || ggml_get_op_params_i32(input, 0) != 0 ||
+            input->ne[0] != input_cols || !ggml_is_matrix(input) || !ggml_is_contiguous(input) ||
+            channels <= 0 || channels > INT_MAX / input_cols ||
+            history->ne[0] != history_cols || history->ne[1] != channels ||
+            !ggml_is_matrix(history) || !ggml_is_contiguous(history) ||
+            tokens->ne[0] != n_slots || tokens->ne[1] != channels || !ggml_is_matrix(tokens) ||
+            tokens->nb[0] != channels*sizeof(float) || tokens->nb[1] != sizeof(float)) {
+        return 0;
+    }
+
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    const auto local_f32 = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->data && t->buffer && t->buffer->buft == buft;
+    };
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto ap = reinterpret_cast<uintptr_t>(a->data);
+        const auto bp = reinterpret_cast<uintptr_t>(b->data);
+        return ap <= bp ? bp - ap < ggml_nbytes(a) : ap - bp < ggml_nbytes(b);
+    };
+    if (!local_f32(input) || !local_f32(history) || !local_f32(tokens) ||
+            overlaps(input, history) || overlaps(input, tokens)) {
+        return 0;
+    }
+
+    int nodes[1 + 2*n_slots] = { i };
+    ggml_op ops[1 + 2*n_slots] = { GGML_OP_CONCAT };
+    int outputs[1 + n_slots] = { i };
+    int pos = i;
+    const int end = i + std::min(graph->n_nodes - i, 1 + 4*n_slots);
+    const auto next_op = [&]() -> const ggml_tensor * {
+        while (++pos < end && graph->nodes[pos]->op == GGML_OP_VIEW) {}
+        return pos < end ? graph->nodes[pos] : nullptr;
+    };
+
+    const ggml_tensor * first_dst = nullptr;
+    size_t prev_offset = 0;
+    size_t slot_stride = 0;
+    for (int slot = 0; slot < n_slots; ++slot) {
+        const auto * cont = next_op();
+        if (!cont || cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 || cont->view_src || !ggml_is_contiguous(cont)) {
+            return 0;
+        }
+        const auto * tail = cont->src[0];
+        if (!tail || tail->op != GGML_OP_VIEW || tail->view_src != input ||
+                tail->view_offs != (n_slots - slot)*sizeof(float) ||
+                tail->ne[0] != history_cols || tail->ne[1] != channels || !ggml_is_matrix(tail) ||
+                tail->nb[0] != sizeof(float) || tail->nb[1] != input->nb[1] || !ggml_are_same_shape(cont, tail)) {
+            return 0;
+        }
+        nodes[1 + 2*slot] = pos;
+        ops[1 + 2*slot] = GGML_OP_CONT;
+
+        const auto * copy = next_op();
+        if (!copy || copy->op != GGML_OP_CPY || copy->src[0] != cont) {
+            return 0;
+        }
+        const auto * dst = copy->src[1];
+        if (!dst || dst->op != GGML_OP_VIEW || !dst->view_src || !local_f32(dst) ||
+                copy->data != dst->data || dst->ne[0] != history_cols*channels ||
+                !ggml_is_vector(dst) || !ggml_is_contiguous(dst) ||
+                overlaps(dst, input) || overlaps(dst, history) || overlaps(dst, tokens)) {
+            return 0;
+        }
+
+        if (slot == 0) {
+            first_dst = dst;
+        } else {
+            if (dst->view_src != first_dst->view_src || dst->view_offs <= prev_offset) {
+                return 0;
+            }
+            const size_t stride = dst->view_offs - prev_offset;
+            if (stride < ggml_nbytes(dst) || stride % sizeof(float) != 0 || (slot > 1 && stride != slot_stride)) {
+                return 0;
+            }
+            slot_stride = stride;
+        }
+        prev_offset = dst->view_offs;
+        nodes[2 + 2*slot] = pos;
+        ops[2 + 2*slot] = GGML_OP_CPY;
+        outputs[1 + slot] = pos;
+    }
+
+    // Each packed tail must be private to its copy.
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 1 + 2*n_slots, ops, outputs, 1 + n_slots)) {
+        return 0;
+    }
+    ggml_cuda_op_ssm_conv_rollback(ctx, input, first_dst, slot_stride);
+    return pos - i;
+}
+
 static bool ggml_cuda_mmf_thin_fusion_matches(const ggml_cgraph * graph, int i) {
     if (i + 2 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_MUL_MAT ||
             graph->nodes[i + 1]->op != GGML_OP_SCALE || graph->nodes[i + 2]->op != GGML_OP_UNARY) {
@@ -4255,6 +4355,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 #if defined(GGML_USE_HIP)
     if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (node->op == GGML_OP_CONCAT && GGML_CUDA_CC_IS_RDNA3_0(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            const int skip = ggml_cuda_try_ssm_conv_rollback_fusion(*cuda_ctx, cgraph, i);
+            if (skip > 0) {
+                return skip;
+            }
+        }
         const int end = ggml_cuda_mmvq_pair_end(cgraph, i);
         if (end > i) {
             const int outputs[] = {i, end};
