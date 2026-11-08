@@ -160,7 +160,8 @@ def stop_server(process: subprocess.Popen, seconds: int) -> int:
     return process.returncode
 
 
-def send_request(request: bytes, folder: Path, seconds: int) -> dict:
+def send_request(request: bytes, folder: Path, seconds: int, *, min_cached_tokens: int = 0,
+                 save_response: bool = True) -> dict:
     folder.mkdir()
     url = f"http://{HOST}:{PORT}/v1/chat/completions"
     http_request = urllib.request.Request(url, data=request, headers={"Content-Type": "application/json"}, method="POST")
@@ -173,13 +174,15 @@ def send_request(request: bytes, folder: Path, seconds: int) -> dict:
         (folder / "response-error.txt").write_bytes(error.read())
         raise RuntimeError(f"HTTP {error.code}: siehe response-error.txt") from error
     t1_us = time.monotonic_ns() // 1000
-    (folder / "response.json").write_bytes(payload)
+    if save_response:
+        (folder / "response.json").write_bytes(payload)
     data = json.loads(payload)
     if status != 200 or data.get("error"):
         raise RuntimeError(f"Unerwartete Antwort: {status}, {str(data)[:500]}")
     usage = data.get("usage") or {}
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    if cached != 0 or not usage.get("prompt_tokens"):
+    expected_cache = cached >= min_cached_tokens if min_cached_tokens else cached == 0
+    if not expected_cache or not usage.get("prompt_tokens"):
         raise RuntimeError(f"Prompt-Cache-Check fehlgeschlagen: cached={cached}, usage={usage}")
     choices = [{"message": c.get("message"), "text": c.get("text"), "finish_reason": c.get("finish_reason")} for c in data.get("choices", [])]
     choice_hash = hashlib.sha256(json.dumps(choices, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

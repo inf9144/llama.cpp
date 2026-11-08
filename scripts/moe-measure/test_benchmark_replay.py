@@ -8,9 +8,44 @@ from unittest.mock import patch
 import cache_replay as cache
 import gdn_ab as gdn
 import handoff_trace as handoff
+import rollback_ab as rollback
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_rollback_launcher_and_prompt_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "request.json"
+            source.write_text(json.dumps(dict(seed=42, messages=[dict(role="user", content="sample")],
+                                              max_completion_tokens=128, cache_prompt=False)))
+            request = rollback.prepare_request(source, 2, 256)
+        self.assertTrue(request["cache_prompt"])
+        self.assertEqual(request["max_tokens"], 256)
+        self.assertNotIn("max_completion_tokens", request)
+        self.assertEqual(request["messages"][0]["content"].count("sample"), 2)
+        text = rollback.launcher(
+            "./build-rocm-moe-reference/bin/llama-server --cache-ram 0 "
+            "--port 8080 --spec-draft-n-max 3 --moe-cache-mib 15200,9600\n",
+            Path("/tmp/rollback binary/llama-server"), (7800, 5650), Path("/tmp/rollback slot"))
+        self.assertIn("--moe-cache-mib 7800,5650", text)
+        self.assertIn("--slot-save-path '/tmp/rollback slot' --no-context-shift", text)
+        self.assertIn("--spec-draft-sampling probabilistic", text)
+
+    def test_rollback_summary_requires_same_output_reuse_and_verify_work(self):
+        def result(trim, t_ms):
+            return dict(content_sha256="same", usage=dict(prompt_tokens=150000, completion_tokens=256),
+                        timings=dict(draft_n=252, draft_n_accepted=171, draft_verify_rounds=85,
+                                     draft_tail_trim_us=trim, cache_n=149996, prompt_n=4, predicted_ms=t_ms))
+
+        a, b = result(8500, 6000), result(1700, 5700)
+        summary = rollback.summarize([dict(baseline=a, candidate=b)])
+        self.assertEqual(summary["baseline"]["trim_us_per_verify"], 100)
+        self.assertEqual(summary["candidate"]["trim_us_per_verify"], 20)
+        self.assertAlmostEqual(summary["paired_decode_ms_delta_percent"][0], -5)
+        b["timings"]["cache_n"] -= 4
+        with self.assertRaisesRegex(ValueError, "Prompt-Reuse"):
+            rollback.summarize([dict(baseline=a, candidate=b)])
+
     def test_gdn_pairs_use_matched_work(self):
         def result(time, digest="same"):
             return dict(content_sha256=digest, usage=dict(prompt_tokens=5121, completion_tokens=128),
@@ -29,7 +64,7 @@ class BenchmarkTests(unittest.TestCase):
 
     @patch.object(handoff, "REPEATS", 2)
     def test_compact_ab_requires_same_payload(self):
-        rows = [dict(mode=mode, misses=misses, graph_us=100 if mode == "separate" else 75, bytes=4096,
+        rows: list[dict] = [dict(mode=mode, misses=misses, graph_us=100 if mode == "separate" else 75, bytes=4096,
                      h2d_bytes=4096 if mode == "separate" else 4160,
                      copies=3*misses + 1 if mode == "separate" else 1)
                 for misses in handoff.MISS_COUNTS for mode in ("separate", "compact") for _ in range(2)]

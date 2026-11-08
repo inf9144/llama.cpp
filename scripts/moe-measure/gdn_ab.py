@@ -23,27 +23,29 @@ def git(directory, *args):
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
 
-def build_pair(directory, env, jobs):
+def build_pair(directory, env, jobs, *, revisions=REVISIONS, extra=()):
     source = directory / "source"
     build = directory / "build"
     snapshots = directory / "runtimes"
+    manifest = {"sdk": env["ROCM_PATH"], "revisions": revisions}
+    if extra:
+        manifest["extra"] = list(extra)
 
     def check_snapshot(folder):
-        binaries = {variant: folder / variant / "llama-server" for variant in REVISIONS}
+        binaries = {variant: folder / variant / "llama-server" for variant in revisions}
         ids = {variant: build_id(binary, env) for variant, binary in binaries.items()}
         for variant, identity in ids.items():
-            if not REVISIONS[variant].startswith(identity.split("-", 1)[1]):
-                raise ValueError(f"{variant} meldet {identity}, erwartet {REVISIONS[variant][:9]}")
+            if not revisions[variant].startswith(identity.split("-", 1)[1]):
+                raise ValueError(f"{variant} meldet {identity}, erwartet {revisions[variant][:9]}")
         return binaries, ids
 
     if snapshots.exists():
-        manifest = json.loads((snapshots / "pair.json").read_text())
-        if manifest != {"sdk": env["ROCM_PATH"], "revisions": REVISIONS}:
-            raise ValueError(f"SDK oder Revision in {snapshots} weicht ab. Bitte ein freies --build-dir wählen.")
+        if json.loads((snapshots / "pair.json").read_text()) != manifest:
+            raise ValueError(f"SDK, Revision oder Build-Optionen in {snapshots} weichen ab. Bitte ein freies --build-dir wählen.")
         return check_snapshot(snapshots)
 
     if not source.exists():
-        subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), REVISIONS["baseline"]],
+        subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), revisions["baseline"]],
                        check=True)
     if (Path(git(source, "rev-parse", "--show-toplevel")).resolve() != source or
             git(source, "rev-parse", "--path-format=absolute", "--git-common-dir") !=
@@ -53,15 +55,15 @@ def build_pair(directory, env, jobs):
 
     with tempfile.TemporaryDirectory(dir=directory) as tmp:
         staging = Path(tmp) / "runtimes"
-        for variant, rev in REVISIONS.items():
+        for variant, rev in revisions.items():
             subprocess.run(["git", "-C", str(source), "checkout", "--detach", rev], check=True)
             build_targets(source, build, env, jobs, False, ("llama-server",), extra=(
                 "-DLLAMA_BUILD_TOOLS=ON", "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_TESTS=OFF",
-                "-DLLAMA_BUILD_UI=OFF", "-DLLAMA_USE_PREBUILT_UI=OFF",
+                "-DLLAMA_BUILD_UI=OFF", "-DLLAMA_USE_PREBUILT_UI=OFF", *extra,
             ))
             shutil.copytree(build / "bin", staging / variant, symlinks=True)
         check_snapshot(staging)
-        runner.json_write(staging / "pair.json", {"sdk": env["ROCM_PATH"], "revisions": REVISIONS})
+        runner.json_write(staging / "pair.json", manifest)
         staging.rename(snapshots)
     return check_snapshot(snapshots)
 
@@ -124,7 +126,7 @@ def main():
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     output = ROOT / "results" / f"gdn-ab-{stamp}-{os.getpid()}"
     output.mkdir(parents=True)
-    report = dict(complete=False, builds=ids, revisions=REVISIONS, sdk=env["ROCM_PATH"], pairs=[])
+    report: dict = dict(complete=False, builds=ids, revisions=REVISIONS, sdk=env["ROCM_PATH"], pairs=[])
     args.draft_max = 3
     args.production_controls = True
     args.baseline_reference = binaries["baseline"]

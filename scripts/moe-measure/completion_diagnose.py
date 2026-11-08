@@ -15,7 +15,6 @@ import hashlib
 import importlib.util
 import json
 import math
-import os
 from pathlib import Path
 import re
 import shlex
@@ -142,16 +141,17 @@ def http(folder: Path, name: str, endpoint: str, payload: dict | None = None) ->
 
 
 @contextlib.contextmanager
-def server(root: Path, folder: Path, launcher: Path, candidate: bool):
+def server(root: Path, folder: Path, launcher: Path, candidate: bool, *, env=None,
+           note='Greedy correctness diagnostic, baseline/candidate, unchanged cache budgets'):
     folder.mkdir(parents=True)
     if runner.port_open():
         raise RuntimeError('Port 8080 is occupied; no unrelated process will be stopped')
     cmd = [sys.executable, 'scripts/moe-measure/run.py', '--output', str(folder / 'instrumented'),
-           '--phase', 'mixed-dflash', '--note', 'Greedy correctness diagnostic, baseline/candidate, unchanged cache budgets',
+           '--phase', 'mixed-dflash', '--note', note,
            '--', 'fish', str(launcher)]
     runner.json_write(folder / 'launch.json', cmd)
     with (folder / 'controller.log').open('wb') as log:
-        process = subprocess.Popen(cmd, cwd=root, env=os.environ.copy(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(cmd, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             runner.wait_health(process, 900)
             trace = folder / 'instrumented/trace.log'

@@ -1901,3 +1901,16 @@ python3 scripts/moe-measure/cache_replay.py
 - **GDN throughput.** The runner builds `84f8054` and `271f296` with the same compiler and CMake options in an isolated worktree. It snapshots their complete runtime directories and reuses the pair on later runs. The first pair warms the model's filesystem pages and is excluded from the statistics. Four measured pairs alternate A/B and B/A, with a fresh server and both requests per variant. The report requires equal completion hashes and DFlash counters and includes paired deltas and their ranges. `--pairs 2` is available for a shorter run. This uses `moe-server-reference.fish`, `moe-first-request.json` and a free port 8080.
 - **H2D consolidation.** The existing Verify-width-four fixture alternates separate uploads and one packed H2D transfer followed by a scatter kernel. The fixture allocates about 18 MiB of GPU scratch and uses the existing pinned host pool. Both variants write the same weights and sparse map update before the normal ready signal. The fixture checks slot indices, map contents and all resident weight bytes before measuring each variant. It records p50/p95 for the whole graph over 64 rounds per path and miss count (1, 3, 8) on both GPUs, without profiler interception. This path is only callable from the measurement fixture.
 - **Cache replay.** The runner captures a single request of up to 768 completion tokens with `moe-server-measure.fish` and the existing seeded request. It retains startup and prefill history and scores small device-lookup graphs after the last large prefill batch. The executable replays the existing C++ policy and checks every recorded baseline plan before comparing slot counts. It tests shifting up to 256 MiB between two groups on ROCm1 within the measured bank budget and with the captured prefill placement. The first half selects a candidate and the second half reports its miss bytes and p95 bytes per graph. Replay keeps the routing fixed and estimates weight traffic. Live cache placement remains a separate experiment.
+
+### Verify tail rollback at long context
+
+Run from the feature checkout with the existing `moe-server-reference.fish`, `moe-first-request.json` and a free port 8080.
+
+```fish
+git pull --ff-only
+and python3 scripts/moe-measure/rollback_ab.py --jobs 28
+```
+
+The runner builds the two fixed revisions against ROCm 10.1 in a separate worktree. It uses the manufacturer sampling preset and tests 15600/11300 MiB and 7800/5650 MiB with fresh servers. One unscored prefill creates a temporary slot snapshot that includes target and draft state. Each measured server restores that same snapshot and must reuse at least 95% of its tokens. The default repeats the existing technical prompt to exercise long-context bookkeeping. Use `--request path/to/long-chat.json --repeat-prefix 1` for a recorded chat request. Increase `--pairs` for alternating repeat runs.
+
+The report compares only equal completions, prompt reuse and Verify counters within each cache budget. Benchmark builds time the target and draft trim calls after Verify. Decode throughput includes the later graph input and QSA layout work. The handoff contains the summaries and server logs. The temporary snapshot is stored separately and removed after the run.
