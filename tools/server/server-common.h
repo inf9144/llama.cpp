@@ -413,6 +413,9 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+#ifdef LLAMA_ROLLBACK_BENCH
+    int64_t t_draft_tail_trim_us = 0;
+#endif
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

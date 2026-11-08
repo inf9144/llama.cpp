@@ -5053,7 +5053,13 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+#ifdef LLAMA_ROLLBACK_BENCH
+            const int64_t t_trim = ggml_time_us();
+#endif
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+#ifdef LLAMA_ROLLBACK_BENCH
+            slot.stats.t_draft_tail_trim_us += ggml_time_us() - t_trim;
+#endif
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
