@@ -1885,4 +1885,19 @@ The runner prints the Handoff archive path after both profiles. It records missi
 
 ### GDN convolution history for Verify width four
 
-On RDNA3 the matching F32 graph packs the convolution input and writes all four rollback snapshots in a single kernel. The fusion checks the input strides, distinct cache ranges and uses of each intermediate snapshot. Other shapes retain the original operations. The `SSM_CONV_ROLLBACK` backend test compares the packed input and the whole cache against the CPU, including a live-intermediate and a single-token case. Run it on both GPUs after the HIP build to check numerical equivalence. The CPU graph cases and host-side matcher/kernel checks passed. Native activation and timing remain to be measured.
+On RDNA3 the matching F32 graph packs the convolution input and writes all four rollback snapshots in a single kernel. The fusion checks the input strides, distinct cache ranges and uses of each intermediate snapshot. Other shapes retain the original operations. The `SSM_CONV_ROLLBACK` backend test compares the packed input and the whole cache against the CPU, including a live-intermediate and a single-token case. Both RDNA3 cards passed all three cases on the workstation. The isolated traces contain `ssm_conv_rollback_f32` with fusion enabled. The single end-to-end pair moved warm decode from 83.35 to 85.15 tokens/s with equal outputs and draft counts. The repeated comparison below controls build settings and run order.
+
+### GDN, upload consolidation and cache budget experiments
+
+Run from the repository with ROCm 10.1 in `~/opt/rocm-10.1`. The runners build with `-j28` and write separate Handoff archives under `results/`.
+
+```fish
+git pull --ff-only
+python3 scripts/moe-measure/gdn_ab.py
+python3 scripts/moe-measure/handoff_trace.py --compact-ab
+python3 scripts/moe-measure/cache_replay.py
+```
+
+- **GDN throughput.** The runner builds `84f8054` and `271f296` with the same compiler and CMake options in an isolated worktree. It snapshots their complete runtime directories and reuses the pair on later runs. The first pair warms the model's filesystem pages and is excluded from the statistics. Four measured pairs alternate A/B and B/A, with a fresh server and both requests per variant. The report requires equal completion hashes and DFlash counters and includes paired deltas and their ranges. `--pairs 2` is available for a shorter run. This uses `moe-server-reference.fish`, `moe-first-request.json` and a free port 8080.
+- **H2D consolidation.** The existing Verify-width-four fixture alternates separate uploads and one packed H2D transfer followed by a scatter kernel. The fixture allocates about 18 MiB of GPU scratch and uses the existing pinned host pool. Both variants write the same weights and sparse map update before the normal ready signal. The fixture checks slot indices, map contents and all resident weight bytes before measuring each variant. It records p50/p95 for the whole graph over 64 rounds per path and miss count (1, 3, 8) on both GPUs, without profiler interception. This path is only callable from the measurement fixture.
+- **Cache replay.** The runner captures a single request of up to 768 completion tokens with `moe-server-measure.fish` and the existing seeded request. It retains startup and prefill history and scores small device-lookup graphs after the last large prefill batch. The executable replays the existing C++ policy and checks every recorded baseline plan before comparing slot counts. It tests shifting up to 256 MiB between two groups on ROCm1 within the measured bank budget and with the captured prefill placement. The first half selects a candidate and the second half reports its miss bytes and p95 bytes per graph. Replay keeps the routing fixed and estimates weight traffic. Live cache placement remains a separate experiment.

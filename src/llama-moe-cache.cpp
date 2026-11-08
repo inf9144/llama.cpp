@@ -572,6 +572,23 @@ struct llama_moe_cache::impl {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
+                    MOE_MEASURE(if (g.n_slots > 0) {
+                        llama_moe_measure::record r("policy_group", d.backend);
+                        const auto & prefill = devices[g.prefill_id];
+                        const int64_t min_slots = std::min<int64_t>(g.n_slots,
+                            std::min<int64_t>(g.policy.n_expert, moe_cache_max_batch*n_expert_used));
+                        r.out << ",\"policy_cache\":" << (uintptr_t) this << ",\"cache_group\":" << (&g - groups.data())
+                              << ",\"experts\":" << g.policy.n_expert << ",\"slots\":" << g.n_slots
+                              << ",\"min_slots\":" << min_slots << ",\"allocated_bytes\":" << alloc_size(g, g.n_slots)
+                              << ",\"alignment\":" << ggml_backend_buft_get_alignment(d.buft)
+                              << ",\"owner_link\":" << d.host_link.bandwidth() << ",\"prefill_link\":" << prefill.host_link.bandwidth()
+                              << ",\"prefill_backend\":" << llama_moe_measure::quote(ggml_backend_name(prefill.backend))
+                              << ",\"layers\":[";
+                        for (size_t i = 0; i < g.layers.size(); ++i) r.out << (i ? "," : "") << g.layers[i];
+                        r.out << "],\"bank_bytes\":[";
+                        for (size_t i = 0; i < g.ref.size(); ++i) r.out << (i ? "," : "") << g.ref[i]->nb[2];
+                        r.out << ']';
+                    });
                 }
             }
             for (size_t execution = 0; execution < devices.size(); ++execution) {
@@ -583,6 +600,7 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        MOE_MEASURE(llama_moe_measure::flush());
     }
 
     ggml_backend_t backend(int32_t il, int64_t n_tokens) const {
@@ -657,6 +675,21 @@ struct llama_moe_cache::impl {
         ((impl *) userdata)->resolve(il, ids, count, miss);
     }
 
+#ifdef LLAMA_MOE_MEASURE
+    void append_policy_step(llama_moe_measure::record & r, int32_t il, bool force_resident) const {
+        const auto ig = layers[il].ig;
+        const auto & policy = groups[ig].policy;
+        r.out << ",\"policy_cache\":" << (uintptr_t) this << ",\"cache_group\":" << ig << ",\"layer_id\":" << il
+              << ",\"clock\":" << clock.tokens << ",\"latency_clock\":" << clock.latency_tokens
+              << ",\"force_resident\":" << (force_resident ? "true" : "false") << ",\"route_counts\":[";
+        for (size_t i = 0; i < policy.uniq.size(); ++i) {
+            const auto e = policy.uniq[i];
+            r.out << (i ? "," : "") << '[' << e << ',' << policy.counts[e] << ']';
+        }
+        r.out << ']';
+    }
+#endif
+
     void resolve(int32_t il, const int32_t * selected, int32_t count, bool miss) {
         auto & g = groups[layers[il].ig];
         auto & d = devices[g.id];
@@ -679,7 +712,8 @@ struct llama_moe_cache::impl {
             r.out << ",\"host_plan_us\":" << ggml_time_us()-start << ",\"resident_hits\":" << hits
                   << ",\"admissions\":" << admissions.size() << ",\"temporary\":0,\"device_lookup\":true,\"device_miss\":" << (miss ? "true" : "false")
                   << ",\"map_update_entries\":" << g.policy.changed.size()
-                  << ",\"map_update_bytes\":" << (miss ? (1 + 2*g.policy.changed.size())*sizeof(int32_t) : 0));
+                  << ",\"map_update_bytes\":" << (miss ? (1 + 2*g.policy.changed.size())*sizeof(int32_t) : 0);
+            append_policy_step(r, il, true));
         size_t bytes = 0;
         const bool batch_upload = miss && d.pipeline.upload_batch;
         if (batch_upload) d.uploads.clear();
@@ -837,8 +871,8 @@ struct llama_moe_cache::impl {
         MOE_MEASURE(llama_moe_measure::record r("hybrid_plan", backend, l.experts.front());
             r.out << ",\"host_plan_us\":" << ggml_time_us()-planning_start
                   << ",\"resident_hits\":" << n_hit << ",\"admissions\":" << fills.size()
-                  << ",\"temporary\":" << g.policy.temporary.size() << ",\"clock\":" << clock.tokens
-                  << ",\"latency_clock\":" << clock.latency_tokens << ",\"local_cache\":" << (local ? "true" : "false"));
+                  << ",\"temporary\":" << g.policy.temporary.size() << ",\"local_cache\":" << (local ? "true" : "false");
+            append_policy_step(r, il, !prefill));
         l.selected = g.policy.uniq;
         l.temporary = g.policy.temporary;
         l.counts.assign(g.policy.counts.begin(), g.policy.counts.end());
