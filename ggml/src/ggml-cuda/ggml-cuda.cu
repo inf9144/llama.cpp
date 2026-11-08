@@ -762,6 +762,29 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 #if defined(GGML_USE_HIP)
+#ifdef LLAMA_MOE_MEASURE
+struct ggml_rocm_compact_range {
+    uint8_t * dst;
+    uint32_t offset;
+    uint32_t size;
+};
+static_assert(sizeof(ggml_rocm_compact_range) == 16);
+
+static __global__ void ggml_rocm_scatter_upload(const uint8_t * packed) {
+    const auto range = ((const ggml_rocm_compact_range *) packed)[blockIdx.y];
+    const uint8_t * src = packed + range.offset;
+    auto * dst = (uint4 *) range.dst;
+    const uint32_t vectors = range.size / sizeof(uint4);
+    for (uint32_t i = blockIdx.x*blockDim.x + threadIdx.x; i < vectors; i += gridDim.x*blockDim.x) {
+        dst[i] = ((const uint4 *) src)[i];
+    }
+    if (blockIdx.x == 0 && threadIdx.x < range.size % sizeof(uint4)) {
+        const uint32_t i = vectors*sizeof(uint4) + threadIdx.x;
+        range.dst[i] = src[i];
+    }
+}
+#endif
+
 // Keep private host buffers alive until their HIP copy completion events signal.
 struct ggml_rocm_malloc_stage_slot {
     void * data = nullptr;
@@ -933,6 +956,54 @@ struct ggml_rocm_malloc_stage_pool {
             offset += n;
         }
     }
+
+#ifdef LLAMA_MOE_MEASURE
+    size_t copy_compact(cudaStream_t stream, ggml_tensor * scratch, const ggml_moe_upload * uploads, size_t count,
+            const ggml_rocm_malloc_stage_config & config) {
+        constexpr size_t alignment = sizeof(uint4);
+        constexpr size_t granularity = 64*1024;
+        ggml_rocm_compact_range ranges[64];
+        GGML_ASSERT(count > 0 && count <= sizeof(ranges)/sizeof(ranges[0]));
+        const size_t limit = std::min({config.limit, chunk_max, ggml_nbytes(scratch)});
+        size_t packed_bytes = count*sizeof(ranges[0]);
+        size_t max_range = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const auto & u = uploads[i];
+            const size_t offset = GGML_PAD(packed_bytes, alignment);
+            auto * dst = (uint8_t *) u.dst->data + u.offset;
+            GGML_ASSERT(config.matches(u) && offset <= limit && u.bytes <= limit - offset);
+            GGML_ASSERT(uintptr_t(dst) % alignment == 0);
+            ranges[i] = {dst, uint32_t(offset), uint32_t(u.bytes)};
+            packed_bytes = offset + u.bytes;
+            max_range = std::max(max_range, u.bytes);
+        }
+
+        const size_t capacity = GGML_PAD(packed_bytes, granularity);
+        GGML_ASSERT(capacity <= config.limit);
+        auto & slot = slots[acquire(capacity, config.limit)];
+        GGML_ASSERT(slot.pinned && !slot.in_flight && slot.capacity >= packed_bytes);
+        auto * host = (uint8_t *) slot.data;
+        size_t end = count*sizeof(ranges[0]);
+        std::memcpy(host, ranges, end);
+        for (size_t i = 0; i < count; ++i) {
+            if (end < ranges[i].offset) {
+                std::memset(host + end, 0, ranges[i].offset - end);
+            }
+            std::memcpy(host + ranges[i].offset, uploads[i].src, ranges[i].size);
+            end = ranges[i].offset + ranges[i].size;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(scratch->data, host, packed_bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaEventRecord(slot.done, stream));
+        slot.in_flight = true;
+        slot.submitted = ++submissions;
+
+        constexpr unsigned threads = 256;
+        const unsigned blocks = std::min<size_t>(32, (max_range + threads*alignment - 1)/(threads*alignment));
+        ggml_rocm_scatter_upload<<<dim3(blocks, count), threads, 0, stream>>>((const uint8_t *) scratch->data);
+        CUDA_CHECK(cudaGetLastError());
+        return packed_bytes;
+    }
+#endif
 
     void copy_batch(cudaStream_t stream, const ggml_moe_upload * uploads, size_t count,
             const ggml_rocm_malloc_stage_config & config, ggml_moe_handoff_sample * sample = nullptr) {
@@ -3038,6 +3109,30 @@ void ggml_cuda_set_tensor_batch_async_stream(ggml_backend_cuda_context & ctx,
     if (!ctx.rocm_malloc_stage_pool) ctx.rocm_malloc_stage_pool = new ggml_rocm_malloc_stage_pool;
     ctx.rocm_malloc_stage_pool->copy_batch(stream, uploads, count, config, sample);
 }
+
+#ifdef LLAMA_MOE_MEASURE
+size_t ggml_cuda_upload_compact(ggml_backend_cuda_context & ctx, ggml_tensor * scratch,
+        const ggml_moe_upload * uploads, size_t count, cudaStream_t stream) {
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    GGML_ASSERT(scratch && scratch->data && uintptr_t(scratch->data) % sizeof(uint4) == 0 &&
+                !scratch->view_src && scratch->buffer && scratch->buffer->buft == buft &&
+                scratch->type == GGML_TYPE_I8 && ggml_is_contiguous(scratch));
+    for (size_t i = 0; i < count; ++i) {
+        const auto & u = uploads[i];
+        GGML_ASSERT(u.src && u.dst && u.dst->data && u.dst != scratch && !u.dst->view_src &&
+                    u.dst->buffer && u.dst->buffer->buft == buft &&
+                    u.offset <= ggml_nbytes(u.dst) && u.bytes <= ggml_nbytes(u.dst) - u.offset);
+        for (size_t j = 0; j < i; ++j) {
+            const auto & prev = uploads[j];
+            GGML_ASSERT(u.dst != prev.dst || u.offset >= prev.offset + prev.bytes || prev.offset >= u.offset + u.bytes);
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+    std::lock_guard<std::mutex> lock(ctx.rocm_malloc_stage_pool_mutex);
+    GGML_ASSERT(ctx.rocm_malloc_stage_pool);
+    return ctx.rocm_malloc_stage_pool->copy_compact(stream, scratch, uploads, count, ggml_rocm_stage_config());
+}
+#endif
 #endif
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {

@@ -319,7 +319,12 @@ bool ggml_hip_moe_pipeline_init(ggml_backend_t backend, int32_t layers,
             GGML_ASSERT(e.idle);
             e.handoff_observer = observer;
         },
+        [](void * p, ggml_tensor * scratch, const ggml_moe_upload * uploads, size_t count) {
+            auto & e = *(service *) p;
+            return ggml_cuda_upload_compact(e.ctx, scratch, uploads, count, e.upload);
+        },
 #else
+        nullptr,
         nullptr,
 #endif
     };

@@ -97,6 +97,8 @@ struct ggml_moe_pipeline {
     // Same source lifetime and stream order as upload. Pool-backed copies own their host sources.
     void (*upload_batch)(void * context, const struct ggml_moe_upload * uploads, size_t count);
     void (*set_handoff_observer)(void * context, ggml_moe_handoff_observer_t observer);
+    // Measurement fixture only. Scratch and all destination ranges are disjoint.
+    size_t (*upload_compact)(void * context, struct ggml_tensor * scratch, const struct ggml_moe_upload * uploads, size_t count);
 };
 typedef bool (*ggml_moe_pipeline_init_t)(struct ggml_backend * backend, int32_t layers,
     ggml_moe_resolve_t resolve, void * userdata, struct ggml_moe_pipeline * out);

@@ -352,35 +352,46 @@ struct handoff_fixture {
     static constexpr int hidden = 2560, ff = 640, max_misses = 8;
     static constexpr int expert_stride = 13; // Keep source ranges disjoint, as with scattered production misses.
     static constexpr int miss_counts[] = {1, 3, max_misses};
+    struct step {
+        int swapped;
+        int misses;
+        bool compact;
+        bool timed;
+        bool check;
+    };
     struct record {
         ggml_moe_handoff_sample service = {};
         int misses = 0;
         int64_t plan_begin = 0, plan_end = 0, upload_begin = 0, upload_end = 0;
         size_t bytes = 0;
         size_t ranges = 0;
+        size_t h2d_bytes = 0;
     };
     ggml_moe_pipeline pipeline = {};
     moe_cache_policy policy;
     std::vector<int32_t> map = std::vector<int32_t>(experts, -1);
     ggml_tensor * bank[3];
     ggml_tensor * updates;
+    ggml_tensor * scratch = nullptr;
     std::vector<uint8_t> weights[3];
     std::vector<moe_cache_policy::fill> fills;
     std::vector<int32_t> patch;
     std::vector<ggml_moe_upload> uploads;
     std::vector<record> records;
+    std::vector<step> steps;
 
     static void resolve(void * userdata, int32_t layer, const int32_t * ids, int32_t count, bool miss) {
         auto & f = *(handoff_fixture *) userdata;
         GGML_ASSERT(layer == 0 && count == used*tokens && miss);
         const size_t round = f.records.size();
-        GGML_ASSERT(round < 1 + repeats*std::size(miss_counts));
+        GGML_ASSERT(round < f.steps.size());
+        const auto & step = f.steps[round];
         auto & r = f.records.emplace_back();
-        r.misses = round == 0 ? slots : miss_counts[(round - 1)/repeats];
+        r.misses = step.misses;
         size_t hits;
-        r.plan_begin = ggml_time_us();
+        if (!f.scratch) r.plan_begin = ggml_time_us();
         GGML_ASSERT(f.policy.plan(layer, ids, count, f.fills, hits, round*tokens, true, round*tokens));
-        r.plan_end = ggml_time_us();
+        if (!f.scratch) r.plan_end = ggml_time_us();
         GGML_ASSERT(f.fills.size() == size_t(r.misses) && hits + f.fills.size() == slots);
         f.uploads.clear();
         for (int i = 0; i < 3; ++i) {
@@ -402,25 +413,54 @@ struct handoff_fixture {
         f.uploads.push_back({f.updates, f.patch.data(), 0, patch_bytes});
         r.bytes += patch_bytes;
         r.ranges = f.uploads.size();
-        r.upload_begin = ggml_time_us();
-        f.pipeline.upload_batch(f.pipeline.context, f.uploads.data(), f.uploads.size());
-        r.upload_end = ggml_time_us();
+        if (!f.scratch) r.upload_begin = ggml_time_us();
+        if (step.compact) {
+            r.h2d_bytes = f.pipeline.upload_compact(f.pipeline.context, f.scratch, f.uploads.data(), f.uploads.size());
+        } else {
+            f.pipeline.upload_batch(f.pipeline.context, f.uploads.data(), f.uploads.size());
+            r.h2d_bytes = r.bytes;
+        }
+        if (!f.scratch) r.upload_end = ggml_time_us();
     }
 
-    void run(ggml_backend_t backend, ggml_moe_pipeline_init_t init) {
+    void run(ggml_backend_t backend, ggml_moe_pipeline_init_t init, bool bench) {
         GGML_ASSERT(init(backend, 1, resolve, this, &pipeline) && pipeline.device_lookup);
         GGML_ASSERT(pipeline.set_handoff_observer && "--handoff-trace requires LLAMA_MOE_MEASURE=ON");
+        GGML_ASSERT(!bench || pipeline.upload_compact);
+        steps.push_back({0, slots, false, false, false});
+        auto add_block = [&](int misses, int count, bool compact, bool timed, bool check) {
+            // Each even-length block ends on the original expert set.
+            for (int i = 0; i < count; ++i) {
+                steps.push_back({i % 2 == 0 ? misses : 0, misses, compact, timed, check && i == 0});
+            }
+        };
+        for (int misses : miss_counts) {
+            if (bench) {
+                constexpr int block = 8;
+                add_block(misses, block, false, false, true);
+                add_block(misses, block, true, false, true);
+                for (int i = 0; i < repeats/block; ++i) {
+                    const bool compact_first = i % 2 != 0;
+                    add_block(misses, block, compact_first, true, false);
+                    add_block(misses, block, !compact_first, true, false);
+                }
+            } else {
+                add_block(misses, repeats, false, false, false);
+            }
+        }
         policy.init(1, experts, slots);
         policy.slot_map[0] = map.data();
         fills.reserve(slots);
         patch.reserve(1 + 4*slots);
         uploads.reserve(3*slots + 1);
-        records.reserve(1 + repeats*std::size(miss_counts));
-        pipeline.set_handoff_observer(pipeline.context, [](void * userdata, const ggml_moe_handoff_sample * s) {
-            auto & records = ((handoff_fixture *) userdata)->records;
-            GGML_ASSERT(s->layer == 0 && s->version == records.size());
-            records.back().service = *s;
-        });
+        records.reserve(steps.size());
+        if (!bench) {
+            pipeline.set_handoff_observer(pipeline.context, [](void * userdata, const ggml_moe_handoff_sample * s) {
+                auto & records = ((handoff_fixture *) userdata)->records;
+                GGML_ASSERT(s->layer == 0 && s->version == records.size());
+                records.back().service = *s;
+            });
+        }
 
         ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
         auto * c = ctx.get();
@@ -431,6 +471,11 @@ struct handoff_fixture {
         bank[0] = ggml_new_tensor_3d(c, GGML_TYPE_IQ3_S, hidden, ff, slots);
         bank[1] = ggml_dup_tensor(c, bank[0]);
         bank[2] = ggml_new_tensor_3d(c, GGML_TYPE_IQ4_NL, ff, hidden, slots);
+        if (bench) {
+            const size_t payload = max_misses*(bank[0]->nb[2] + bank[1]->nb[2] + bank[2]->nb[2]);
+            // The map patch, range descriptors and alignment fit in this tail.
+            scratch = ggml_new_tensor_1d(c, GGML_TYPE_I8, payload + 4096);
+        }
 
         auto * graph = ggml_new_graph(c);
         auto * pub = ggml_moe_cache_lookup(c, device_map, ids, pipeline.lookup_job(pipeline.context, 0), updates);
@@ -454,29 +499,75 @@ struct handoff_fixture {
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_buffer_clear(buffer.get(), 0);
         ggml_backend_tensor_set(device_map, map.data(), 0, ggml_nbytes(device_map));
-        for (int i = 0; i < 3; ++i) weights[i].resize((slots + max_misses)*bank[i]->nb[2]);
+        for (int i = 0; i < 3; ++i) {
+            const size_t size = bank[i]->nb[2];
+            weights[i].resize((slots + max_misses)*size);
+            if (bench) {
+                const size_t block = ggml_type_size(bank[i]->type);
+                for (int expert = 0; expert < slots + max_misses; ++expert) {
+                    auto * data = weights[i].data() + expert*size;
+                    // Distinct valid block payloads with zero scales.
+                    for (size_t offset = 0; offset < size; offset += block) {
+                        data[offset + 2] = 1 + expert + 37*i;
+                        data[offset + block - 1] = (offset/block + expert) % 251;
+                    }
+                }
+            }
+        }
 
-        auto compute = [&](int swapped) {
+        std::vector<int64_t> graph_us(steps.size());
+        pipeline.begin(pipeline.context);
+        for (size_t round = 0; round < steps.size(); ++round) {
+            const auto & step = steps[round];
             int32_t routing[used*tokens];
             for (int i = 0; i < used*tokens; ++i) {
                 const int e = i % slots;
-                routing[i] = expert_stride*(e < slots - swapped ? e : e + swapped);
+                routing[i] = expert_stride*(e < slots - step.swapped ? e : e + step.swapped);
             }
             ggml_backend_tensor_set(ids, routing, 0, sizeof(routing));
+            const int64_t start = step.timed ? ggml_time_us() : 0;
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
-        };
-        pipeline.begin(pipeline.context);
-        compute(0);
-        for (int misses : miss_counts) {
-            // End each phase on the original set so the next phase starts
-            // with exactly its intended number of missing experts.
-            for (int step = 0; step < repeats; ++step) compute(step % 2 == 0 ? misses : 0);
+            if (step.timed) graph_us[round] = ggml_time_us() - start;
+            if (step.check) {
+                pipeline.flush(pipeline.context);
+                int32_t selected[used*tokens];
+                ggml_backend_tensor_get(physical, selected, 0, sizeof(selected));
+                for (int i = 0; i < used*tokens; ++i) {
+                    GGML_ASSERT(selected[i] == map[routing[i]] && selected[i] >= 0);
+                }
+                std::vector<int32_t> readback(experts);
+                ggml_backend_tensor_get(device_map, readback.data(), 0, ggml_nbytes(device_map));
+                GGML_ASSERT(readback == map);
+                for (int i = 0; i < 3; ++i) {
+                    const size_t bytes = bank[i]->nb[2];
+                    std::vector<uint8_t> actual(ggml_nbytes(bank[i]));
+                    ggml_backend_tensor_get(bank[i], actual.data(), 0, actual.size());
+                    for (int e = 0; e < slots + max_misses; ++e) {
+                        const int slot = map[e*expert_stride];
+                        if (slot >= 0) {
+                            GGML_ASSERT(std::memcmp(actual.data() + slot*bytes, weights[i].data() + e*bytes, bytes) == 0);
+                        }
+                    }
+                }
+                pipeline.begin(pipeline.context);
+            }
         }
         pipeline.flush(pipeline.context);
         std::vector<int32_t> readback(experts);
         ggml_backend_tensor_get(device_map, readback.data(), 0, ggml_nbytes(device_map));
-        GGML_ASSERT(readback == map && records.size() == 1 + repeats*std::size(miss_counts));
-        for (const auto & r : records) {
+        GGML_ASSERT(readback == map && records.size() == steps.size());
+        for (size_t round = 0; round < records.size(); ++round) {
+            const auto & r = records[round];
+            const auto & step = steps[round];
+            if (bench) {
+                if (step.timed) {
+                    printf("upload_ab {\"mode\":\"%s\",\"misses\":%d,\"graph_us\":%lld,"
+                           "\"bytes\":%zu,\"h2d_bytes\":%zu,\"copies\":%zu}\n",
+                           step.compact ? "compact" : "separate", r.misses, (long long) graph_us[round],
+                           r.bytes, r.h2d_bytes, step.compact ? size_t(1) : r.ranges);
+                }
+                continue;
+            }
             const auto & s = r.service;
             GGML_ASSERT(s.version && s.staged_bytes == r.bytes);
             printf("handoff {\"version\":%u,\"misses\":%d,\"bytes\":%zu,\"ranges\":%zu,"
@@ -668,15 +759,17 @@ int main(int argc, char ** argv) {
     bool lookup_only = false;
     bool overlap_only = false;
     bool handoff_trace = false;
+    bool compact_ab = false;
     bool upload_only = false, upload_bench = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) filter = argv[++i];
         else if (strcmp(argv[i], "--lookup-only") == 0) lookup_only = true;
         else if (strcmp(argv[i], "--overlap-only") == 0) overlap_only = true;
         else if (strcmp(argv[i], "--handoff-trace") == 0) handoff_trace = true;
+        else if (strcmp(argv[i], "--compact-ab") == 0) handoff_trace = compact_ab = true;
         else if (strcmp(argv[i], "--upload-only") == 0) upload_only = true;
         else if (strcmp(argv[i], "--upload-bench") == 0) upload_only = upload_bench = true;
-        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only | --overlap-only | --upload-only | --upload-bench | --handoff-trace]");
+        else GGML_ABORT("usage: test-moe-stream [--backend NAME] [--lookup-only | --overlap-only | --upload-only | --upload-bench | --handoff-trace | --compact-ab]");
     }
     GGML_ASSERT(!handoff_trace || (filter && !lookup_only && !overlap_only && !upload_only));
     ggml_backend_load_all();
@@ -695,7 +788,7 @@ int main(int argc, char ** argv) {
         auto init = reg ? (ggml_moe_pipeline_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_hip_moe_pipeline_init") : nullptr;
         if (handoff_trace) {
             GGML_ASSERT(hip && init && "--handoff-trace requires an RDNA3 HIP backend");
-            handoff_fixture().run(backend.get(), init);
+            handoff_fixture().run(backend.get(), init, compact_ab);
             return 0;
         }
         if (upload_only) {

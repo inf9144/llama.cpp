@@ -15,9 +15,9 @@ import subprocess
 import tarfile
 
 from profile import union_ns
+from rocm_build import ROOT, SDK, build_targets, rocm_env
 
 
-ROOT = Path(__file__).resolve().parents[2]
 REPEATS = 64
 MISS_COUNTS = (1, 3, 8)
 TIMEOUT = 120
@@ -175,7 +175,37 @@ def summarize(raw, log):
                                    for row in apis))
 
 
-def run_profile(command, log, env):
+def summarize_compact_ab(log):
+    with log.open() as source:
+        samples = [json.loads(line.removeprefix("upload_ab ")) for line in source if line.startswith("upload_ab ")]
+    if len(samples) != 2*REPEATS*len(MISS_COUNTS):
+        raise ValueError(f"Unvollständiger Transfervergleich ({len(samples)} Runden)")
+    phases = {}
+    for misses in MISS_COUNTS:
+        phase = {}
+        for mode in ("separate", "compact"):
+            rows = [s for s in samples if s["misses"] == misses and s["mode"] == mode]
+            values = sorted(r["graph_us"] for r in rows)
+            expected_copies = 3*misses + 1 if mode == "separate" else 1
+            if len(rows) != REPEATS or values[0] <= 0 or any(r["copies"] != expected_copies for r in rows):
+                raise ValueError(f"Ungültige Samples für {misses} Misses / {mode}")
+            byte_sizes = {(r["bytes"], r["h2d_bytes"]) for r in rows}
+            if len(byte_sizes) != 1:
+                raise ValueError(f"Wechselnde Nutzlast für {misses} Misses / {mode}")
+            (payload, transferred), = byte_sizes
+            if payload <= 0 or transferred < payload or (mode == "separate" and transferred != payload):
+                raise ValueError(f"Ungültige H2D-Nutzlast für {misses} Misses / {mode}")
+            phase[mode] = dict(rounds=len(rows), copies=expected_copies, payload_bytes=payload, h2d_bytes=transferred,
+                               median_us=statistics.median(values), p95_us=values[math.ceil(0.95*len(values)) - 1])
+        a, b = phase["separate"], phase["compact"]
+        if a["payload_bytes"] != b["payload_bytes"]:
+            raise ValueError(f"Unterschiedliche Nutzlast für {misses} Misses")
+        phase["median_delta_percent"] = 100*(b["median_us"]/a["median_us"] - 1)
+        phases[misses] = phase
+    return dict(phases=phases, samples=samples)
+
+
+def run_capture(command, log, env):
     with log.open("w") as output:
         with subprocess.Popen(command, cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT,
                               start_new_session=True) as process:
@@ -191,75 +221,58 @@ def run_profile(command, log, env):
                 process.wait()
                 raise
     if rc != 0:
-        raise RuntimeError(f"rocprofv3/Test endete mit Status {rc}; Details in {log}")
+        raise RuntimeError(f"Test endete mit Status {rc}; Details in {log}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rocm", type=Path, default=Path.home() / "opt/rocm-10.1")
+    parser.add_argument("--rocm", type=Path, default=SDK)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-rocm-moe-stream-measure")
     parser.add_argument("--jobs", type=int, default=28)
+    parser.add_argument("--compact-ab", action="store_true", help="Sammeltransfer gegen einzelne Kopien ohne Profiler messen")
     args = parser.parse_args()
-    if args.jobs < 1:
-        parser.error("--jobs muss positiv sein")
-    rocm = args.rocm.expanduser().resolve()
     build = args.build_dir.expanduser().resolve()
-    compiler = rocm / "bin/amdclang++"
-    profiler = rocm / "bin/rocprofv3"
-    for path in (compiler, profiler):
-        if not os.access(path, os.X_OK):
-            parser.error(f"Fehlendes ausführbares Programm {path}")
-    if not (rocm / "include/hip").is_dir():
-        parser.error(f"HIP-Header fehlen unter {rocm}/include/hip")
-    cache = build / "CMakeCache.txt"
-    if cache.is_file():
-        for line in cache.read_text().splitlines():
-            if line.startswith("CMAKE_HIP_COMPILER:"):
-                existing = Path(line.split("=", 1)[1])
-                if existing.resolve() != compiler.resolve():
-                    parser.error(f"{build} verwendet {existing}. Bitte ein freies --build-dir wählen.")
-
-    env = dict(os.environ, ROCM_PATH=str(rocm), HIP_PATH=str(rocm),
-               PATH=os.pathsep.join([str(rocm / "bin"), os.environ.get("PATH", "")]),
-               LD_LIBRARY_PATH=os.pathsep.join([str(rocm / "lib"), str(rocm / "lib64")] +
-                                               os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)).rstrip(os.pathsep),
-               GGML_ROCM_MALLOC_STAGE_POOL="1", GGML_ROCM_MALLOC_STAGE_POOL_MIB="512",
-               GGML_ROCM_MALLOC_STAGE_POOL_TENSOR="")
-    configure = [
-        "cmake", "-S", str(ROOT), "-B", str(build),
-        f"-DCMAKE_HIP_COMPILER={compiler}", f"-DCMAKE_PREFIX_PATH={rocm}",
-        "-C", str(ROOT / "scripts/moe-measure/rocm-sdk-options.cmake"),
-        "-DCMAKE_BUILD_TYPE=Release", "-DGGML_HIP=ON", "-DGGML_HIP_GRAPHS=ON",
-        "-DGPU_TARGETS=gfx1100;gfx1101", "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1101",
-        "-DLLAMA_MOE_MEASURE=ON", "-DLLAMA_BUILD_TESTS=ON",
-    ]
-    if not cache.is_file():
-        configure.extend(["-G", "Ninja"])
-    print(f"Baue test-moe-stream mit {rocm} und -j{args.jobs}", flush=True)
-    subprocess.run(configure, cwd=ROOT, env=env, check=True)
-    subprocess.run(["cmake", "--build", str(build), "--target", "test-moe-stream", f"-j{args.jobs}"],
-                   cwd=ROOT, env=env, check=True)
+    try:
+        env = rocm_env(args.rocm)
+        profiler = Path(env["ROCM_PATH"]) / "bin/rocprofv3"
+        if not args.compact_ab and not os.access(profiler, os.X_OK):
+            raise ValueError(f"Fehlendes ausführbares Programm {profiler}")
+        env.update(GGML_ROCM_MALLOC_STAGE_POOL="1", GGML_ROCM_MALLOC_STAGE_POOL_MIB="512",
+                   GGML_ROCM_MALLOC_STAGE_POOL_TENSOR="")
+        build_targets(ROOT, build, env, args.jobs, True, ("test-moe-stream",), extra=("-DLLAMA_BUILD_TESTS=ON",))
+        env["LD_LIBRARY_PATH"] = str(build / "bin") + os.pathsep + env["LD_LIBRARY_PATH"]
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"{error}\n")
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output = ROOT / "results" / f"moe-handoff-trace-{stamp}-{os.getpid()}"
+    name = "moe-compact-ab" if args.compact_ab else "moe-handoff-trace"
+    output = ROOT / "results" / f"{name}-{stamp}-{os.getpid()}"
     output.mkdir(parents=True)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    report = dict(commit=commit, sdk=str(rocm), verify_width=4, devices={}, errors={})
+    report = dict(commit=commit, sdk=env["ROCM_PATH"], verify_width=4, compact_ab=args.compact_ab, devices={}, errors={},
+                  runtime_env={key: env.get(key) for key in ("HSA_ENABLE_SDMA", "HSA_ENABLE_PEER_SDMA", "GGML_CUDA_DISABLE_GRAPHS")})
     for backend in ("ROCm0", "ROCm1"):
         raw = output / backend
         raw.mkdir()
         log = raw / "fixture.log"
-        command = [
-            str(profiler), "--hip-runtime-trace", "--kernel-trace", "--memory-copy-trace",
-            "--output-format", "csv", "--output-directory", str(raw), "--",
-            str(build / "bin/test-moe-stream"), "--backend", backend, "--handoff-trace",
-        ]
-        print(f"{backend} misst je {REPEATS} Runden mit 1, 3 und 8 Cache-Misses", flush=True)
+        command = [str(build / "bin/test-moe-stream"), "--backend", backend,
+                   "--compact-ab" if args.compact_ab else "--handoff-trace"]
+        if not args.compact_ab:
+            command = [str(profiler), "--hip-runtime-trace", "--kernel-trace", "--memory-copy-trace",
+                       "--output-format", "csv", "--output-directory", str(raw), "--", *command]
+        print(f"{backend} misst je {REPEATS} Runden mit 1, 3 und 8 Cache-Misses"
+              + (" pro Variante, ohne Profiler" if args.compact_ab else ""), flush=True)
         try:
-            run_profile(command, log, env)
-            result = summarize(raw, log)
+            run_capture(command, log, env)
+            result = summarize_compact_ab(log) if args.compact_ab else summarize(raw, log)
             report["devices"][backend] = result
             for misses, phase in result["phases"].items():
+                if args.compact_ab:
+                    a, b = phase["separate"], phase["compact"]
+                    print(f"  {misses} Misses, Verify-Graph p50/p95 in µs   "
+                          f"{a['median_us']:.1f}/{a['p95_us']:.1f} -> {b['median_us']:.1f}/{b['p95_us']:.1f}   "
+                          f"({phase['median_delta_percent']:+.1f}% p50)")
+                    continue
                 med = {key: value["median"] for key, value in phase["us"].items()}
                 print(f"  {misses} Misses, Median in µs   Planung {med['plan_us']:.1f}   "
                       f"Staging {med['staging_us']:.1f}   HIP-Copy-API {med['hip_copy_api_us']:.1f}   "
