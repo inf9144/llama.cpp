@@ -79,6 +79,17 @@ def json_write(path: Path, obj: object) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def prepare_request(path: Path, production_controls: bool) -> bytes:
+    payload = path.read_bytes()
+    request = json.loads(payload)
+    if request.get("cache_prompt") is not False or request.get("stream") is not False or request.get("seed") is None:
+        raise ValueError("Request muss cache_prompt=false, stream=false, festen seed enthalten")
+    if production_controls:
+        request.update(MANUFACTURER_SAMPLING)
+        return (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+    return payload
+
+
 def sha(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as inp:
@@ -208,8 +219,8 @@ def split_host_trace(trace: Path, folder: Path, intervals: dict[str, tuple[int, 
     finally:
         for out in files.values():
             out.close()
-    if not counts.get("cold") or not counts.get("warm"):
-        raise RuntimeError(f"Keine Events für Cold oder Warm: {dict(counts)}; nicht blind zusammenfassen")
+    if any(not counts.get(phase) for phase in intervals):
+        raise RuntimeError(f"Keine Events für mindestens einen Request: {dict(counts)}")
     return {"records": dict(counts), "kinds": {k: dict(v) for k, v in kinds.items()},
             "limitation": "MOE_MEASURE Host-Events per monotonic request bounds; pending asynchronous events at boundaries may be unassigned."}
 
@@ -281,8 +292,7 @@ def require_candidate_acceptance(result: dict) -> None:
 
 
 def require_candidate_stream(split: dict) -> None:
-    for phase in ("cold", "warm"):
-        kinds = split["kinds"].get(phase, {})
+    for phase, kinds in split["kinds"].items():
         if not kinds.get("hybrid_plan") or kinds.get("work_copy", 0):
             raise RuntimeError(f"Candidate/{phase}: Streaming nicht vollständig aktiv: {kinds}. "
                                "Experten-Arbeitskopien sind weiterhin im Pfad; diesen Lauf nicht als Streaming-Benchmark werten.")
@@ -302,7 +312,8 @@ def require_runtime_build(props: dict, expected: str | None) -> str:
 
 def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler: bool,
               request: bytes, env: dict, cli: argparse.Namespace, candidate: bool = False,
-              fish_no_config: bool = False, expected_build: str | None = None) -> dict:
+              fish_no_config: bool = False, expected_build: str | None = None,
+              request_phases: tuple[str, ...] = ("cold", "warm")) -> dict:
     out.mkdir(parents=True, exist_ok=False)
     raw = out / "gpu-raw"
     executable = ["fish", *(["--no-config"] if fish_no_config else []), str(launcher_script)]
@@ -327,7 +338,7 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
                 json_write(out / "props.json", props)
             runtime_build = require_runtime_build(props, expected_build)
             say(f"{name}: server bereit" + (f"; Candidate-Prefill: {placement}" if candidate else ""))
-            for phase in ("cold", "warm"):
+            for phase in request_phases:
                 result = send_request(request, out / phase, cli.request_timeout)
                 results[phase] = result
                 if candidate:
@@ -351,7 +362,7 @@ def run_phase(root: Path, out: Path, name: str, launcher_script: Path, profiler:
             intervals = {key: (value["monotonic_start_us"], value["monotonic_end_us"]) for key, value in results.items()}
             split = split_host_trace(trace, out, intervals)
             analysis = {}
-            for phase in ("cold", "warm"):
+            for phase in request_phases:
                 target = out / f"host-{phase}.json"
                 invoke(root, ["scripts/moe-measure/analyze.py", str(out / f"trace-{phase}.log"),
                               "--phase", "mixed-dflash", "--output", str(target)])
@@ -507,13 +518,10 @@ def main() -> int:
     request_path = (a.request if a.request.is_absolute() else root / a.request).resolve()
     if not request_path.is_file():
         p.error(f"Testrequest fehlt: {request_path}")
-    payload = request_path.read_bytes()
-    json_request = json.loads(payload)
-    if json_request.get("cache_prompt") is not False or json_request.get("stream") is not False or json_request.get("seed") is None:
-        p.error("Request muss cache_prompt=false, stream=false, festen seed enthalten")
-    if a.production_controls:
-        json_request.update(MANUFACTURER_SAMPLING)
-        payload = (json.dumps(json_request, ensure_ascii=False) + '\n').encode('utf-8')
+    try:
+        payload = prepare_request(request_path, a.production_controls)
+    except (OSError, ValueError) as exc:
+        p.error(str(exc))
     if not shutil.which("fish"):
         p.error("Fish nicht gefunden")
     if PORT <= 0 or PORT > 65535:

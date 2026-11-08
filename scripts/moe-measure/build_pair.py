@@ -10,9 +10,9 @@ import subprocess
 import tempfile
 
 
-def build_id(binary: Path) -> str:
+def build_id(binary: Path, env: dict | None = None) -> str:
     binary = binary.resolve()
-    env = dict(os.environ)
+    env = dict(os.environ if env is None else env)
     env['LD_LIBRARY_PATH'] = str(binary.parent) + os.pathsep + env.get('LD_LIBRARY_PATH', '')
     result = subprocess.run([str(binary), '--version'], env=env, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, check=True, timeout=30)
