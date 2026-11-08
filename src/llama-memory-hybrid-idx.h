@@ -86,7 +86,7 @@ public:
 
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
-    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    // sequence's first one, so a ubatch only ever appends to it. A suffix removal can keep its complete prefix pools.
     struct kpool_layout;
 
     const kpool_layout & kpool_layout_update();
@@ -120,6 +120,8 @@ private:
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
+
+    bool kpool_layout_trim_tail(llama_seq_id seq_id, llama_pos p0);
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);

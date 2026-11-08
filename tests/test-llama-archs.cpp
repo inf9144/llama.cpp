@@ -2431,6 +2431,7 @@ static int test_qsa_sparse(size_t seed, float stdev) {
         cp.n_batch = 32;
         cp.n_ubatch = 8;
         cp.n_seq_max = 2;
+        cp.n_rs_seq = 3;
         cp.kv_unified = true;
         cp.n_threads = cp.n_threads_batch = 2;
         cp.type_k = cp.type_v = type;
@@ -2529,8 +2530,21 @@ static int test_qsa_sparse(size_t seed, float stdev) {
             GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1));
         }
         step(3, 15, 0);
+
+        // Use the bounded erase as the full layout rebuild reference for the open-ended trim.
+        int pos[] = {18, 3};
+        for (int keep : {4, 1, 2, 3, 1}) {
+            step(4, pos[0], pos[1]);
+            for (int seq = 0; seq < 2; ++seq) {
+                const int first = pos[seq] + keep;
+                GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(dense.get()), seq, first, pos[seq] + 4));
+                GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(sparse.get()), seq, first, -1));
+                pos[seq] = first;
+            }
+        }
+        step(4, pos[0], pos[1]);
         GGML_ASSERT(ref.checks > 0);
-        printf("Qwen4Exp QSA sparse CPU oracle: KV=%s, %d attention checks, exact logits after sequence reset and checkpoint rollback\n",
+        printf("Qwen4Exp QSA sparse CPU oracle: KV=%s, %d attention checks, exact logits after sequence reset, checkpoint restore and tail rollback\n",
             ggml_type_name(type), ref.checks);
     }
     return 0;

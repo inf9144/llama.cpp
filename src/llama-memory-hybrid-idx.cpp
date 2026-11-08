@@ -189,9 +189,14 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     if (mem_idx) {
-        const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
-        mem_idx->seq_rm(seq_id, p0, p1);
-        mem_idx_stale_set(seq_id, stale);
+        const bool tail = seq_id >= 0 && p0 > 0 && p1 < 0;
+        if (!tail || p0 <= mem_idx->seq_pos_max(seq_id)) {
+            const llama_pos stale = mem_idx_stale_pos(seq_id, p0);
+            mem_idx->seq_rm(seq_id, p0, p1);
+            if (!tail || !kpool_layout_trim_tail(seq_id, p0)) {
+                mem_idx_stale_set(seq_id, stale);
+            }
+        }
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
@@ -382,6 +387,29 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
     GGML_ASSERT(kpool_lay != nullptr);
 
     return *kpool_lay;
+}
+
+bool llama_memory_hybrid_idx::kpool_layout_trim_tail(llama_seq_id seq_id, llama_pos p0) {
+    if (!kpool_lay || !get_kpool_by_order() || mem_idx_stale[seq_id] != POS_CLEAN) {
+        return false;
+    }
+
+    auto & sq = kpool_lay->seqs[seq_id];
+    const auto & positions = mem_idx->get_cells(seq_id).seq_pos_get(seq_id);
+    const auto end = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p0, 0u));
+    const size_t kept = end - sq.cells.begin();
+    if (kept == 0 || kept != positions.size() || sq.cells.front() != *positions.begin() || *(end - 1) != *positions.rbegin()) {
+        return false;
+    }
+
+    // Complete prefix pools keep their reps. The next ubatch will mark any pool it completes again.
+    const uint32_t kpool = get_kpool();
+    const size_t pools = kept/kpool;
+    kpool_lay->n_pool_real -= (uint32_t) (sq.pools.size() - pools);
+    sq.cells.resize(kept);
+    sq.pools.resize(pools);
+    sq.j_next = pools*kpool;
+    return true;
 }
 
 // Pools are fixed by the positions relative to the sequence's first one, so the layout survives a plain
