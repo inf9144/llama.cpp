@@ -5598,6 +5598,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);
 
+		SRV_ERR("SSE streaming exception: %s\n", e.what());
+
                 // terminate on exception
                 return false;
             }
