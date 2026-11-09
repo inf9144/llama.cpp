@@ -117,7 +117,7 @@ private:
 
 class ssd_io_read_buffer : public llama_io_read_i {
 public:
-    ssd_io_read_buffer(const std::vector<uint8_t> & data) : data(data) {}
+    ssd_io_read_buffer(const common_state_data & data) : data(data) {}
 
     void read(void * dst, size_t size) override {
         memcpy(dst, take(size), size);
@@ -140,7 +140,7 @@ private:
         return result;
     }
 
-    const std::vector<uint8_t> & data;
+    const common_state_data & data;
     size_t read_size = 0;
 };
 
@@ -314,8 +314,8 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
         bool fits_limit = fits(header_size) && fits(packed.size()) && fits(main_size) && fits(drft_size);
         for (const auto & ckpt : prompt.checkpoints) {
             fits_limit = fits_limit
-                      && fits(sizeof(ckpt.n_tokens) + sizeof(ckpt.id_task) + sizeof(ckpt.pos_min) + sizeof(ckpt.pos_max) + 3*sizeof(uint64_t))
-                      && fits(ckpt.data_tgt.size()) && fits(ckpt.data_dft.size()) && fits(ckpt.data_spec.size());
+                      && fits(sizeof(ckpt->n_tokens) + sizeof(ckpt->id_task) + sizeof(ckpt->pos_min) + sizeof(ckpt->pos_max) + 3*sizeof(uint64_t))
+                      && fits(ckpt->data_tgt.size()) && fits(ckpt->data_dft.size()) && fits(ckpt->data_spec.size());
         }
         if (!fits_limit) {
             SRV_WRN("ssd cache: snapshot exceeds size limit %.3f MiB, skipping\n", limit_size / (1024.0 * 1024.0));
@@ -359,16 +359,16 @@ bool server_prompt_cache_ssd::save_file(const std::string & path, const server_p
         ok = write(&n_ckpt, sizeof(n_ckpt));
         for (const auto & ckpt : prompt.checkpoints) {
             uint64_t sz;
-            ok = write(&ckpt.n_tokens, sizeof(ckpt.n_tokens))
-               && write(&ckpt.id_task,  sizeof(ckpt.id_task))
-               && write(&ckpt.pos_min,  sizeof(ckpt.pos_min))
-               && write(&ckpt.pos_max,  sizeof(ckpt.pos_max));
-            sz = ckpt.data_tgt.size();
-            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt.data_tgt.data(), sz));
-            sz = ckpt.data_dft.size();
-            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt.data_dft.data(), sz));
-            sz = ckpt.data_spec.size();
-            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt.data_spec.data(), sz));
+            ok = write(&ckpt->n_tokens, sizeof(ckpt->n_tokens))
+               && write(&ckpt->id_task,  sizeof(ckpt->id_task))
+               && write(&ckpt->pos_min,  sizeof(ckpt->pos_min))
+               && write(&ckpt->pos_max,  sizeof(ckpt->pos_max));
+            sz = ckpt->data_tgt.size();
+            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt->data_tgt.data(), sz));
+            sz = ckpt->data_dft.size();
+            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt->data_dft.data(), sz));
+            sz = ckpt->data_spec.size();
+            ok = ok && write(&sz, sizeof(sz)) && (sz == 0 || write(ckpt->data_spec.data(), sz));
             if (!ok) {
                 break;
             }
@@ -601,7 +601,7 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
         if (!fits(sz)) return false;
         ckpt.data_spec.resize(sz);
         if (sz && !read(ckpt.data_spec.data(), sz)) return false;
-        prompt.checkpoints.push_back(std::move(ckpt));
+        prompt.checkpoints.push_back(std::make_shared<const common_prompt_checkpoint>(std::move(ckpt)));
     }
 
     uint64_t main_size;
@@ -669,7 +669,7 @@ bool server_prompt_cache_ssd::read_state(const entry & e, server_prompt & prompt
     }
 
     if (ctx_tgt) {
-        auto restore = [&](llama_context * ctx, std::streampos pos, uint64_t size, const std::vector<uint8_t> & buffer) {
+        auto restore = [&](llama_context * ctx, std::streampos pos, uint64_t size, const common_state_data & buffer) {
             auto apply = [&](llama_io_read_i & io) {
                 const size_t n = llama_state_seq_read(ctx, io, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
                 if (n != size) {

@@ -27,14 +27,16 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // sizes: optional per-device budget, llama_max_devices()
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const size_t * sizes = nullptr);
+    // cpu_share is the share of the misses computed on the CPU instead of uploaded
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, const size_t * sizes = nullptr);
     ~llama_moe_cache();
 
     // Execution device; small batches stay with the resident cache owner.
     ggml_backend_t backend(int32_t il, int64_t n_tokens = 0) const;
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+    // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
     ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il) const;
     void begin_compute(ggml_cgraph * graph);
     void synchronize();
@@ -46,6 +48,9 @@ public:
 
     // Select the all-resident or streaming execution plan with logical IDs.
     ggml_tensor * mul_mat(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids, ggml_tensor * slots) const;
+    // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
+    // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
+    ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const;
 
     // ggml_backend_sched copy callback, returns false if src is not a slot map
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);

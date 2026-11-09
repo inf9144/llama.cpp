@@ -66,15 +66,15 @@ static server_prompt_cache_state make_state(const std::vector<llama_token> & tok
     return state;
 }
 
-static common_prompt_checkpoint make_checkpoint() {
-    common_prompt_checkpoint ckpt;
-    ckpt.n_tokens = 3;
-    ckpt.id_task = 7;
-    ckpt.pos_min = 0;
-    ckpt.pos_max = 2;
-    ckpt.data_tgt = {1, 2, 3};
-    ckpt.data_dft = {4, 5};
-    ckpt.data_spec = {6, 7, 8, 9};
+static std::shared_ptr<common_prompt_checkpoint> make_checkpoint() {
+    auto ckpt = std::make_shared<common_prompt_checkpoint>();
+    ckpt->n_tokens = 3;
+    ckpt->id_task = 7;
+    ckpt->pos_min = 0;
+    ckpt->pos_max = 2;
+    ckpt->data_tgt = {1, 2, 3};
+    ckpt->data_dft = {4, 5};
+    ckpt->data_spec = {6, 7, 8, 9};
     return ckpt;
 }
 
@@ -109,10 +109,10 @@ static void check_stored_state(server_prompt_cache_ssd & cache, const server_pro
         if (actual == prompt.checkpoints.end()) {
             break;
         }
-        CHECK(actual->n_tokens == ckpt.n_tokens && actual->id_task == ckpt.id_task &&
-              actual->pos_min == ckpt.pos_min && actual->pos_max == ckpt.pos_max, "checkpoint metadata intact");
-        CHECK(actual->data_tgt == ckpt.data_tgt && actual->data_dft == ckpt.data_dft &&
-              actual->data_spec == ckpt.data_spec, "checkpoint bytes intact");
+        CHECK((*actual)->n_tokens == ckpt->n_tokens && (*actual)->id_task == ckpt->id_task &&
+              (*actual)->pos_min == ckpt->pos_min && (*actual)->pos_max == ckpt->pos_max, "checkpoint metadata intact");
+        CHECK((*actual)->data_tgt == ckpt->data_tgt && (*actual)->data_dft == ckpt->data_dft &&
+              (*actual)->data_spec == ckpt->data_spec, "checkpoint bytes intact");
         ++actual;
     }
 }
@@ -187,7 +187,7 @@ static void test_save_limit_and_replacement(const std::string & dir) {
     CHECK(cache.n_evictions() == 0, "no eviction at capacity");
     const auto original_bytes = read_file(path);
 
-    auto oversized = make_state({1, 2, 3, 4}, limit - 50 - make_checkpoint().size(), 50);
+    auto oversized = make_state({1, 2, 3, 4}, limit - 50 - make_checkpoint()->size(), 50);
     oversized.prompt.checkpoints.push_back(make_checkpoint());
     CHECK(oversized.size() == limit, "payload fits but serialized metadata exceeds limit");
     const std::string tmp_path = path + ".tmp";
@@ -574,7 +574,9 @@ static void test_unchanged_ssd_snapshot(const std::string & dir) {
 
     use_test_state_reader(cache);
     state.prompt.invalidate_ssd_snapshot();
-    state.prompt.checkpoints.front().data_spec.push_back(42);
+    auto changed = std::make_shared<common_prompt_checkpoint>(*state.prompt.checkpoints.front());
+    changed->data_spec.push_back(42);
+    state.prompt.checkpoints.front() = std::move(changed);
     CHECK(!ssd.is_saved(state.prompt), "modified prompt invalidates saved identity despite equal tokens");
     CHECK(cache.save_state(state.prompt, nullptr, nullptr, TEST_SLOT_ID), "modified same-token state is saved again");
     CHECK(std::filesystem::last_write_time(path) != fixed_time, "modified same-token state rewrites snapshot");
@@ -651,8 +653,8 @@ static llama_model_ptr make_test_model(const std::string & path) {
     return llama_model_ptr(llama_model_load_from_file(path.c_str(), params));
 }
 
-static std::vector<uint8_t> capture_state(llama_context * ctx, llama_seq_id seq_id = 0) {
-    std::vector<uint8_t> state(llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE));
+static common_state_data capture_state(llama_context * ctx, llama_seq_id seq_id = 0) {
+    common_state_data state(llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE));
     CHECK(!state.empty(), "real state has a size");
     CHECK(llama_state_seq_get_data_ext(ctx, state.data(), state.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == state.size(), "capture real sequence");
     return state;
@@ -764,7 +766,7 @@ static void test_io_modes(const std::string & dir) {
                         CHECK(capture_state(target_draft.get()) == state.data.drft, "cross-mode draft state is byte-identical");
                     }
                     CHECK(restored.tokens.get_common_prefix(state.prompt.tokens) == tokens.size(), "cross-mode tokens intact");
-                    CHECK(restored.checkpoints.size() == 1 && restored.checkpoints.front().data_spec == state.prompt.checkpoints.front().data_spec, "cross-mode checkpoint state intact");
+                    CHECK(restored.checkpoints.size() == 1 && restored.checkpoints.front()->data_spec == state.prompt.checkpoints.front()->data_spec, "cross-mode checkpoint state intact");
                     decode_test_tokens(target.get(), {9}, 8);
                     logits = llama_get_logits_ith(target.get(), -1);
                     for (size_t i = 0; i < reference.size(); ++i) {

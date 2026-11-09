@@ -914,8 +914,8 @@ static void mmb_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * w, c
         const int experts = streaming ? streaming->n_experts : w->ne[2], used = ids->ne[0], rows = used * tokens;
         CUDA_CHECK(cudaMemsetAsync(output, 0, ggml_nbytes(dst), stream));
         ggml_cuda_pool_alloc<int32_t> source(ctx.pool(), rows), target(ctx.pool(), rows), bounds(ctx.pool(), experts + 1);
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, source.get(), target.get(), bounds.get(),
-            experts, tokens, used, x->ne[1], ids->nb[1] / sizeof(int32_t), x->nb[2] / x->nb[1], false, stream);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, source.get(), target.get(), nullptr,
+            experts, tokens, used, x->ne[1], 1, ids->nb[1] / sizeof(int32_t), x->nb[2] / x->nb[1], false, stream, bounds.get());
         constexpr int big_n = 128, small_n = 32, threshold = 32;
         const int nbig_max = rows / big_n + experts + 1, nsmall_max = experts + 1;
         ggml_cuda_pool_alloc<uint32_t> big(ctx.pool(), nbig_max), small(ctx.pool(), nsmall_max);

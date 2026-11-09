@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 llama_add_compile_flags()
 
 # Optional args:
@@ -226,10 +228,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
-    #       this branch and run them on all platforms
-    llama_build(test-llama-archs.cpp)
 
+endif()
+
+llama_build(test-llama-archs.cpp)
+
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-llama-archs PRIVATE LLAMA_TEST_FORK_INTERNALS)
     llama_test(test-llama-archs NAME test-moe-cache-policy ARGS --test-moe-cache-policy -s 42)
     llama_test(test-llama-archs NAME test-moe-cache-prefill ARGS --test-moe-cache-prefill -s 42)
     llama_test(test-llama-archs NAME test-graph-recovery ARGS --test-graph-recovery -s 42)
@@ -241,58 +246,76 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-llama-archs NAME test-dflash-tail ARGS --test-dflash-tail -s 42)
     llama_test(test-llama-archs NAME test-dflash-tail-disabled ARGS --test-dflash-tail -s 42)
     set_tests_properties(test-dflash-tail-disabled PROPERTIES ENVIRONMENT "LLAMA_DFLASH_INGEST_TAIL=0")
-
-    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
-    file(MAKE_DIRECTORY "${MODEL_DIR}")
-
-    llama_test(
-        test-llama-archs
-        NAME test-generate-models
-        LABEL "main behavior backend"
-        ARGS -o "${MODEL_DIR}"
-    )
-    set_tests_properties(test-generate-models PROPERTIES
-        FIXTURES_SETUP generate-models
-    )
-
-    # Target model for test-speculative-rejection-sampling
-    set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
-    file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
-    llama_test(
-        test-llama-archs
-        NAME test-generate-speculative-target
-        LABEL main
-        ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
-    )
-    set_tests_properties(
-        test-generate-speculative-target
-        PROPERTIES FIXTURES_SETUP speculative-model
-    )
-
-    # To avoid recreating the model use the fixture exclude any option:
-    # -FA "^speculative-model$"
-    llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
-        -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
-    set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
-
-    # Test context state handling across all architectures, using the generated dummy models
-    llama_test(
-        test-llama-context
-        LABEL "main behavior backend"
-        ARGS --models "${MODEL_DIR}"
-    )
-    # abort on graph reallocations that the initial reserve should have covered
-    set_tests_properties(test-llama-context PROPERTIES
-        FIXTURES_REQUIRED generate-models
-        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
-    )
-
-    llama_build(test-fusion.cpp)
 endif()
+
+if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    llama_build(test-fp8.cpp)
+    set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
+    file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-fp8-models LABEL "main behavior backend"
+        ARGS -a llama -s 1 -o "${FP8_MODEL_DIR}")
+    set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
+    llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
+        ARGS --models "${FP8_MODEL_DIR}")
+    set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+endif()
+
+set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+file(MAKE_DIRECTORY "${MODEL_DIR}")
+
+llama_test(
+    test-llama-archs
+    NAME test-generate-models
+    LABEL "main behavior backend"
+    ARGS -o "${MODEL_DIR}"
+)
+set_tests_properties(test-generate-models PROPERTIES
+    FIXTURES_SETUP generate-models
+)
+
+# Target model for test-speculative-rejection-sampling
+set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
+file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
+llama_test(
+    test-llama-archs
+    NAME test-generate-speculative-target
+    LABEL main
+    ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
+)
+set_tests_properties(
+    test-generate-speculative-target
+    PROPERTIES FIXTURES_SETUP speculative-model
+)
+
+# To avoid recreating the model use the fixture exclude any option:
+# -FA "^speculative-model$"
+llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
+
+# Test context state handling across all architectures, using the generated dummy models
+llama_test(
+    test-llama-context
+    LABEL "main behavior backend"
+    ARGS --models "${MODEL_DIR}"
+)
+# abort on graph reallocations that the initial reserve should have covered
+set_tests_properties(test-llama-context PROPERTIES
+    FIXTURES_REQUIRED generate-models
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
+llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
 llama_build_and_test(test-jinja.cpp  LABEL behavior)
 llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
+llama_test_cmd(python3
+    NAME test-conversion-fp8
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
+)
 llama_build_and_test(test-json-schema.cpp  LABEL behavior)
 llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp  LABEL behavior)
@@ -361,7 +384,16 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
 
-llama_build(test-backend-ops.cpp LINK ggml)
+llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+
+llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+
+if (BUILD_SHARED_LIBS)
+    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
+    target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
+else()
+    llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
+endif()
 llama_build_and_test(test-backend-sched.cpp LINK ggml)
 llama_build_and_test(test-moe-stream.cpp LINK ggml)
 if (LLAMA_MOE_MEASURE)
@@ -451,6 +483,7 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
+    llama_build_and_test(test-host-buffer-release.cpp LINK ggml)
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)

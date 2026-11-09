@@ -1759,6 +1759,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -2030,7 +2040,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size += ckpt->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -2071,8 +2081,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_data state_data_tgt;
+    common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
@@ -2183,7 +2193,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // pick the candidate that reuses the most tokens
     if (lcp_ssd > lcp_ram) {
         SRV_INF(" - restoring prompt from SSD cache, lcp = %d\n", lcp_ssd);
-        return ssd->load(*it_ssd_best, prompt, ctx_tgt, ctx_dft, id_slot);
+        if (!ssd->load(*it_ssd_best, prompt, ctx_tgt, ctx_dft, id_slot)) {
+            return false;
+        }
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+        if (lcp_ssd == (int) prompt.tokens.size()) {
+            SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+        }
+        return true;
     }
 
     SRV_TRC(" - restoring prompt from RAM cache, lcp = %d\n", lcp_ram);
@@ -2217,6 +2234,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
+    if (lcp_ram == (int) best.prompt.tokens.size()) {
+        SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+    }
     prompt = std::move(best.prompt);
     states.erase(it_ram_best);
 
