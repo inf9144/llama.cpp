@@ -22,6 +22,31 @@ def response(tokens, tops=None):
 
 
 class CompletionDiagnoseTests(unittest.TestCase):
+    def test_reports_server_abort_while_wrapper_is_still_exiting(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(diagnose.subprocess, 'Popen') as popen,
+            mock.patch.object(diagnose.runner, 'port_open', return_value=False),
+            mock.patch.object(diagnose.runner, 'wait_health'),
+            mock.patch.object(diagnose.runner, 'children_by_comm', return_value=[]),
+            mock.patch.object(diagnose.runner.os, 'kill') as kill,
+            mock.patch.object(diagnose, 'http'),
+        ):
+            root = Path(tmp)
+            process = popen.return_value
+            process.poll.return_value = None
+
+            def finish(*, timeout):
+                process.returncode = 134
+                return process.returncode
+
+            process.wait.side_effect = finish
+            with self.assertRaisesRegex(RuntimeError, 'status 134; inspect .*trace.log'):
+                with diagnose.server(root, root / 'run', root / 'launch.fish', False):
+                    raise ConnectionResetError
+            process.wait.assert_called_once_with(timeout=5)
+            kill.assert_not_called()
+
     def run_mocked_suite(self, root, fail=False, different_prompt=False, draft_max=3, unexpected_drafts=False, baseline_reference=None):
         for case in diagnose.CASES:
             binary = root / diagnose.runner.BINARIES[case][0]

@@ -23,7 +23,7 @@ def git(directory, *args):
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True).strip()
 
 
-def build_pair(directory, env, jobs, *, revisions=REVISIONS, extra=()):
+def build_pair(directory, env, jobs, *, revisions=REVISIONS, extra=(), reuse_baseline=False):
     source = directory / "source"
     build = directory / "build"
     snapshots = directory / "runtimes"
@@ -31,18 +31,29 @@ def build_pair(directory, env, jobs, *, revisions=REVISIONS, extra=()):
     if extra:
         manifest["extra"] = list(extra)
 
-    def check_snapshot(folder):
-        binaries = {variant: folder / variant / "llama-server" for variant in revisions}
+    def check_snapshot(folder, variants=revisions):
+        binaries = {variant: folder / variant / "llama-server" for variant in variants}
         ids = {variant: build_id(binary, env) for variant, binary in binaries.items()}
         for variant, identity in ids.items():
             if not revisions[variant].startswith(identity.split("-", 1)[1]):
                 raise ValueError(f"{variant} meldet {identity}, erwartet {revisions[variant][:9]}")
         return binaries, ids
 
+    previous = None
+    if reuse_baseline and snapshots.exists():
+        saved = json.loads((snapshots / "pair.json").read_text())
+        old_candidate = saved.get("revisions", {}).get("candidate")
+        if old_candidate and saved == dict(manifest, revisions=dict(revisions, candidate=old_candidate)) and saved != manifest:
+            previous = snapshots
+            snapshots = directory / f"runtimes-{revisions['candidate']}"
+
     if snapshots.exists():
         if json.loads((snapshots / "pair.json").read_text()) != manifest:
             raise ValueError(f"SDK, Revision oder Build-Optionen in {snapshots} weichen ab. Bitte ein freies --build-dir wählen.")
         return check_snapshot(snapshots)
+    if previous is not None:
+        check_snapshot(previous, ("baseline",))
+        runner.say(f"Verwende vorhandene Baseline aus {previous}")
 
     if not source.exists():
         subprocess.run(["git", "-C", str(ROOT), "worktree", "add", "--detach", str(source), revisions["baseline"]],
@@ -56,6 +67,9 @@ def build_pair(directory, env, jobs, *, revisions=REVISIONS, extra=()):
     with tempfile.TemporaryDirectory(dir=directory) as tmp:
         staging = Path(tmp) / "runtimes"
         for variant, rev in revisions.items():
+            if variant == "baseline" and previous is not None:
+                shutil.copytree(previous / variant, staging / variant, symlinks=True)
+                continue
             subprocess.run(["git", "-C", str(source), "checkout", "--detach", rev], check=True)
             build_targets(source, build, env, jobs, False, ("llama-server",), extra=(
                 "-DLLAMA_BUILD_TOOLS=ON", "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_TESTS=OFF",

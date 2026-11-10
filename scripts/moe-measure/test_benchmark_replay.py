@@ -62,6 +62,43 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unterschiedliche Antworten"):
             gdn.summarize(pairs)
 
+    def test_upstream_pair_reuses_matching_baseline_for_new_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp).resolve()
+            previous = folder / "runtimes"
+            env = {"ROCM_PATH": "/tmp/rocm-10.1"}
+            baseline = "a"*40
+            candidate = "c"*40
+            manifest = dict(sdk=env["ROCM_PATH"], revisions=dict(baseline=baseline, candidate="b"*40))
+            (previous / "baseline").mkdir(parents=True)
+            (previous / "baseline/llama-server").write_text("b1-aaaaaaaaa")
+            (previous / "pair.json").write_text(json.dumps(manifest))
+            (folder / "source").mkdir()
+            revisions = dict(baseline=baseline, candidate=candidate)
+
+            def git(_directory, *args):
+                return str(folder / "source") if "--show-toplevel" in args else ""
+
+            def build(_source, output, *_args, **_kwargs):
+                (output / "bin").mkdir(parents=True)
+                (output / "bin/llama-server").write_text("b3-ccccccccc")
+
+            with (
+                patch.object(gdn, "git", side_effect=git),
+                patch.object(gdn.subprocess, "run") as checkout,
+                patch.object(gdn, "build_id", side_effect=lambda binary, _env: binary.read_text()),
+                patch.object(gdn, "build_targets", side_effect=build) as targets,
+            ):
+                first = gdn.build_pair(folder, env, 28, revisions=revisions, reuse_baseline=True)
+                self.assertEqual(first[1], dict(baseline="b1-aaaaaaaaa", candidate="b3-ccccccccc"))
+                self.assertEqual(first, gdn.build_pair(folder, env, 28, revisions=revisions, reuse_baseline=True))
+                self.assertEqual(json.loads((previous / "pair.json").read_text()), manifest)
+                with self.assertRaisesRegex(ValueError, "SDK"):
+                    gdn.build_pair(folder, {"ROCM_PATH": "/opt/rocm"}, 28, revisions=revisions, reuse_baseline=True)
+                checkout.assert_called_once_with(
+                    ["git", "-C", str(folder / "source"), "checkout", "--detach", candidate], check=True)
+                targets.assert_called_once()
+
     @patch.object(handoff, "REPEATS", 2)
     def test_compact_ab_requires_same_payload(self):
         rows: list[dict] = [dict(mode=mode, misses=misses, graph_us=100 if mode == "separate" else 75, bytes=4096,

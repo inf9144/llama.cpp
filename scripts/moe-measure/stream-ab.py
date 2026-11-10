@@ -153,11 +153,19 @@ def wait_health(process: subprocess.Popen, seconds: int) -> None:
 
 def stop_server(process: subprocess.Popen, seconds: int) -> int:
     targets = children_by_comm(process.pid, "llama-server")
+    if not targets:
+        # The server may have exited while run.py is still writing the trace metadata.
+        try:
+            return process.wait(timeout=min(seconds, 5))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("Kein eigener llama-server gefunden, Benchmark-Wrapper läuft noch") from error
     if len(targets) != 1:
         raise RuntimeError(f"Genau einen eigenen llama-server erwartet: {targets}")
-    os.kill(targets[0], signal.SIGTERM)
-    process.wait(timeout=seconds)
-    return process.returncode
+    try:
+        os.kill(targets[0], signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    return process.wait(timeout=seconds)
 
 
 def send_request(request: bytes, folder: Path, seconds: int, *, min_cached_tokens: int = 0,

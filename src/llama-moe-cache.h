@@ -37,7 +37,7 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     // cpu_part: the graph computes the misses in the CPU map of the layer (see get_cpu_map)
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used, bool cpu_part) const;
-    ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il) const;
+    ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il, int32_t n_used) const;
     void begin_compute(ggml_cgraph * graph);
     void synchronize();
 

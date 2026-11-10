@@ -86,7 +86,7 @@ def main():
         env = rocm_env(args.rocm)
         directory = args.build_dir.resolve()
         with build_lock(directory):
-            binaries, builds = build_pair(directory, env, args.jobs, revisions=revisions)
+            binaries, builds = build_pair(directory, env, args.jobs, revisions=revisions, reuse_baseline=True)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")
 

@@ -975,13 +975,16 @@ struct llama_moe_cache::impl {
         return prefill ? l.slot_map_prefill : l.slot_map;
     }
 
-    ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il) const {
+    ggml_tensor * lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il, int32_t n_used) const {
         const auto & l = layers[il];
         if (map == l.slot_map_device) {
             const auto & p = devices[groups[l.ig].id].pipeline;
             return ggml_moe_cache_lookup(ctx, map, ids, p.lookup_job(p.context, il), groups[l.ig].gpu_updates);
         }
-        return ggml_get_rows(ctx, map, ids);
+        ggml_tensor * slots = ggml_get_rows(ctx, map, ids);
+        // The scheduler may copy the flat IDs to another backend without their reshape source.
+        slots->op_params[0] = n_used;
+        return slots;
     }
 
     void synchronize() {
@@ -1201,12 +1204,12 @@ struct llama_moe_cache::impl {
                 GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
             }
         }
-        GGML_ASSERT(ggml_is_contiguous(sel));
-        GGML_ASSERT(sel->op == GGML_OP_RESHAPE); // of the [n_expert_used, n_tokens] ids, see build_moe_cache_slots
+        GGML_ASSERT(sel->type == GGML_TYPE_I32 && ggml_is_vector(sel) && ggml_is_contiguous(sel));
+        const int32_t n_used = lookup->op_params[0];
+        const int64_t n_ids = ggml_nelements(sel);
+        GGML_ASSERT(n_used > 0 && n_ids % n_used == 0);
 
-        const int32_t n_used = (int32_t) sel->src[0]->ne[0];
-
-        ids.resize(ggml_nelements(sel));
+        ids.resize(n_ids);
 #ifdef LLAMA_MOE_MEASURE
         const int64_t routing_start = ggml_time_us();
 #endif
@@ -1232,7 +1235,7 @@ struct llama_moe_cache::impl {
                 l.cpu_acc = acc & 0xffff;
                 return (size_t) (acc >> 16);
             };
-            planned = g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit);
+            planned = g.lru.plan(il, ids.data(), ids.size(), n_ids/n_used, n_used, n_zero, n_cpu, fills, cpu, n_hit);
         } else {
             planned = g.policy.plan(il, ids.data(), ids.size(), fills, n_hit, clock.tokens, !prefill, clock.latency_tokens, local);
         }
@@ -1477,8 +1480,8 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
     return pimpl->copy(backend, src, dst, graph);
 }
 
-ggml_tensor * llama_moe_cache::lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il) const {
-    return pimpl->lookup_slots(ctx, map, ids, il);
+ggml_tensor * llama_moe_cache::lookup_slots(ggml_context * ctx, ggml_tensor * map, ggml_tensor * ids, int32_t il, int32_t n_used) const {
+    return pimpl->lookup_slots(ctx, map, ids, il, n_used);
 }
 
 void llama_moe_cache::begin_compute(ggml_cgraph * graph) {

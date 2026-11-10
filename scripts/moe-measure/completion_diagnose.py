@@ -152,9 +152,9 @@ def server(root: Path, folder: Path, launcher: Path, candidate: bool, *, env=Non
     runner.json_write(folder / 'launch.json', cmd)
     with (folder / 'controller.log').open('wb') as log:
         process = subprocess.Popen(cmd, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        trace = folder / 'instrumented/trace.log'
         try:
             runner.wait_health(process, 900)
-            trace = folder / 'instrumented/trace.log'
             if candidate:
                 runner.require_candidate_scratch(trace)
             http(folder, 'props', 'props')
@@ -162,8 +162,10 @@ def server(root: Path, folder: Path, launcher: Path, candidate: bool, *, env=Non
         finally:
             if process.poll() is None:
                 runner.stop_server(process, 240)
+            if process.returncode != 0:
+                raise RuntimeError(f'llama-server exited with status {process.returncode}; inspect {trace}')
         metadata = json.loads((folder / 'instrumented/metadata.json').read_text())
-        if process.returncode != 0 or metadata.get('exit_code') != 0:
+        if metadata.get('exit_code') != 0:
             raise RuntimeError(f'Server exited unexpectedly; inspect {folder}')
 
 
