@@ -86,8 +86,7 @@ int main() {
     auto tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, read_file(template_path)));
 
     const auto caps = common_chat_templates_get_caps(tmpls.get());
-    const auto supports_object_arguments = caps.find("supports_object_arguments");
-    if (supports_object_arguments == caps.end() || !supports_object_arguments->second) {
+    if (!caps.value("supports_object_arguments", false)) {
         std::cerr << "Codex template must advertise object tool-call arguments so Responses JSON strings are normalized before rendering\n";
         return 1;
     }
